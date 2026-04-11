@@ -45,6 +45,8 @@ struct App {
     is_processing: bool,
     model: String,
     should_quit: bool,
+    scroll_offset: u16,
+    max_scroll: u16,
 }
 
 impl App {
@@ -57,6 +59,8 @@ impl App {
             is_processing: false,
             model,
             should_quit: false,
+            scroll_offset: 0,
+            max_scroll: 0,
         }
     }
 
@@ -78,6 +82,18 @@ impl App {
                 &mut self.current_response,
             )));
         }
+    }
+
+    fn scroll_up(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(self.max_scroll);
+    }
+
+    fn scroll_down(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    fn is_at_bottom(&self) -> bool {
+        self.scroll_offset == 0
     }
 }
 
@@ -112,7 +128,7 @@ pub async fn run(agent: Agent) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
 
     loop {
-        terminal.draw(|f| render(f, &app))?;
+        terminal.draw(|f| render(f, &mut app))?;
 
         tokio::select! {
             _ = tick.tick() => {}
@@ -149,6 +165,16 @@ fn handle_terminal_event(evt: Event, app: &mut App, input_tx: &mpsc::UnboundedSe
             return;
         }
 
+        // Scroll keys work in all states
+        let half_page = (app.max_scroll.max(10) / 2).max(5);
+        match key.code {
+            KeyCode::Up => { app.scroll_up(1); return; }
+            KeyCode::Down => { app.scroll_down(1); return; }
+            KeyCode::PageUp => { app.scroll_up(half_page); return; }
+            KeyCode::PageDown => { app.scroll_down(half_page); return; }
+            _ => {}
+        }
+
         if app.is_processing {
             if key.code == KeyCode::Esc {
                 app.should_quit = true;
@@ -164,20 +190,35 @@ fn handle_terminal_event(evt: Event, app: &mut App, input_tx: &mpsc::UnboundedSe
             }
             KeyCode::Char(c) => {
                 app.input.insert(app.cursor_pos, c);
-                app.cursor_pos += 1;
+                app.cursor_pos += c.len_utf8();
             }
             KeyCode::Backspace => {
                 if app.cursor_pos > 0 {
-                    app.cursor_pos -= 1;
-                    app.input.remove(app.cursor_pos);
+                    let prev = app.input[..app.cursor_pos]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    app.input.remove(prev);
+                    app.cursor_pos = prev;
                 }
             }
             KeyCode::Left => {
-                app.cursor_pos = app.cursor_pos.saturating_sub(1);
+                if app.cursor_pos > 0 {
+                    app.cursor_pos = app.input[..app.cursor_pos]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
             }
             KeyCode::Right => {
                 if app.cursor_pos < app.input.len() {
-                    app.cursor_pos += 1;
+                    app.cursor_pos = app.input[app.cursor_pos..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| app.cursor_pos + i)
+                        .unwrap_or(app.input.len());
                 }
             }
             KeyCode::Home => {
@@ -195,6 +236,8 @@ fn handle_terminal_event(evt: Event, app: &mut App, input_tx: &mpsc::UnboundedSe
 }
 
 fn handle_agent_event(event: AgentEvent, app: &mut App) {
+    let was_at_bottom = app.is_at_bottom();
+
     match event {
         AgentEvent::Token(t) => {
             app.current_response.push_str(&t);
@@ -216,11 +259,16 @@ fn handle_agent_event(event: AgentEvent, app: &mut App) {
             app.is_processing = false;
         }
     }
+
+    // Auto-scroll to bottom if user hadn't scrolled up
+    if was_at_bottom {
+        app.scroll_offset = 0;
+    }
 }
 
 // ── Rendering ──────────────────────────────────────────────────────────────
 
-fn render(f: &mut Frame, app: &App) {
+fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -239,7 +287,13 @@ fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
-                " imp",
+                " ◆ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Ollama Code",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -255,13 +309,17 @@ fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(header, area);
 }
 
-fn render_chat(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn render_chat(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let lines = build_chat_lines(app);
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
 
     let line_count = paragraph.line_count(area.width) as u16;
-    let scroll = line_count.saturating_sub(area.height);
+    let max_scroll = line_count.saturating_sub(area.height);
+    app.max_scroll = max_scroll;
+    app.scroll_offset = app.scroll_offset.min(max_scroll);
+
+    let scroll = max_scroll.saturating_sub(app.scroll_offset);
 
     let paragraph = paragraph.scroll((scroll, 0));
     f.render_widget(paragraph, area);
@@ -304,7 +362,8 @@ fn render_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(input, area);
 
     if !app.is_processing {
-        f.set_cursor_position((area.x + 3 + app.cursor_pos as u16, area.y + 1));
+        let display_col = app.input[..app.cursor_pos].chars().count() as u16;
+        f.set_cursor_position((area.x + 3 + display_col, area.y + 1));
     }
 }
 

@@ -12,7 +12,7 @@ impl Config {
     pub fn path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("imp")
+            .join("ollama-code")
             .join("config.toml")
     }
 

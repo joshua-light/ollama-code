@@ -5,17 +5,6 @@ use crate::message::Message;
 use crate::ollama::OllamaClient;
 use crate::tools::{BashTool, ToolRegistry};
 
-const SYSTEM_PROMPT: &str = r#"You are Imp, a helpful terminal assistant. You help users by executing commands and providing clear, concise answers.
-
-You have access to a bash tool that lets you execute shell commands. Use it to:
-- Read or write files
-- Explore directories
-- Run programs and scripts
-- Check system information
-- Perform any terminal operation
-
-Be concise and direct. When a task requires running commands, use the bash tool proactively. Show relevant output and summarize results clearly."#;
-
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum AgentEvent {
@@ -38,7 +27,26 @@ impl Agent {
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(BashTool));
 
-        let messages = vec![Message::system(SYSTEM_PROMPT)];
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let system_prompt = format!(
+            "You are Ollama Code, a helpful terminal assistant. You help users by executing commands and providing clear, concise answers.\n\
+             \n\
+             Your working directory is: {cwd}\n\
+             \n\
+             You have access to a bash tool that lets you execute shell commands. Use it to:\n\
+             - Read or write files\n\
+             - Explore directories\n\
+             - Run programs and scripts\n\
+             - Check system information\n\
+             - Perform any terminal operation\n\
+             \n\
+             Be concise and direct. When a task requires running commands, use the bash tool proactively. Show relevant output and summarize results clearly."
+        );
+
+        let messages = vec![Message::system(&system_prompt)];
 
         Self {
             ollama,

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is this
 
-Imp is a CLI agent built on Ollama. It connects to a local Ollama instance, sends chat messages with tool definitions, and executes tool calls in a loop until the model produces a final response. It has two modes: an interactive TUI (default) and a non-interactive pipe mode (`-p "prompt"`).
+Ollama Code is a CLI agent built on Ollama. It connects to a local Ollama instance, sends chat messages with tool definitions, and executes tool calls in a loop until the model produces a final response. It has two modes: an interactive TUI (default) and a non-interactive pipe mode (`-p "prompt"`).
 
 ## Build & Run
 
@@ -32,4 +32,4 @@ The agent loop lives in `src/agent.rs`. `Agent::run()` sends messages to Ollama,
 
 **Message types** (`src/message.rs`): Serializable message structs matching Ollama's chat API format (system/user/assistant/tool roles).
 
-**Config** (`src/config.rs`): Loads from `~/.config/imp/config.toml`. Currently only has an optional `model` field.
+**Config** (`src/config.rs`): Loads from `~/.config/ollama-code/config.toml`. Currently only has an optional `model` field.

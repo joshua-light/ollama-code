@@ -1,11 +1,11 @@
 [package]
-name = "imp"
+name = "ollama-code"
 version = "0.1.0"
 edition = "2021"
 description = "A CLI agent built on Ollama"
 
 [[bin]]
-name = "imp"
+name = "ollama-code"
 path = "src/main.rs"
 
 [dependencies]

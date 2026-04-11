@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::ollama::OllamaClient;
 
 #[derive(Parser)]
-#[command(name = "imp", about = "A CLI agent built on Ollama")]
+#[command(name = "ollama-code", about = "A CLI agent built on Ollama")]
 struct Cli {
     /// Run in pipe mode: send a prompt and get a response
     #[arg(short, long)]
