@@ -10,9 +10,22 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+use tokio::sync::mpsc;
+
 use crate::backend::{ChatResponse, ModelBackend};
 use crate::message::Message;
 use crate::ollama::OllamaBackend;
+
+/// Progress updates during llama-server startup.
+pub enum ServerStartEvent {
+    /// Model loading progress (0.0 to 1.0), parsed from /health response.
+    Progress(f32),
+    /// Server is ready; carries the LlamaServer handle back to the caller.
+    Ready(LlamaServer),
+    /// Server startup failed.
+    Failed(String),
+}
+
 /// How to specify the model for llama-server.
 pub enum ModelSource {
     /// Local GGUF file path.
@@ -105,9 +118,10 @@ impl LlamaServer {
     }
 
     /// Spawn llama-server with the given model source and port.
+    /// Returns immediately after the child process starts — does NOT wait for readiness.
     /// `extra_args` are passed directly to the process (e.g. ["-ngl", "99"]).
     /// Server stderr is written only to the log file, never to the terminal.
-    pub async fn start(
+    pub async fn spawn(
         binary: &Path,
         model: &ModelSource,
         port: u16,
@@ -144,32 +158,36 @@ impl LlamaServer {
         std::fs::create_dir_all(&log_dir)?;
         let log_path = log_dir.join("llama-server.log");
 
-        let mut server = Self {
+        Ok(Self {
             child: Some(child),
             port,
             log_path,
-        };
+        })
+    }
+
+    /// Spawn llama-server and wait for it to become ready (blocking).
+    /// Convenience wrapper around `spawn()` + `wait_until_ready()`.
+    pub async fn start(
+        binary: &Path,
+        model: &ModelSource,
+        port: u16,
+        context_size: u64,
+        extra_args: &[String],
+    ) -> Result<Self> {
+        let mut server = Self::spawn(binary, model, port, context_size, extra_args).await?;
         server.wait_until_ready(model).await?;
         Ok(server)
     }
 
     /// Poll `/health` until the server responds OK.
-    /// Stderr is written only to the log file.
-    /// Detects early crashes by checking if the child process has exited.
-    /// No fixed timeout — waits as long as the process is alive.
-    async fn wait_until_ready(&mut self, model: &ModelSource) -> Result<()> {
-        let client = reqwest::Client::new();
-        let url = format!("http://127.0.0.1:{}/health", self.port);
-
-        let child = self.child.as_mut().expect("wait_until_ready called on non-owned server");
-
-        // Take stderr and spawn a task that writes to the log file.
-        // Keep only the last N lines in memory for crash diagnostics.
+    /// Drain child stderr to a log file and keep the last N lines in memory
+    /// for crash diagnostics. Returns a shared handle to the ring buffer.
+    fn capture_stderr(child: &mut Child, log_path: &Path) -> std::sync::Arc<std::sync::Mutex<VecDeque<String>>> {
         const STDERR_TAIL_LINES: usize = 30;
         let stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::<String>::new()));
         if let Some(stderr) = child.stderr.take() {
             let lines = stderr_lines.clone();
-            let log_path = self.log_path.clone();
+            let log_path = log_path.to_path_buf();
 
             tokio::spawn(async move {
                 let log_file = std::fs::File::create(&log_path).ok();
@@ -190,34 +208,104 @@ impl LlamaServer {
                 }
             });
         }
+        stderr_lines
+    }
 
-        // Record the PID for the server info file.
+    /// Collect the last N stderr lines into a single string for error messages.
+    fn stderr_tail(buf: &std::sync::Mutex<VecDeque<String>>) -> String {
+        buf.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
+    }
+
+    /// Stderr is written only to the log file.
+    /// Detects early crashes by checking if the child process has exited.
+    /// No fixed timeout — waits as long as the process is alive.
+    pub async fn wait_until_ready(&mut self, model: &ModelSource) -> Result<()> {
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/health", self.port);
+
+        let child = self.child.as_mut().expect("wait_until_ready called on non-owned server");
+        let stderr_lines = Self::capture_stderr(child, &self.log_path);
         let pid = child.id();
 
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            // Check if the process crashed
             let child = self.child.as_mut().unwrap();
             if let Some(status) = child.try_wait()? {
-                let buf = stderr_lines.lock().unwrap();
-                let tail: String = buf.iter().cloned().collect::<Vec<_>>().join("\n");
                 anyhow::bail!(
                     "llama-server exited with {} before becoming ready\n{}",
                     status,
-                    tail
+                    Self::stderr_tail(&stderr_lines),
                 );
             }
 
             match client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    // Server is ready — write the info file so other instances can find it.
                     if let Some(pid) = pid {
                         let _ = write_server_info(pid, self.port, &model.model_id());
                     }
                     return Ok(());
                 }
                 _ => continue,
+            }
+        }
+    }
+
+    /// Like `wait_until_ready`, but sends progress updates over a channel.
+    /// On success, sends `ServerStartEvent::Ready` with `self` moved into it.
+    /// On failure, sends `ServerStartEvent::Failed`.
+    pub async fn wait_until_ready_with_progress(
+        mut self,
+        model: &ModelSource,
+        progress_tx: mpsc::UnboundedSender<ServerStartEvent>,
+    ) {
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/health", self.port);
+
+        let child = self.child.as_mut().expect("wait_until_ready_with_progress called on non-owned server");
+        let stderr_lines = Self::capture_stderr(child, &self.log_path);
+        let pid = child.id();
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let child = self.child.as_mut().unwrap();
+            if let Some(status) = match child.try_wait() {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = progress_tx.send(ServerStartEvent::Failed(format!("Error checking server process: {}", e)));
+                    return;
+                }
+            } {
+                let _ = progress_tx.send(ServerStartEvent::Failed(format!(
+                    "llama-server exited with {} before becoming ready\n{}",
+                    status, Self::stderr_tail(&stderr_lines),
+                )));
+                return;
+            }
+
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Some(pid) = pid {
+                        let _ = write_server_info(pid, self.port, &model.model_id());
+                    }
+                    let _ = progress_tx.send(ServerStartEvent::Ready(self));
+                    return;
+                }
+                Ok(resp) => {
+                    if let Ok(body) = resp.text().await {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(progress) = json.get("progress").and_then(|v| v.as_f64()) {
+                                let _ = progress_tx.send(ServerStartEvent::Progress(progress as f32));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => {
+                    let _ = progress_tx.send(ServerStartEvent::Progress(0.0));
+                    continue;
+                }
             }
         }
     }

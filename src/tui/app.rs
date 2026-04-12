@@ -5,15 +5,20 @@ use tokio::sync::mpsc;
 
 use crate::backend::ModelBackend;
 use crate::config::Config;
+use crate::format;
 use crate::llama_server::ModelSource;
+use crate::message::{Message, Role};
 use crate::ollama::OllamaBackend;
+use crate::skills::SkillMeta;
 
 pub(crate) enum AgentInput {
     Message(String),
     ClearHistory,
+    Rewind(usize),
     SetModel(String),
     SetContextSize(u64),
     SetBackend(Arc<dyn ModelBackend>),
+    RestoreMessages(Vec<Message>),
 }
 
 #[derive(Clone)]
@@ -42,6 +47,8 @@ pub(crate) enum ChatMessage {
         user_chars: usize,
         assistant_chars: usize,
         tool_chars: usize,
+        base_prompt_tokens: u64,
+        project_docs_tokens: Vec<(String, u64)>,
     },
     GenerationSummary { duration: std::time::Duration },
     SubagentToolCall {
@@ -68,6 +75,16 @@ pub(crate) struct PendingServerStart {
     pub(crate) unload: Option<(OllamaBackend, String)>,
 }
 
+/// State for the initial llama-server loading progress display.
+pub(crate) struct ServerLoadingState {
+    /// 0.0 to 1.0 — parsed from llama-server /health endpoint.
+    pub(crate) progress: f32,
+    /// When loading started, for elapsed time display.
+    pub(crate) start: Instant,
+    /// Model name being loaded, for display.
+    pub(crate) model_name: String,
+}
+
 pub(crate) struct App {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) current_response: String,
@@ -89,6 +106,8 @@ pub(crate) struct App {
     pub(crate) context_used: u64,
     pub(crate) session_start: Instant,
     pub(crate) tool_call_count: usize,
+    pub(crate) total_input_tokens: u64,
+    pub(crate) total_output_tokens: u64,
     pub(crate) tools_expanded: bool,
     pub(crate) git_branch: Option<String>,
     pub(crate) git_dirty: bool,
@@ -108,10 +127,18 @@ pub(crate) struct App {
     pub(crate) pending_server_start: Option<PendingServerStart>,
     /// Cancel flag shared with the agent task — set to true to request cancellation.
     pub(crate) cancel_flag: Arc<AtomicBool>,
+    /// Estimated tokens for the base system prompt (SYSTEM_PROMPT.md).
+    pub(crate) base_prompt_tokens: u64,
+    /// Estimated tokens for each loaded project doc (filename, tokens).
+    pub(crate) project_docs_tokens: Vec<(String, u64)>,
+    /// Discovered skills available as slash commands.
+    pub(crate) skills: Vec<SkillMeta>,
+    /// When Some, the initial llama-server is still loading and we show a progress bar.
+    pub(crate) server_loading: Option<ServerLoadingState>,
 }
 
 impl App {
-    pub(crate) fn new(model: String, context_size: u64, ollama: OllamaBackend, config: Config) -> Self {
+    pub(crate) fn new(model: String, context_size: u64, ollama: OllamaBackend, config: Config, skills: Vec<SkillMeta>) -> Self {
         let (git_branch, git_dirty) = super::render::get_git_info_sync();
         let dir_name = std::env::current_dir()
             .ok()
@@ -136,6 +163,8 @@ impl App {
             context_used: 0,
             session_start: Instant::now(),
             tool_call_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
             tools_expanded: false,
             git_branch,
             git_dirty,
@@ -148,6 +177,10 @@ impl App {
             needs_clear: false,
             pending_server_start: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            base_prompt_tokens: 0,
+            project_docs_tokens: Vec::new(),
+            skills,
+            server_loading: None,
         }
     }
 
@@ -205,14 +238,91 @@ impl App {
         self.cursor_pos = 0;
     }
 
+    /// Remove the last `n` user turns (user message + all subsequent non-user messages).
+    /// Returns how many turns were actually removed.
+    pub(crate) fn rewind_turns(&mut self, n: usize, input_tx: &mpsc::UnboundedSender<AgentInput>) -> usize {
+        let user_indices: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| matches!(m, ChatMessage::User(_)).then_some(i))
+            .collect();
+
+        if user_indices.is_empty() {
+            return 0;
+        }
+
+        let actual_n = n.min(user_indices.len());
+        let truncate_at = user_indices[user_indices.len() - actual_n];
+        self.messages.truncate(truncate_at);
+
+        let _ = input_tx.send(AgentInput::Rewind(actual_n));
+
+        self.scroll_offset = 0;
+        actual_n
+    }
+
     pub(crate) fn reset_conversation(&mut self, input_tx: &mpsc::UnboundedSender<AgentInput>, msg: &str) {
         self.messages.clear();
         self.current_response.clear();
         self.context_used = 0;
         self.tool_call_count = 0;
+        self.total_input_tokens = 0;
+        self.total_output_tokens = 0;
         self.scroll_offset = 0;
         self.max_scroll = 0;
         let _ = input_tx.send(AgentInput::ClearHistory);
         self.messages.push(ChatMessage::Info(msg.into()));
     }
+}
+
+/// Convert a Vec<Message> (from a saved session) into Vec<ChatMessage> for TUI display.
+pub(crate) fn messages_to_chat_messages(messages: &[Message]) -> Vec<ChatMessage> {
+    let mut chat_msgs = Vec::new();
+
+    for msg in messages {
+        match msg.role {
+            Role::System => {} // not displayed
+            Role::User => {
+                chat_msgs.push(ChatMessage::User(msg.content.clone()));
+            }
+            Role::Assistant => {
+                // If the assistant message has non-empty content, show it
+                if !msg.content.trim().is_empty() {
+                    chat_msgs.push(ChatMessage::Assistant(msg.content.clone()));
+                }
+                // If it has tool calls, add those
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    for tc in tool_calls {
+                        let args_display = format::format_tool_args_display(
+                            &tc.function.name,
+                            &tc.function.arguments,
+                        );
+                        chat_msgs.push(ChatMessage::ToolCall {
+                            name: tc.function.name.clone(),
+                            args: args_display,
+                            result: None,
+                        });
+                    }
+                }
+            }
+            Role::Tool => {
+                // Fill in the result on the last pending ToolCall.
+                // Orphaned tool results from saved sessions are expected; skip silently.
+                for cm in chat_msgs.iter_mut().rev() {
+                    if let ChatMessage::ToolCall { result, .. } = cm {
+                        if result.is_none() {
+                            *result = Some(ToolResultData {
+                                output: msg.content.clone(),
+                                success: true,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    chat_msgs
 }

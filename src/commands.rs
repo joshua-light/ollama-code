@@ -3,6 +3,8 @@ pub enum SlashCommand {
     Clear,
     Context,
     Model,
+    Resume,
+    Rewind,
     Session,
     New,
     Unknown(String),
@@ -31,6 +33,14 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Switch the active model",
     },
     CommandInfo {
+        name: "/resume",
+        description: "List recent sessions",
+    },
+    CommandInfo {
+        name: "/rewind",
+        description: "Undo the last turn (or /rewind N for N turns)",
+    },
+    CommandInfo {
         name: "/session",
         description: "Show session log directory",
     },
@@ -50,8 +60,10 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         "/clear" => Some(SlashCommand::Clear),
         "/context" => Some(SlashCommand::Context),
         "/model" => Some(SlashCommand::Model),
+        "/resume" => Some(SlashCommand::Resume),
         "/session" => Some(SlashCommand::Session),
         "/new" => Some(SlashCommand::New),
+        "/rewind" => Some(SlashCommand::Rewind),
         cmd => Some(SlashCommand::Unknown(cmd.to_string())),
     }
 }

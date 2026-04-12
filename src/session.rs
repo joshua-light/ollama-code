@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,121 @@ impl Session {
 
         session.log_debug("SESSION_START");
         Ok(session)
+    }
+
+    /// Resume an existing session by ID, returning the session handle and loaded messages.
+    pub fn resume(id: &str) -> anyhow::Result<(Self, Vec<Message>)> {
+        let base = config::data_dir().join("sessions");
+        let dir = base.join(id);
+
+        if !dir.exists() {
+            anyhow::bail!("Session not found: {}", id);
+        }
+
+        let messages_path = dir.join("messages.jsonl");
+        let mut messages = Vec::new();
+
+        if messages_path.exists() {
+            let file = File::open(&messages_path)?;
+            let reader = std::io::BufReader::new(file);
+            for (i, line) in reader.lines().enumerate() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("Warning: could not read line {} of messages.jsonl: {}", i + 1, e);
+                        continue;
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Message>(&line) {
+                    Ok(msg) => messages.push(msg),
+                    Err(e) => {
+                        eprintln!("Warning: could not parse line {} of messages.jsonl: {}", i + 1, e);
+                    }
+                }
+            }
+        }
+
+        let messages_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("messages.jsonl"))?;
+
+        let debug_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("debug.log"))?;
+
+        let mut session = Self {
+            dir,
+            messages_file,
+            debug_file,
+        };
+
+        session.log_debug("SESSION_RESUME");
+        Ok((session, messages))
+    }
+
+    /// List recent session IDs, sorted most-recent first.
+    pub fn list_recent(limit: usize) -> anyhow::Result<Vec<String>> {
+        let base = config::data_dir().join("sessions");
+        if !base.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries: Vec<String> = fs::read_dir(&base)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.file_type().ok()?.is_dir() {
+                    Some(entry.file_name().to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        entries.sort_unstable();
+        entries.reverse();
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
+    /// Return the most recent session ID, if any.
+    pub fn latest() -> anyhow::Result<Option<String>> {
+        Ok(Self::list_recent(1)?.into_iter().next())
+    }
+
+    /// Find a session ID by prefix match.
+    pub fn find_by_prefix(prefix: &str) -> anyhow::Result<Option<String>> {
+        let base = config::data_dir().join("sessions");
+        if !base.exists() {
+            return Ok(None);
+        }
+
+        let mut matches: Vec<String> = fs::read_dir(&base)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.file_type().ok()?.is_dir() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with(prefix) {
+                        return Some(name);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        matches.sort_unstable();
+        // Return the most recent match (last alphabetically)
+        Ok(matches.pop())
+    }
+
+    pub fn id(&self) -> &str {
+        self.dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
     }
 
     pub fn path(&self) -> &Path {
@@ -84,7 +199,7 @@ impl Session {
             AgentEvent::ContextUpdate { prompt_tokens } => {
                 format!("CONTEXT_UPDATE prompt_tokens={}", prompt_tokens)
             }
-            AgentEvent::Done { prompt_tokens } => {
+            AgentEvent::Done { prompt_tokens, .. } => {
                 format!("DONE prompt_tokens={}", prompt_tokens)
             }
             AgentEvent::Error(e) => format!("ERROR {}", e),
@@ -118,6 +233,9 @@ impl Session {
             AgentEvent::Cancelled => "CANCELLED".to_string(),
             AgentEvent::MessageLogged(_) => return, // handled separately via log_message
             AgentEvent::Debug(s) => format!("DEBUG {}", s),
+            AgentEvent::SystemPromptInfo { base_prompt_tokens, ref project_docs } => {
+                format!("SYSTEM_PROMPT_INFO base={} docs={:?}", base_prompt_tokens, project_docs)
+            }
         };
         self.log_debug(&line);
     }

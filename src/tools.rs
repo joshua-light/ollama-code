@@ -398,8 +398,21 @@ impl Tool for WriteTool {
         file.write_all(content.as_bytes())
             .map_err(|e| anyhow::anyhow!("Failed to write '{}': {}", file_path, e))?;
 
-        let line_count = content.lines().count();
-        Ok(format!("Created '{}' ({} lines)", file_path, line_count))
+        let lines: Vec<&str> = content.lines().collect();
+        let line_count = lines.len();
+        let num_width = format!("{}", line_count).len().max(3);
+
+        const MAX_DIFF_LINES: usize = 50;
+        let mut diff = String::new();
+        let shown = lines.len().min(MAX_DIFF_LINES);
+        for (i, line) in lines.iter().take(MAX_DIFF_LINES).enumerate() {
+            diff.push_str(&format!("+{:>width$}  {}\n", i + 1, line, width = num_width));
+        }
+        if line_count > MAX_DIFF_LINES {
+            diff.push_str(&format!("... ({} more lines)\n", line_count - shown));
+        }
+
+        Ok(format!("Created '{}' ({} lines)\n{}", file_path, line_count, diff))
     }
 }
 

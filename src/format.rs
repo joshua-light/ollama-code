@@ -47,3 +47,48 @@ pub fn format_tool_output(output: &str) -> Vec<String> {
 pub fn format_tool_error(output: &str) -> String {
     format!("{}{}", PREFIX_FIRST, output.trim())
 }
+
+/// Format tool call arguments for display, extracting the most relevant field
+/// per tool type (e.g. the command for bash, the file path for read/edit).
+pub fn format_tool_args_display(name: &str, args: &serde_json::Value) -> String {
+    match name {
+        "bash" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "read" => {
+            let path = args
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let offset = args.get("offset").and_then(|v| v.as_u64());
+            let limit = args.get("limit").and_then(|v| v.as_u64());
+            match (offset, limit) {
+                (Some(o), Some(l)) => format!("{}, offset={}, limit={}", path, o, l),
+                (Some(o), None) => format!("{}, offset={}", path, o),
+                (None, Some(l)) => format!("{}, limit={}", path, l),
+                (None, None) => path.to_string(),
+            }
+        }
+        "edit" | "write" => args
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string(),
+        "subagent" => args
+            .get("task")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string(),
+        "glob" | "grep" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+            let path = args.get("path").and_then(|v| v.as_str());
+            match path {
+                Some(p) => format!("{} in {}", pattern, p),
+                None => pattern.to_string(),
+            }
+        }
+        _ => args.to_string(),
+    }
+}

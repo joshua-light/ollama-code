@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use crossterm::{
     execute,
+    event::{EnableBracketedPaste, DisableBracketedPaste},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::{FutureExt, StreamExt};
@@ -18,12 +19,19 @@ use tokio::sync::mpsc;
 use crate::agent::{Agent, AgentEvent};
 use crate::backend::ModelBackend;
 use crate::config::Config;
-use crate::llama_server::LlamaServer;
+use crate::llama_server::{LlamaServer, ModelSource, ServerStartEvent};
 use crate::ollama::OllamaBackend;
 use crate::session::Session;
 
-use app::{AgentInput, App, ChatMessage};
+use app::{AgentInput, App, ChatMessage, ServerLoadingState, messages_to_chat_messages};
 use render::format_number;
+use crate::message::Message;
+
+/// Configuration for deferred initial server startup (TUI shows progress bar).
+pub struct InitialServerStart {
+    pub server: LlamaServer,
+    pub model_source: ModelSource,
+}
 
 /// Handle model list results from Ollama.
 fn handle_model_list_result(app: &mut App, result: Result<Vec<String>>) {
@@ -143,24 +151,27 @@ fn format_model_list(models: &[String], current: &str, start_index: usize) -> St
 /// Result type sent over the channel when a new llama-server backend is ready.
 pub(super) type BackendReady = Result<(Arc<dyn ModelBackend>, String, LlamaServer)>;
 
-pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: Config, mut llama_server: Option<LlamaServer>, no_confirm: bool) -> Result<()> {
+pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: Config, mut llama_server: Option<LlamaServer>, restored: Option<Vec<Message>>, initial_server_start: Option<InitialServerStart>) -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         original_hook(info);
     }));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let model = agent.model().to_string();
-    let ollama = OllamaBackend::new(None); // always points to real Ollama for model listing
-    let mut app = App::new(model.clone(), context_size, ollama, config);
-    if no_confirm {
+    let skills = agent.skills().to_vec();
+    let ollama = OllamaBackend::new(config.ollama_url.clone());
+    let no_confirm = config.no_confirm.unwrap_or(false);
+    let bypass = config.bypass.unwrap_or(false);
+    let mut app = App::new(model.clone(), context_size, ollama, config, skills);
+    if no_confirm || bypass {
         app.auto_approve = true;
     }
 
@@ -188,11 +199,14 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                         cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                         if let Err(e) = agent.run(&msg, &event_tx, &mut confirm_rx, cancel_flag.clone()).await {
                             let _ = event_tx.send(AgentEvent::Error(format!("Agent error: {}", e)));
-                            let _ = event_tx.send(AgentEvent::Done { prompt_tokens: 0 });
+                            let _ = event_tx.send(AgentEvent::Done { prompt_tokens: 0, eval_count: 0 });
                         }
                     }
                     AgentInput::ClearHistory => {
                         agent.clear_history();
+                    }
+                    AgentInput::Rewind(n) => {
+                        agent.rewind_turns(n);
                     }
                     AgentInput::SetModel(model) => {
                         agent.set_model(model);
@@ -202,6 +216,9 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                     }
                     AgentInput::SetBackend(backend) => {
                         agent.set_backend(backend);
+                    }
+                    AgentInput::RestoreMessages(msgs) => {
+                        agent.restore_messages(msgs);
                     }
                 }
             }
@@ -218,9 +235,39 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                 "unknown panic".to_string()
             };
             let _ = panic_event_tx.send(AgentEvent::Error(format!("Agent panicked: {}", msg)));
-            let _ = panic_event_tx.send(AgentEvent::Done { prompt_tokens: 0 });
+            let _ = panic_event_tx.send(AgentEvent::Done { prompt_tokens: 0, eval_count: 0 });
         }
     });
+
+    // Restore a previous session if provided
+    if let Some(msgs) = restored {
+        let session_id = session.id().to_string();
+        let chat_messages = messages_to_chat_messages(&msgs);
+        app.messages = chat_messages;
+        app.messages.push(ChatMessage::Info(format!(
+            "Resumed session {}.", session_id
+        )));
+        let _ = input_tx.send(AgentInput::RestoreMessages(msgs));
+    }
+
+    // Deferred initial server startup — spawn progress-reporting task
+    let (server_progress_tx, mut server_progress_rx) = mpsc::unbounded_channel::<ServerStartEvent>();
+    if let Some(initial) = initial_server_start {
+        let model_name = app.model.clone();
+        app.server_loading = Some(ServerLoadingState {
+            progress: 0.0,
+            start: std::time::Instant::now(),
+            model_name,
+        });
+        app.is_processing = true;
+        app.generation_start = Some(std::time::Instant::now());
+        app.generation_verb = "Loading model".to_string();
+
+        let tx = server_progress_tx;
+        tokio::spawn(async move {
+            initial.server.wait_until_ready_with_progress(&initial.model_source, tx).await;
+        });
+    }
 
     let mut reader = crossterm::event::EventStream::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
@@ -304,6 +351,34 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                 handle_backend_ready(&mut app, result, &mut llama_server, &input_tx);
                 needs_redraw = true;
             }
+            Some(evt) = server_progress_rx.recv() => {
+                match evt {
+                    ServerStartEvent::Progress(pct) => {
+                        if let Some(ref mut loading) = app.server_loading {
+                            loading.progress = pct;
+                        }
+                    }
+                    ServerStartEvent::Ready(server) => {
+                        llama_server = Some(server);
+                        app.server_loading = None;
+                        app.is_processing = false;
+                        app.generation_start = None;
+                        let model = app.model.clone();
+                        app.messages.push(ChatMessage::Info(format!(
+                            "Model {} loaded.", model
+                        )));
+                    }
+                    ServerStartEvent::Failed(err) => {
+                        app.server_loading = None;
+                        app.is_processing = false;
+                        app.generation_start = None;
+                        app.messages.push(ChatMessage::Error(format!(
+                            "Failed to start llama-server: {}", err
+                        )));
+                    }
+                }
+                needs_redraw = true;
+            }
         }
 
         if app.should_quit {
@@ -312,7 +387,7 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     // Stop any running llama-server

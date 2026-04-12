@@ -7,6 +7,7 @@ mod llama_server;
 mod message;
 mod ollama;
 mod session;
+mod skills;
 mod tools;
 mod tui;
 
@@ -44,6 +45,10 @@ struct Cli {
     #[arg(long)]
     llama_server_path: Option<String>,
 
+    /// URL of a remote llama-server (e.g. "http://192.168.1.50:8080")
+    #[arg(long)]
+    llama_server_url: Option<String>,
+
     /// Path to GGUF model file (for llama-cpp backend)
     #[arg(long)]
     model_path: Option<String>,
@@ -63,35 +68,84 @@ struct Cli {
     /// Enable verbose/debug output
     #[arg(long)]
     verbose: bool,
+
+    /// Resume a previous session (most recent if no ID given, or by ID/prefix)
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load()?;
+    let mut config = Config::load()?;
 
-    let context_size = cli.context_size
-        .or(config.context_size)
-        .unwrap_or(DEFAULT_CONTEXT_SIZE);
+    // Apply CLI overrides (highest priority layer) — moves, not clones.
+    if cli.model.is_some() { config.model = cli.model; }
+    if cli.context_size.is_some() { config.context_size = cli.context_size; }
+    if cli.backend.is_some() { config.backend = cli.backend; }
+    if cli.llama_server_path.is_some() { config.llama_server_path = cli.llama_server_path; }
+    if cli.llama_server_url.is_some() { config.llama_server_url = cli.llama_server_url; }
+    if cli.model_path.is_some() { config.model_path = cli.model_path; }
+    if cli.hf_repo.is_some() { config.hf_repo = cli.hf_repo; }
+    if cli.no_confirm { config.no_confirm = Some(true); }
+    if cli.verbose { config.verbose = Some(true); }
 
-    let backend = cli
+    if let Some(ref pp) = config.project_config_path {
+        eprintln!("Using project config: {}", pp.display());
+    }
+
+    // Normalize llama_server_url
+    if let Some(ref mut url) = config.llama_server_url {
+        *url = url.trim_end_matches('/').to_string();
+    }
+
+    let context_size = config.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE);
+
+    let backend = config
         .backend
         .as_deref()
-        .or(config.backend.as_deref())
+        .or(if config.llama_server_url.is_some() { Some("llama-cpp") } else { None })
         .unwrap_or("ollama");
 
-    match backend {
-        "llama-cpp" => run_llama_cpp(cli, config, context_size).await,
-        _ => run_ollama(cli, config, context_size).await,
+    let resume = cli.resume;
+
+    match (backend, config.llama_server_url.clone()) {
+        ("llama-cpp", Some(url)) => run_remote_llama_cpp(cli.prompt, config, context_size, url, resume).await,
+        ("llama-cpp", None) => run_llama_cpp(cli.prompt, config, context_size, resume).await,
+        _ => run_ollama(cli.prompt, config, context_size, resume).await,
     }
 }
 
-async fn run_ollama(cli: Cli, mut config: Config, context_size: u64) -> Result<()> {
-    let ollama = OllamaBackend::new(None);
+/// Resolve a `--resume` argument into a (Session, Vec<Message>) pair.
+/// An empty string means "resume the latest session".
+fn resolve_resume(resume_arg: &str) -> Result<(Session, Vec<message::Message>)> {
+    let session_id = if resume_arg.is_empty() {
+        Session::latest()?
+            .ok_or_else(|| anyhow::anyhow!("No previous sessions found"))?
+    } else {
+        Session::find_by_prefix(resume_arg)?
+            .ok_or_else(|| anyhow::anyhow!("No session found matching '{}'", resume_arg))?
+    };
 
-    let model = if let Some(m) = cli.model {
-        m
-    } else if let Some(m) = config.model.clone() {
+    eprintln!("Resuming session: {}", session_id);
+    let (session, messages) = Session::resume(&session_id)?;
+    Ok((session, messages))
+}
+
+/// Create or resume a session based on the `--resume` flag.
+fn resolve_session(resume: &Option<String>) -> Result<(Session, Option<Vec<message::Message>>)> {
+    if let Some(ref resume_arg) = resume {
+        let (session, msgs) = resolve_resume(resume_arg)?;
+        Ok((session, Some(msgs)))
+    } else {
+        Ok((Session::new()?, None))
+    }
+}
+
+async fn run_ollama(prompt: Option<String>, mut config: Config, context_size: u64, resume: Option<String>) -> Result<()> {
+    let ollama = OllamaBackend::new(config.ollama_url.clone());
+
+    let model = if let Some(m) = config.model.clone() {
         m
     } else {
         let m = select_model(&ollama).await?;
@@ -105,22 +159,26 @@ async fn run_ollama(cli: Cli, mut config: Config, context_size: u64) -> Result<(
 
     let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
     let subagent_max_turns = config.subagent_max_turns.unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS);
-    let backend = OllamaBackend::new(None);
+    let backend = OllamaBackend::new(config.ollama_url.clone());
     let agent = Agent::new(Arc::new(backend), model, context_size, bash_timeout, subagent_max_turns);
-    let session = Session::new()?;
+    let verbose = config.verbose.unwrap_or(false);
+    let (session, restored) = resolve_session(&resume)?;
 
-    if let Some(prompt) = cli.prompt {
-        run_pipe(agent, &prompt, session, cli.verbose).await
+    if let Some(prompt) = prompt {
+        let mut agent = agent;
+        if let Some(msgs) = restored {
+            agent.restore_messages(msgs);
+        }
+        run_pipe(agent, &prompt, session, verbose).await
     } else {
-        tui::run(agent, context_size, session, config, None, cli.no_confirm).await
+        tui::run(agent, context_size, session, config, None, restored, None).await
     }
 }
 
-async fn run_llama_cpp(cli: Cli, config: Config, context_size: u64) -> Result<()> {
-    let server_path = cli
+async fn run_llama_cpp(prompt: Option<String>, config: Config, context_size: u64, resume: Option<String>) -> Result<()> {
+    let server_path = config
         .llama_server_path
         .as_deref()
-        .or(config.llama_server_path.as_deref())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "llama-cpp backend requires --llama-server-path or llama_server_path in config"
@@ -132,28 +190,21 @@ async fn run_llama_cpp(cli: Cli, config: Config, context_size: u64) -> Result<()
         anyhow::bail!("llama-server binary not found at: {}", server_binary.display());
     }
 
-    // Determine model name (used as the alias for the API)
-    let model_name = cli
-        .model
-        .as_deref()
-        .or(config.model.as_deref())
-        .unwrap_or("default");
+    let model_name = config.model.as_deref().unwrap_or("default");
 
-    // Determine model source: --model-path > --hf-repo > config > Ollama blob resolution
+    // Determine model source: model_path > hf_repo > Ollama blob resolution
     let model_source =
-        if let Some(p) = cli.model_path.as_deref().or(config.model_path.as_deref()) {
+        if let Some(p) = config.model_path.as_deref() {
             let path = PathBuf::from(p);
             if !path.exists() {
                 anyhow::bail!("Model file not found: {}", path.display());
             }
             ModelSource::File(path)
-        } else if let Some(hf) = cli.hf_repo.as_deref().or(config.hf_repo.as_deref()) {
+        } else if let Some(hf) = config.hf_repo.as_deref() {
             ModelSource::HuggingFace(hf.to_string())
         } else if model_name.contains('/') {
-            // Looks like a HuggingFace repo (e.g. "unsloth/gemma-4-26B-A4B-it-GGUF")
             ModelSource::HuggingFace(model_name.to_string())
         } else {
-            // Try to resolve from Ollama's model storage via the Ollama API
             eprintln!("Resolving model '{}' from Ollama storage...", model_name);
             ModelSource::File(llama_server::find_ollama_model_path(model_name).await?)
         };
@@ -161,12 +212,14 @@ async fn run_llama_cpp(cli: Cli, config: Config, context_size: u64) -> Result<()
     let extra_args = config.llama_server_args.clone().unwrap_or_default();
 
     // Try to reuse an existing llama-server for the same model.
-    let mut server = if let Some(server) = LlamaServer::connect_existing(&model_source).await {
+    // If reusing, we're ready immediately. If spawning fresh, defer readiness
+    // wait to the TUI so a progress bar is shown.
+    let (llama_server, initial_start) = if let Some(server) = LlamaServer::connect_existing(&model_source).await {
         eprintln!(
             "Connected to existing llama-server on port {}",
             server.port
         );
-        server
+        (Some(server), None)
     } else {
         let port = llama_server::find_free_port()?;
         eprintln!(
@@ -178,26 +231,95 @@ async fn run_llama_cpp(cli: Cli, config: Config, context_size: u64) -> Result<()
             }
         );
         let server =
-            LlamaServer::start(&server_binary, &model_source, port, context_size, &extra_args)
+            LlamaServer::spawn(&server_binary, &model_source, port, context_size, &extra_args)
                 .await?;
-        eprintln!("llama-server ready (log: {})", server.log_path.display());
-        server
+        (None, Some((server, model_source)))
     };
 
-    let backend = LlamaCppBackend::new(server.base_url());
+    let base_url = if let Some(ref s) = llama_server {
+        s.base_url()
+    } else if let Some((ref s, _)) = initial_start {
+        s.base_url()
+    } else {
+        unreachable!()
+    };
+    let backend = LlamaCppBackend::new(base_url);
 
     let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
     let subagent_max_turns = config.subagent_max_turns.unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS);
     let agent = Agent::new(Arc::new(backend), model_name.to_string(), context_size, bash_timeout, subagent_max_turns);
-    let session = Session::new()?;
+    let verbose = config.verbose.unwrap_or(false);
+    let (session, restored) = resolve_session(&resume)?;
 
-    if let Some(prompt) = cli.prompt {
-        let result = run_pipe(agent, &prompt, session, cli.verbose).await;
-        server.stop().await;
-        result
+    if let Some(prompt) = prompt {
+        // Pipe mode: wait for server synchronously (no TUI to show progress)
+        let mut agent = agent;
+        if let Some(msgs) = &restored {
+            agent.restore_messages(msgs.clone());
+        }
+        if let Some((mut server, model_source)) = initial_start {
+            server.wait_until_ready(&model_source).await?;
+            eprintln!("llama-server ready (log: {})", server.log_path.display());
+            let result = run_pipe(agent, &prompt, session, verbose).await;
+            server.stop().await;
+            result
+        } else {
+            let mut server = llama_server.unwrap();
+            let result = run_pipe(agent, &prompt, session, verbose).await;
+            server.stop().await;
+            result
+        }
     } else {
-        // TUI takes ownership of the server and handles its lifecycle
-        tui::run(agent, context_size, session, config, Some(server), cli.no_confirm).await
+        // TUI mode: defer server readiness to event loop (shows progress bar)
+        let initial = initial_start.map(|(server, ms)| tui::InitialServerStart {
+            server,
+            model_source: ms,
+        });
+        tui::run(agent, context_size, session, config, llama_server, restored, initial).await
+    }
+}
+
+async fn run_remote_llama_cpp(prompt: Option<String>, mut config: Config, context_size: u64, url: String, resume: Option<String>) -> Result<()> {
+    // Health check the remote server
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let health_url = format!("{}/health", url);
+    match client.get(&health_url).send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => anyhow::bail!(
+            "Remote llama-server at {} returned status {}. Is it healthy?",
+            url, resp.status()
+        ),
+        Err(e) => anyhow::bail!(
+            "Cannot reach llama-server at {} — is it running?\n  Error: {}",
+            url, e
+        ),
+    }
+
+    let model_name = config.model.as_deref().unwrap_or("default").to_string();
+
+    eprintln!("Connected to remote llama-server at {}", url);
+
+    // Ensure config reflects llama-cpp backend so TUI guards work correctly
+    config.backend = Some("llama-cpp".to_string());
+    config.llama_server_url = Some(url.clone());
+
+    let backend = LlamaCppBackend::new(url);
+    let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
+    let subagent_max_turns = config.subagent_max_turns.unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS);
+    let agent = Agent::new(Arc::new(backend), model_name, context_size, bash_timeout, subagent_max_turns);
+    let verbose = config.verbose.unwrap_or(false);
+    let (session, restored) = resolve_session(&resume)?;
+
+    if let Some(prompt) = prompt {
+        let mut agent = agent;
+        if let Some(msgs) = restored {
+            agent.restore_messages(msgs);
+        }
+        run_pipe(agent, &prompt, session, verbose).await
+    } else {
+        tui::run(agent, context_size, session, config, None, restored, None).await
     }
 }
 
@@ -304,7 +426,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
             AgentEvent::Debug(ref msg) if verbose => {
                 eprintln!("[debug] {}", msg);
             }
-            AgentEvent::ContextUpdate { .. } | AgentEvent::ContentReplaced(_) | AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) => {}
+            AgentEvent::ContextUpdate { .. } | AgentEvent::ContentReplaced(_) | AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) | AgentEvent::SystemPromptInfo { .. } => {}
         }
     }
 

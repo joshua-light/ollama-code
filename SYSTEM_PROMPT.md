@@ -7,6 +7,8 @@ Working directory: {cwd}.
 - read(path, offset?, limit?): Read file contents. Use this, not cat/head/tail
 - edit(path, old, new): Replace exact string in a file. Use this, not sed/echo/tee
 - bash(command): Run shell commands. Use for: running programs, git, ls, find, install, anything not covered by read/edit
+    - glob(pattern): Find files matching a glob pattern.
+    - grep(pattern, path?): Search file contents using regex patterns.
 {subagent_tool}
 
 # Guidelines

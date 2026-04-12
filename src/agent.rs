@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -6,6 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::ModelBackend;
 use crate::message::Message;
+use crate::skills::{self, SkillMeta};
 use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SubagentToolDef, WriteTool, ToolRegistry};
 
 #[derive(Debug, Clone)]
@@ -23,7 +25,7 @@ pub enum AgentEvent {
     ContextUpdate { prompt_tokens: u64 },
     /// Context was auto-trimmed to stay within the window.
     ContextTrimmed { removed_messages: usize, estimated_tokens_freed: u64 },
-    Done { prompt_tokens: u64 },
+    Done { prompt_tokens: u64, eval_count: u64 },
     /// Generation was cancelled by the user.
     Cancelled,
     Error(String),
@@ -34,6 +36,11 @@ pub enum AgentEvent {
     SubagentToolCall { name: String, args: String },
     SubagentToolResult { name: String, success: bool },
     SubagentEnd { result: String },
+    /// System prompt composition info (emitted once at first run).
+    SystemPromptInfo {
+        base_prompt_tokens: u64,
+        project_docs: Vec<(String, u64)>,
+    },
 }
 
 /// Maximum number of lines to keep in tool output stored in context.
@@ -76,6 +83,28 @@ fn send_event(
         .map_err(|_| anyhow::anyhow!("Event channel closed"))
 }
 
+/// Discover `CLAUDE.md` and `AGENTS.md` files by walking up from `cwd`.
+/// Stops at the first directory that contains either file.
+fn discover_project_docs(cwd: &str) -> Vec<(String, String)> {
+    let mut dir = Path::new(cwd).to_path_buf();
+    loop {
+        let mut found = Vec::new();
+        for name in &["CLAUDE.md", "AGENTS.md"] {
+            let path = dir.join(name);
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                found.push((name.to_string(), content));
+            }
+        }
+        if !found.is_empty() {
+            return found;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    Vec::new()
+}
+
 pub struct Agent {
     backend: Arc<dyn ModelBackend>,
     tools: ToolRegistry,
@@ -88,6 +117,12 @@ pub struct Agent {
     max_turns: Option<u16>,
     /// Turn limit passed to sub-agents spawned by this agent.
     subagent_max_turns: u16,
+    /// Char count of the base system prompt (before project docs).
+    system_prompt_base_len: usize,
+    /// Loaded project doc files: (filename, char_count).
+    project_docs_info: Vec<(String, usize)>,
+    /// Discovered skills (name + description only; body loaded on activation).
+    skills: Vec<SkillMeta>,
 }
 
 impl Agent {
@@ -126,9 +161,39 @@ impl Agent {
              or any task that would benefit from a clean context window"
         };
 
-        let system_prompt = include_str!("../SYSTEM_PROMPT.md")
+        let mut system_prompt = include_str!("../SYSTEM_PROMPT.md")
             .replace("{cwd}", &cwd)
             .replace("{subagent_tool}", subagent_desc);
+
+        let system_prompt_base_len = system_prompt.len();
+
+        // Load project docs (CLAUDE.md / AGENTS.md) for top-level agents only.
+        let project_docs_info = if !is_subagent {
+            let docs = discover_project_docs(&cwd);
+            let mut info = Vec::new();
+            for (name, content) in &docs {
+                system_prompt.push_str(&format!(
+                    "\n\n---\n\n# Project Instructions ({})\n\n{}",
+                    name, content
+                ));
+                info.push((name.clone(), content.len()));
+            }
+            info
+        } else {
+            Vec::new()
+        };
+
+        // Discover skills (.agents/skills/*/SKILL.md) for top-level agents only.
+        // Only name + description are injected into the system prompt (discovery layer).
+        let discovered_skills = if !is_subagent {
+            let found = skills::discover_skills(&cwd);
+            if !found.is_empty() {
+                system_prompt.push_str(&skills::format_skill_summaries(&found));
+            }
+            found
+        } else {
+            Vec::new()
+        };
 
         let messages = vec![Message::system(&system_prompt)];
 
@@ -142,6 +207,9 @@ impl Agent {
             bash_timeout,
             max_turns,
             subagent_max_turns,
+            system_prompt_base_len,
+            project_docs_info,
+            skills: discovered_skills,
         }
     }
 
@@ -170,6 +238,10 @@ impl Agent {
         &self.model
     }
 
+    pub fn skills(&self) -> &[SkillMeta] {
+        &self.skills
+    }
+
     pub fn set_model(&mut self, model: String) {
         self.model = model;
     }
@@ -184,6 +256,40 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.messages.truncate(1); // keep system prompt
+    }
+
+    /// Restore conversation from a previously saved session.
+    /// Replaces the loaded system prompt with the agent's fresh one (current cwd/tools),
+    /// and marks the system prompt as already logged to prevent re-logging.
+    pub fn restore_messages(&mut self, mut messages: Vec<Message>) {
+        // Drop the old system prompt from the saved messages
+        if !messages.is_empty() && matches!(messages[0].role, crate::message::Role::System) {
+            messages.remove(0);
+        }
+        // Prepend our fresh system prompt
+        let fresh_system = self.messages[0].clone();
+        messages.insert(0, fresh_system);
+        self.messages = messages;
+        self.system_prompt_logged = true;
+    }
+
+    /// Remove the last `n` user turns from the message history.
+    /// The system prompt (index 0) is always preserved.
+    pub fn rewind_turns(&mut self, n: usize) {
+        let user_indices: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| matches!(m.role, crate::message::Role::User).then_some(i))
+            .collect();
+
+        if user_indices.is_empty() {
+            return;
+        }
+
+        let actual_n = n.min(user_indices.len());
+        let truncate_at = user_indices[user_indices.len() - actual_n];
+        self.messages.truncate(truncate_at);
     }
 
     /// Return the last assistant message content, or a fallback string.
@@ -261,6 +367,12 @@ impl Agent {
             if let Some(sys_msg) = self.messages.first() {
                 send_event(events, AgentEvent::MessageLogged(sys_msg.clone()))?;
             }
+            send_event(events, AgentEvent::SystemPromptInfo {
+                base_prompt_tokens: (self.system_prompt_base_len as u64) / 4,
+                project_docs: self.project_docs_info.iter()
+                    .map(|(name, len)| (name.clone(), (*len as u64) / 4))
+                    .collect(),
+            })?;
             self.system_prompt_logged = true;
         }
 
@@ -308,7 +420,7 @@ impl Agent {
                             send_event(events, AgentEvent::MessageLogged(msg))?;
                         }
                     }
-                    send_event(events, AgentEvent::Done { prompt_tokens: 0 })?;
+                    send_event(events, AgentEvent::Done { prompt_tokens: 0, eval_count: 0 })?;
                     return Ok(());
                 }
             }
@@ -335,7 +447,7 @@ impl Agent {
                         Ok(r) => r,
                         Err(e) => {
                             send_event(events, AgentEvent::Error(e.to_string()))?;
-                            send_event(events, AgentEvent::Done { prompt_tokens: 0 })?;
+                            send_event(events, AgentEvent::Done { prompt_tokens: 0, eval_count: 0 })?;
                             return Ok(());
                         }
                     }
@@ -481,6 +593,7 @@ impl Agent {
                         events,
                         AgentEvent::Done {
                             prompt_tokens: response.prompt_eval_count,
+                            eval_count: response.eval_count,
                         },
                     )?;
                     return Ok(());
@@ -508,6 +621,7 @@ impl Agent {
                     events,
                     AgentEvent::Done {
                         prompt_tokens: response.prompt_eval_count,
+                        eval_count: response.eval_count,
                     },
                 )?;
                 return Ok(());
@@ -540,47 +654,7 @@ impl Agent {
                 let name = &tool_call.function.name;
                 let args = &tool_call.function.arguments;
 
-                // Format args for display based on tool type
-                let args_display = match name.as_str() {
-                    "bash" => args
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    "read" => {
-                        let path = args
-                            .get("file_path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?");
-                        let offset = args.get("offset").and_then(|v| v.as_u64());
-                        let limit = args.get("limit").and_then(|v| v.as_u64());
-                        match (offset, limit) {
-                            (Some(o), Some(l)) => format!("{}, offset={}, limit={}", path, o, l),
-                            (Some(o), None) => format!("{}, offset={}", path, o),
-                            (None, Some(l)) => format!("{}, limit={}", path, l),
-                            (None, None) => path.to_string(),
-                        }
-                    }
-                    "edit" => args
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    "subagent" => args
-                        .get("task")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    "glob" | "grep" => {
-                        let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
-                        let path = args.get("path").and_then(|v| v.as_str());
-                        match path {
-                            Some(p) => format!("{} in {}", pattern, p),
-                            None => pattern.to_string(),
-                        }
-                    }
-                    _ => args.to_string(),
-                };
+                let args_display = crate::format::format_tool_args_display(name, args);
 
                 send_event(
                     events,
@@ -619,8 +693,22 @@ impl Agent {
                     }
                 }
 
+                // Check cancellation before each tool call
+                if cancel.load(Ordering::Relaxed) {
+                    send_event(events, AgentEvent::Cancelled)?;
+                    return Ok(());
+                }
+
                 let (result, success) = if name == "bash" {
-                    BashTool.execute_async(args, self.bash_timeout).await
+                    // Race tool execution against the cancel flag so ESC kills
+                    // long-running bash commands immediately.
+                    tokio::select! {
+                        output = BashTool.execute_async(args, self.bash_timeout) => output,
+                        _ = poll_cancel(&cancel) => {
+                            send_event(events, AgentEvent::Cancelled)?;
+                            return Ok(());
+                        }
+                    }
                 } else if name == "subagent" {
                     let task = args
                         .get("task")

@@ -371,8 +371,11 @@ fn process_openai_chunk(
             if let Some(delta) = &choice.delta {
                 if let Some(text) = &delta.content {
                     if !text.is_empty() {
-                        content.push_str(text);
-                        on_token(text);
+                        let cleaned = strip_special_tokens(text);
+                        if !cleaned.is_empty() {
+                            content.push_str(&cleaned);
+                            on_token(&cleaned);
+                        }
                     }
                 }
                 if let Some(tool_calls) = &delta.tool_calls {
@@ -424,8 +427,11 @@ fn process_chunk(
     if let Some(msg) = &parsed.message {
         if let Some(text) = &msg.content {
             if !text.is_empty() {
-                content.push_str(text);
-                on_token(text);
+                let cleaned = strip_special_tokens(text);
+                if !cleaned.is_empty() {
+                    content.push_str(&cleaned);
+                    on_token(&cleaned);
+                }
             }
         }
         if let Some(calls) = &msg.tool_calls {

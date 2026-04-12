@@ -9,10 +9,9 @@ use ratatui::{
 use crate::commands;
 use crate::format;
 
-use super::app::{App, ChatMessage, PendingConfirm, ToolResultData};
+use super::app::{App, ChatMessage, PendingConfirm, ServerLoadingState, ToolResultData};
 use super::markdown::{render_markdown, MD_INDENT};
 
-pub(super) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const VERBS: &[&str] = &[
     "Tempering",
     "Harmonizing",
@@ -71,14 +70,6 @@ fn render_expanded_output(lines: &mut Vec<Line<'static>>, output: &str) {
             Style::default().fg(Color::DarkGray),
         )));
     }
-}
-
-pub(super) fn spinner_frame() -> &'static str {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    SPINNER[(ms / 80) as usize % SPINNER.len()]
 }
 
 pub(crate) fn pick_verb() -> String {
@@ -403,7 +394,7 @@ fn render_status_line(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(
             "⏵⏵ bypass",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::Red)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -420,6 +411,19 @@ fn render_status_line(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(
             format!("⚙ {}", app.tool_call_count),
             Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    // Estimated Opus 4.6 cost
+    if app.config.show_cost_estimate.unwrap_or(false)
+        && (app.total_input_tokens > 0 || app.total_output_tokens > 0)
+    {
+        let cost = app.total_input_tokens as f64 * 5.0 / 1_000_000.0
+                 + app.total_output_tokens as f64 * 25.0 / 1_000_000.0;
+        spans.push(sep_span());
+        spans.push(Span::styled(
+            format!("${:.4}", cost),
+            Style::default().fg(Color::Cyan),
         ));
     }
 
@@ -489,7 +493,7 @@ fn render_command_completions(
 fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
-    if app.messages.is_empty() && app.current_response.is_empty() {
+    if app.messages.is_empty() && app.current_response.is_empty() && app.server_loading.is_none() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  Type a message to get started.",
@@ -524,6 +528,8 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 user_chars,
                 assistant_chars,
                 tool_chars,
+                base_prompt_tokens,
+                project_docs_tokens,
             } => {
                 render_chat_context_info(
                     &mut lines,
@@ -535,6 +541,8 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     *user_chars,
                     *assistant_chars,
                     *tool_chars,
+                    *base_prompt_tokens,
+                    project_docs_tokens,
                 );
             }
             ChatMessage::GenerationSummary { duration } => {
@@ -562,9 +570,14 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         && !matches!(
             app.messages.last(),
             Some(ChatMessage::ToolCall { result: None, .. })
+                | Some(ChatMessage::SubagentToolCall { .. })
         )
     {
-        render_chat_progress(&mut lines, app);
+        if let Some(ref loading) = app.server_loading {
+            render_server_loading_progress(&mut lines, loading);
+        } else {
+            render_chat_progress(&mut lines, app);
+        }
     }
 
     lines
@@ -614,7 +627,7 @@ fn render_chat_tool_call(
     let circle_color = match result {
         Some(ToolResultData { success: true, .. }) => Color::Green,
         Some(ToolResultData { success: false, .. }) => Color::Red,
-        None => Color::White,
+        None => Color::DarkGray,
     };
     lines.push(Line::from(vec![
         Span::styled(" ● ", Style::default().fg(circle_color)),
@@ -631,19 +644,13 @@ fn render_chat_tool_call(
             "edit" => {
                 render_edit_result(lines, result_data);
             }
+            "write" => {
+                render_write_result(lines, result_data);
+            }
             _ => {
                 render_default_result(lines, result_data, expanded);
             }
         }
-    } else {
-        // Tool is still running
-        lines.push(Line::from(vec![
-            Span::styled(format::PREFIX_FIRST, Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} Running...", spinner_frame()),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
     }
 }
 
@@ -697,6 +704,8 @@ fn render_chat_context_info(
     user_chars: usize,
     assistant_chars: usize,
     tool_chars: usize,
+    base_prompt_tokens: u64,
+    project_docs_tokens: &[(String, u64)],
 ) {
     lines.push(Line::from(""));
     // Header
@@ -743,8 +752,20 @@ fn render_chat_context_info(
         )));
     }
 
-    // Message counts
+    // System prompt breakdown
     lines.push(Line::from(""));
+    if base_prompt_tokens > 0 {
+        let mut parts = vec![format!("~{} base", format_number(base_prompt_tokens))];
+        for (name, tokens) in project_docs_tokens {
+            parts.push(format!("~{} {}", format_number(*tokens), name));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("   System    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(parts.join(" · "), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    // Message counts
     lines.push(Line::from(vec![
         Span::styled("   Messages  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -849,7 +870,7 @@ fn render_chat_progress(lines: &mut Vec<Line<'static>>, app: &App) {
     let (symbol, symbol_color) = if app.has_received_tokens {
         ("·", Color::DarkGray)
     } else {
-        ("✻", Color::Yellow)
+        ("✻", Color::DarkGray)
     };
 
     lines.push(Line::from(""));
@@ -857,6 +878,57 @@ fn render_chat_progress(lines: &mut Vec<Line<'static>>, app: &App) {
         Span::styled(format!(" {} ", symbol), Style::default().fg(symbol_color)),
         Span::styled(
             format!("{}… ({}{})", app.generation_verb, time_str, token_str),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]));
+}
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn render_server_loading_progress(lines: &mut Vec<Line<'static>>, loading: &ServerLoadingState) {
+    let elapsed = loading.start.elapsed();
+    let time_str = format_elapsed(elapsed);
+    let pct = (loading.progress * 100.0) as u64;
+
+    let bar_width: usize = 30;
+    let filled = ((loading.progress * bar_width as f32) as usize).min(bar_width);
+    let empty = bar_width - filled;
+
+    let bar_color = if pct > 80 {
+        Color::Green
+    } else {
+        Color::Cyan
+    };
+
+    let spinner_idx = (elapsed.as_millis() / 80) as usize % SPINNER.len();
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {} ", SPINNER[spinner_idx]),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            format!("Loading {}…", loading.model_name),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("   "),
+        Span::styled("━".repeat(filled), Style::default().fg(bar_color)),
+        Span::styled("╌".repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {}%", pct),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  ({})", time_str),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
@@ -939,15 +1011,64 @@ fn render_edit_result(lines: &mut Vec<Line<'static>>, result: &ToolResultData) {
     // Render diff lines with colors
     for diff_line in &diff_lines {
         let style = if diff_line.starts_with('-') {
-            Style::default().fg(Color::Red)
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Indexed(52))
         } else if diff_line.starts_with('+') {
-            Style::default().fg(Color::Green)
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Indexed(22))
         } else {
             Style::default().fg(Color::DarkGray)
         };
         lines.push(Line::from(Span::styled(
             format!("      {}", diff_line),
             style,
+        )));
+    }
+}
+
+fn render_write_result(lines: &mut Vec<Line<'static>>, result: &ToolResultData) {
+    if !result.success {
+        lines.push(Line::from(Span::styled(
+            format::format_tool_error(&result.output),
+            Style::default().fg(Color::Red),
+        )));
+        return;
+    }
+
+    // First line is the summary "Created 'path' (N lines)", rest is the diff
+    let mut output_lines = result.output.lines();
+    let summary = output_lines.next().unwrap_or("Created file");
+
+    lines.push(Line::from(vec![
+        Span::styled(format::PREFIX_FIRST, Style::default().fg(Color::DarkGray)),
+        Span::styled(summary.to_string(), Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let max_diff_lines = 30;
+    let mut shown = 0;
+    let mut remaining = 0;
+    for diff_line in output_lines {
+        if diff_line.is_empty() {
+            continue;
+        }
+        if shown < max_diff_lines {
+            lines.push(Line::from(Span::styled(
+                format!("      {}", diff_line),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Indexed(22)),
+            )));
+            shown += 1;
+        } else {
+            remaining += 1;
+        }
+    }
+    if remaining > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("      ... ({} more lines)", remaining),
+            Style::default().fg(Color::DarkGray),
         )));
     }
 }

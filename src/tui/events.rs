@@ -22,6 +22,14 @@ pub(super) fn handle_terminal_event(
     model_tx: &mpsc::UnboundedSender<Result<Vec<String>>>,
     session: &Session,
 ) {
+    if let Event::Paste(text) = evt {
+        if !app.is_processing && app.pending_confirm.is_none() && app.model_choices.is_none() {
+            app.input.insert_str(app.cursor_pos, &text);
+            app.cursor_pos += text.len();
+        }
+        return;
+    }
+
     if let Event::Key(key) = evt {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if app.pending_confirm.is_some() {
@@ -72,7 +80,12 @@ pub(super) fn handle_terminal_event(
 
         if app.is_processing {
             if key.code == KeyCode::Esc {
-                app.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                if app.server_loading.is_some() {
+                    // Quit during initial server loading (Drop kills the child process)
+                    app.should_quit = true;
+                } else {
+                    app.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             return;
         }
@@ -115,7 +128,14 @@ pub(super) fn handle_terminal_event(
                     };
 
                     if let Some(model_name) = resolved {
-                        if model_name.contains('/') {
+                        if model_name.contains('/') && app.config.llama_server_url.is_some() {
+                            // Remote server — cannot spawn a local llama-server
+                            app.messages.push(ChatMessage::Error(
+                                "Cannot start a local llama-server while connected to a remote server. \
+                                 Change the model on the remote server directly.".into(),
+                            ));
+                            app.dismiss_model_chooser();
+                        } else if model_name.contains('/') {
                             // HuggingFace repo — defer start so event loop stops old server first
                             let hf_repo = model_name;
                             let server_path = app.config.llama_server_path.clone();
@@ -158,7 +178,7 @@ pub(super) fn handle_terminal_event(
                             } else {
                                 // Switch to Ollama backend (stop server in event loop)
                                 app.stop_llama_server = true;
-                                let backend = OllamaBackend::new(None);
+                                let backend = OllamaBackend::new(app.config.ollama_url.clone());
                                 let _ = input_tx.send(AgentInput::SetBackend(Arc::new(backend)));
                                 app.model = model_name.clone();
                                 let _ = input_tx.send(AgentInput::SetModel(model_name.clone()));
@@ -215,6 +235,15 @@ pub(super) fn handle_terminal_event(
                 if let Some(cmd) = matches.first() {
                     app.input = cmd.name.to_string();
                     app.cursor_pos = app.input.len();
+                } else {
+                    // Check skill name completions
+                    let prefix = app.input.trim();
+                    if let Some(skill_prefix) = prefix.strip_prefix('/') {
+                        if let Some(skill) = app.skills.iter().find(|s| s.name.starts_with(skill_prefix)) {
+                            app.input = format!("/{}", skill.name);
+                            app.cursor_pos = app.input.len();
+                        }
+                    }
                 }
             }
             KeyCode::Char(c) => {
@@ -301,11 +330,13 @@ pub(super) fn handle_agent_event(event: AgentEvent, app: &mut App) {
         AgentEvent::ContextUpdate { prompt_tokens } => {
             app.context_used = prompt_tokens;
         }
-        AgentEvent::Done { prompt_tokens, .. } => {
+        AgentEvent::Done { prompt_tokens, eval_count } => {
             app.flush_streaming();
             if prompt_tokens > 0 {
                 app.context_used = prompt_tokens;
             }
+            app.total_input_tokens += prompt_tokens;
+            app.total_output_tokens += eval_count;
             if let Some(start) = app.generation_start.take() {
                 let duration = start.elapsed();
                 if duration.as_secs() >= 1 {
@@ -371,6 +402,10 @@ pub(super) fn handle_agent_event(event: AgentEvent, app: &mut App) {
             app.is_processing = false;
             app.generation_start = None;
         }
+        AgentEvent::SystemPromptInfo { base_prompt_tokens, project_docs } => {
+            app.base_prompt_tokens = base_prompt_tokens;
+            app.project_docs_tokens = project_docs;
+        }
         // MessageLogged and Debug are handled by the session logger in the event loop,
         // not by the app state.
         AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) => {}
@@ -405,6 +440,34 @@ fn handle_command(
         commands::SlashCommand::Clear => {
             app.reset_conversation(input_tx, "Conversation cleared.");
         }
+        commands::SlashCommand::Rewind => {
+            let arg = raw_input.trim().strip_prefix("/rewind").unwrap_or("").trim();
+            let n = if arg.is_empty() {
+                1
+            } else if let Ok(num) = arg.parse::<usize>() {
+                if num == 0 {
+                    app.messages.push(ChatMessage::Info(
+                        "Usage: /rewind [N] — undo the last N turns (default: 1)".into(),
+                    ));
+                    if was_at_bottom { app.scroll_offset = 0; }
+                    return;
+                }
+                num
+            } else {
+                1
+            };
+
+            let rewound = app.rewind_turns(n, input_tx);
+            if rewound == 0 {
+                app.messages.push(ChatMessage::Info("Nothing to rewind.".into()));
+            } else if rewound == 1 {
+                app.messages.push(ChatMessage::Info("Rewound last turn.".into()));
+            } else {
+                app.messages.push(ChatMessage::Info(
+                    format!("Rewound last {} turns.", rewound),
+                ));
+            }
+        }
         commands::SlashCommand::Context => {
             // `/context <size>` — set context size for current model
             let arg = raw_input.trim().strip_prefix("/context").unwrap_or("").trim();
@@ -424,7 +487,13 @@ fn handle_command(
                 }
                 app.config = config;
 
-                if is_llama_cpp {
+                if is_llama_cpp && app.config.llama_server_url.is_some() {
+                    // Remote server — can't restart it, just update the local parameter
+                    app.messages.push(ChatMessage::Info(format!(
+                        "Context size set to {} (local parameter). The remote server's actual context limit is controlled on the server side.",
+                        format_number(new_size)
+                    )));
+                } else if is_llama_cpp {
                     // Restart llama-server with the new context size
                     let model_source = if let Some(ref hf) = app.config.hf_repo {
                         Some(ModelSource::HuggingFace(hf.clone()))
@@ -512,6 +581,8 @@ fn handle_command(
                     user_chars,
                     assistant_chars,
                     tool_chars,
+                    base_prompt_tokens: app.base_prompt_tokens,
+                    project_docs_tokens: app.project_docs_tokens.clone(),
                 });
             }
         }
@@ -527,6 +598,27 @@ fn handle_command(
                 let _ = tx.send(result);
             });
         }
+        commands::SlashCommand::Resume => {
+            match crate::session::Session::list_recent(10) {
+                Ok(sessions) if sessions.is_empty() => {
+                    app.messages.push(ChatMessage::Info("No previous sessions found.".into()));
+                }
+                Ok(sessions) => {
+                    let mut info = String::from("Recent sessions:\n");
+                    for (i, id) in sessions.iter().enumerate() {
+                        let current = if id == session.id() { " (current)" } else { "" };
+                        info.push_str(&format!("  {}. {}{}\n", i + 1, id, current));
+                    }
+                    info.push_str("\nUse --resume <id> to resume a session.");
+                    app.messages.push(ChatMessage::Info(info));
+                }
+                Err(e) => {
+                    app.messages.push(ChatMessage::Error(format!(
+                        "Failed to list sessions: {}", e
+                    )));
+                }
+            }
+        }
         commands::SlashCommand::Session => {
             app.messages.push(ChatMessage::Info(format!(
                 "Session: {}",
@@ -537,8 +629,50 @@ fn handle_command(
             app.reset_conversation(input_tx, "New conversation started.");
         }
         commands::SlashCommand::Unknown(name) => {
-            app.messages
-                .push(ChatMessage::Info(format!("Unknown command: {}", name)));
+            let skill_name = name.trim_start_matches('/');
+            if let Some(skill) = app.skills.iter().find(|s| s.name == skill_name) {
+                match skill.load_instructions() {
+                    Ok(instructions) => {
+                        // Extract user args after the command name
+                        let args = raw_input
+                            .trim()
+                            .strip_prefix(&name)
+                            .unwrap_or("")
+                            .trim();
+
+                        // Show the slash command in chat (not the full instructions)
+                        let display = if args.is_empty() {
+                            format!("/{}", skill_name)
+                        } else {
+                            format!("/{} {}", skill_name, args)
+                        };
+                        app.messages.push(ChatMessage::User(display));
+
+                        // Build the prompt: instructions + optional user args
+                        let prompt = if args.is_empty() {
+                            instructions
+                        } else {
+                            format!("{}\n\nUser input: {}", instructions, args)
+                        };
+
+                        app.is_processing = true;
+                        app.generation_start = Some(Instant::now());
+                        app.generation_tokens = 0;
+                        app.generation_verb = pick_verb();
+                        app.has_received_tokens = false;
+                        let _ = input_tx.send(AgentInput::Message(prompt));
+                    }
+                    Err(e) => {
+                        app.messages.push(ChatMessage::Error(format!(
+                            "Failed to load skill '{}': {}",
+                            skill_name, e
+                        )));
+                    }
+                }
+            } else {
+                app.messages
+                    .push(ChatMessage::Info(format!("Unknown command: {}", name)));
+            }
         }
     }
 
