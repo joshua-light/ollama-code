@@ -91,6 +91,18 @@ impl Session {
             AgentEvent::ContentReplaced(_) => {
                 "CONTENT_REPLACED (tool calls extracted from text)".to_string()
             }
+            AgentEvent::ToolConfirmRequest { name, args } => {
+                format!("TOOL_CONFIRM_REQUEST {}({})", name, args)
+            }
+            AgentEvent::ContextTrimmed {
+                removed_messages,
+                estimated_tokens_freed,
+            } => {
+                format!(
+                    "CONTEXT_TRIMMED removed={} freed_est={}",
+                    removed_messages, estimated_tokens_freed
+                )
+            }
             AgentEvent::MessageLogged(_) => return, // handled separately via log_message
             AgentEvent::Debug(s) => format!("DEBUG {}", s),
         };

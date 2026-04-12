@@ -85,7 +85,8 @@ async fn run_ollama(cli: Cli, mut config: Config, context_size: u64) -> Result<(
         m
     };
 
-    let agent = Agent::new(ollama.clone(), model, context_size);
+    let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
+    let agent = Agent::new(ollama.clone(), model, context_size, bash_timeout);
     let session = Session::new()?;
 
     if let Some(prompt) = cli.prompt {
@@ -157,7 +158,8 @@ async fn run_llama_cpp(cli: Cli, config: Config, context_size: u64) -> Result<()
 
     let ollama = OllamaClient::new(Some(server.base_url()));
 
-    let agent = Agent::new(ollama.clone(), model_name.to_string(), context_size);
+    let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
+    let agent = Agent::new(ollama.clone(), model_name.to_string(), context_size, bash_timeout);
     let session = Session::new()?;
 
     if let Some(prompt) = cli.prompt {
@@ -205,11 +207,12 @@ async fn select_model(ollama: &OllamaClient) -> Result<String> {
 
 async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let (confirm_tx, mut confirm_rx) = mpsc::unbounded_channel::<bool>();
 
     eprintln!("Session: {}", session.path().display());
 
     let prompt = prompt.to_string();
-    let handle = tokio::spawn(async move { agent.run(&prompt, &tx).await });
+    let handle = tokio::spawn(async move { agent.run(&prompt, &tx, &mut confirm_rx).await });
 
     while let Some(event) = rx.recv().await {
         session.log_agent_event(&event);
@@ -228,6 +231,10 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session) -> Resul
                     format::truncate_args(&args, 77),
                 );
             }
+            AgentEvent::ToolConfirmRequest { .. } => {
+                // Auto-approve in pipe mode
+                let _ = confirm_tx.send(true);
+            }
             AgentEvent::ToolResult { output, success, .. } => {
                 if !success {
                     eprintln!("{}", format::format_tool_error(&output));
@@ -236,6 +243,9 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session) -> Resul
                         eprintln!("{}", line);
                     }
                 }
+            }
+            AgentEvent::ContextTrimmed { removed_messages, estimated_tokens_freed } => {
+                eprintln!("(context trimmed: {} messages, ~{} tokens freed)", removed_messages, estimated_tokens_freed);
             }
             AgentEvent::Done { .. } => {
                 println!();

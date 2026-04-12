@@ -38,6 +38,10 @@ pub struct Config {
     /// Extra arguments passed to llama-server (e.g. ["-ngl", "99"]).
     #[serde(default)]
     pub llama_server_args: Option<Vec<String>>,
+
+    /// Timeout for bash tool commands in seconds (default: 120).
+    #[serde(default)]
+    pub bash_timeout: Option<u64>,
 }
 
 impl Config {

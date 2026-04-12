@@ -18,6 +18,34 @@ pub trait Tool: Send + Sync {
 
 // --- Bash tool ---
 
+/// Format the output of a bash command into a result string and success flag.
+pub fn format_bash_output(output: &std::process::Output) -> (String, bool) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut result = String::new();
+    if !stdout.is_empty() {
+        result.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&stderr);
+    }
+    if result.is_empty() {
+        result.push_str("(no output)");
+    }
+    let success = output.status.success();
+    if !success {
+        result.push_str(&format!(
+            "\n(exit code: {})",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    (result, success)
+}
+
 pub struct BashTool;
 
 impl Tool for BashTool {
@@ -50,30 +78,7 @@ impl Tool for BashTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
 
         let output = Command::new("bash").arg("-c").arg(command).output()?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        let mut result = String::new();
-        if !stdout.is_empty() {
-            result.push_str(&stdout);
-        }
-        if !stderr.is_empty() {
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(&stderr);
-        }
-        if result.is_empty() {
-            result.push_str("(no output)");
-        }
-        if !output.status.success() {
-            result.push_str(&format!(
-                "\n(exit code: {})",
-                output.status.code().unwrap_or(-1)
-            ));
-        }
-
+        let (result, _) = format_bash_output(&output);
         Ok(result)
     }
 }

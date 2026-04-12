@@ -50,6 +50,22 @@ impl ToolCall {
 }
 
 impl Message {
+    /// Rough token estimate (chars / 4 heuristic for English text + overhead).
+    pub fn estimated_tokens(&self) -> u64 {
+        let content_tokens = (self.content.len() as u64) / 4;
+        let tool_call_tokens = self.tool_calls.as_ref().map_or(0, |calls| {
+            calls
+                .iter()
+                .map(|tc| {
+                    let name_len = tc.function.name.len() as u64;
+                    let args_len = tc.function.arguments.to_string().len() as u64;
+                    (name_len + args_len) / 4
+                })
+                .sum()
+        });
+        content_tokens + tool_call_tokens + 4 // 4 for role/formatting overhead
+    }
+
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,

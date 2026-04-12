@@ -245,6 +245,7 @@ struct OpenAIDelta {
 
 #[derive(Debug, Deserialize)]
 struct OpenAIToolCallDelta {
+    index: Option<usize>,
     function: Option<OpenAIFunctionDelta>,
 }
 
@@ -288,8 +289,9 @@ fn process_openai_chunk<F: Fn(&str)>(
                 }
                 if let Some(tool_calls) = &delta.tool_calls {
                     for (i, tc) in tool_calls.iter().enumerate() {
+                        let idx = tc.index.unwrap_or(i);
                         // Grow accumulators as needed
-                        while tool_accum.len() <= i {
+                        while tool_accum.len() <= idx {
                             tool_accum.push(OpenAIToolCallAccum {
                                 name: String::new(),
                                 arguments: String::new(),
@@ -297,10 +299,10 @@ fn process_openai_chunk<F: Fn(&str)>(
                         }
                         if let Some(func) = &tc.function {
                             if let Some(name) = &func.name {
-                                tool_accum[i].name = name.clone();
+                                tool_accum[idx].name = name.clone();
                             }
                             if let Some(args) = &func.arguments {
-                                tool_accum[i].arguments.push_str(args);
+                                tool_accum[idx].arguments.push_str(args);
                             }
                         }
                     }
@@ -371,6 +373,39 @@ fn process_chunk<F: Fn(&str)>(
             metrics.total_duration = n;
         }
     }
+}
+
+/// Parse API error JSON into a user-friendly message.
+///
+/// Handles two common shapes:
+/// - `{"error": {"message": "...", "type": "...", ...}}` (llama-server / OpenAI)
+/// - `{"error": "..."}` (Ollama native)
+fn parse_api_error(body: &str) -> Option<String> {
+    let json: Value = serde_json::from_str(body).ok()?;
+    let error = json.get("error")?;
+
+    // Nested error object (llama-server / OpenAI format)
+    if let Some(obj) = error.as_object() {
+        let error_type = obj.get("type").and_then(|t| t.as_str());
+        if error_type == Some("exceed_context_size_error") {
+            let n_prompt = obj.get("n_prompt_tokens").and_then(|n| n.as_u64());
+            let n_ctx = obj.get("n_ctx").and_then(|n| n.as_u64());
+            if let (Some(prompt), Some(ctx)) = (n_prompt, n_ctx) {
+                return Some(format!(
+                    "Context window exceeded ({} tokens requested, {} available). \
+                     Use /clear to start fresh.",
+                    prompt, ctx,
+                ));
+            }
+        }
+        // Fall back to the message field
+        if let Some(msg) = obj.get("message").and_then(|m| m.as_str()) {
+            return Some(msg.to_string());
+        }
+    }
+
+    // Simple string: {"error": "..."}
+    error.as_str().map(|s| s.to_string())
 }
 
 impl OllamaClient {
@@ -459,6 +494,9 @@ impl OllamaClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if let Some(message) = parse_api_error(&body) {
+                anyhow::bail!("{}", message);
+            }
             anyhow::bail!("Ollama API error ({}): {}", status, body);
         }
 

@@ -19,7 +19,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "/context",
-        description: "Show context window usage",
+        description: "Show or set context window size",
     },
     CommandInfo {
         name: "/model",

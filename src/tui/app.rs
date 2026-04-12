@@ -1,0 +1,188 @@
+use std::time::Instant;
+use tokio::sync::mpsc;
+
+use crate::config::Config;
+use crate::ollama::OllamaClient;
+
+pub(crate) enum AgentInput {
+    Message(String),
+    ClearHistory,
+    SetModel(String),
+    SetContextSize(u64),
+    SetClient(OllamaClient),
+}
+
+#[derive(Clone)]
+pub(crate) struct ToolResultData {
+    pub(crate) output: String,
+    pub(crate) success: bool,
+}
+
+#[derive(Clone)]
+pub(crate) enum ChatMessage {
+    User(String),
+    Assistant(String),
+    ToolCall {
+        name: String,
+        args: String,
+        result: Option<ToolResultData>,
+    },
+    Error(String),
+    Info(String),
+    ContextInfo {
+        context_used: u64,
+        context_size: u64,
+        user_messages: u32,
+        assistant_messages: u32,
+        tool_calls: u32,
+        user_chars: usize,
+        assistant_chars: usize,
+        tool_chars: usize,
+    },
+    GenerationSummary { duration: std::time::Duration },
+}
+
+pub(crate) struct PendingConfirm {
+    pub(crate) name: String,
+    pub(crate) args: String,
+}
+
+pub(crate) struct App {
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) current_response: String,
+    pub(crate) input: String,
+    pub(crate) cursor_pos: usize,
+    pub(crate) is_processing: bool,
+    pub(crate) model: String,
+    pub(crate) should_quit: bool,
+    pub(crate) scroll_offset: u16,
+    pub(crate) max_scroll: u16,
+    // Generation tracking
+    pub(crate) generation_start: Option<Instant>,
+    pub(crate) generation_tokens: usize,
+    pub(crate) generation_verb: String,
+    pub(crate) has_received_tokens: bool,
+    // Status line
+    pub(crate) dir_name: String,
+    pub(crate) context_size: u64,
+    pub(crate) context_used: u64,
+    pub(crate) session_start: Instant,
+    pub(crate) tool_call_count: usize,
+    pub(crate) tools_expanded: bool,
+    pub(crate) git_branch: Option<String>,
+    pub(crate) git_dirty: bool,
+    // Model selection
+    pub(crate) ollama: OllamaClient,
+    pub(crate) model_choices: Option<Vec<String>>,
+    pub(crate) config: Config,
+    /// Set by model selection to signal the event loop to stop the llama-server
+    pub(crate) stop_llama_server: bool,
+    /// Pending tool confirmation awaiting user response
+    pub(crate) pending_confirm: Option<PendingConfirm>,
+    /// Force a full terminal clear before the next draw (e.g. after expand/collapse)
+    pub(crate) needs_clear: bool,
+}
+
+impl App {
+    pub(crate) fn new(model: String, context_size: u64, ollama: OllamaClient, config: Config) -> Self {
+        let (git_branch, git_dirty) = super::render::get_git_info_sync();
+        let dir_name = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| ".".to_string());
+        Self {
+            messages: Vec::new(),
+            current_response: String::new(),
+            input: String::new(),
+            cursor_pos: 0,
+            is_processing: false,
+            model,
+            should_quit: false,
+            scroll_offset: 0,
+            max_scroll: 0,
+            generation_start: None,
+            generation_tokens: 0,
+            generation_verb: super::render::pick_verb(),
+            has_received_tokens: false,
+            dir_name,
+            context_size,
+            context_used: 0,
+            session_start: Instant::now(),
+            tool_call_count: 0,
+            tools_expanded: false,
+            git_branch,
+            git_dirty,
+            ollama,
+            model_choices: None,
+            config,
+            stop_llama_server: false,
+            pending_confirm: None,
+            needs_clear: false,
+        }
+    }
+
+    pub(crate) fn submit(&mut self) -> Option<String> {
+        if self.input.trim().is_empty() || self.is_processing {
+            return None;
+        }
+        let msg = self.input.clone();
+        self.input.clear();
+        self.cursor_pos = 0;
+        self.messages.push(ChatMessage::User(msg.clone()));
+        self.is_processing = true;
+        self.generation_start = Some(Instant::now());
+        self.generation_tokens = 0;
+        self.generation_verb = super::render::pick_verb();
+        self.has_received_tokens = false;
+        Some(msg)
+    }
+
+    pub(crate) fn flush_streaming(&mut self) {
+        if !self.current_response.is_empty() {
+            self.messages.push(ChatMessage::Assistant(std::mem::take(
+                &mut self.current_response,
+            )));
+        }
+    }
+
+    pub(crate) fn scroll_up(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(self.max_scroll);
+    }
+
+    pub(crate) fn scroll_down(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub(crate) fn is_at_bottom(&self) -> bool {
+        self.scroll_offset == 0
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if self.cursor_pos > 0 {
+            let prev = self.input[..self.cursor_pos]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.input.remove(prev);
+            self.cursor_pos = prev;
+        }
+    }
+
+    pub(crate) fn dismiss_model_chooser(&mut self) {
+        self.model_choices = None;
+        self.input.clear();
+        self.cursor_pos = 0;
+    }
+
+    pub(crate) fn reset_conversation(&mut self, input_tx: &mpsc::UnboundedSender<AgentInput>, msg: &str) {
+        self.messages.clear();
+        self.current_response.clear();
+        self.context_used = 0;
+        self.tool_call_count = 0;
+        self.scroll_offset = 0;
+        self.max_scroll = 0;
+        let _ = input_tx.send(AgentInput::ClearHistory);
+        self.messages.push(ChatMessage::Info(msg.into()));
+    }
+}

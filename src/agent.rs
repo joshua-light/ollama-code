@@ -13,8 +13,13 @@ pub enum AgentEvent {
     /// JSON instead of using structured tool_calls).
     ContentReplaced(String),
     ToolCall { name: String, args: String },
+    /// Request user confirmation before executing a tool.
+    /// The agent blocks waiting on the confirm channel.
+    ToolConfirmRequest { name: String, args: String },
     ToolResult { name: String, output: String, success: bool },
     ContextUpdate { prompt_tokens: u64 },
+    /// Context was auto-trimmed to stay within the window.
+    ContextTrimmed { removed_messages: usize, estimated_tokens_freed: u64 },
     Done { prompt_tokens: u64 },
     Error(String),
     MessageLogged(Message),
@@ -38,10 +43,11 @@ pub struct Agent {
     messages: Vec<Message>,
     system_prompt_logged: bool,
     context_size: u64,
+    bash_timeout: std::time::Duration,
 }
 
 impl Agent {
-    pub fn new(ollama: OllamaClient, model: String, context_size: u64) -> Self {
+    pub fn new(ollama: OllamaClient, model: String, context_size: u64, bash_timeout: std::time::Duration) -> Self {
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(BashTool));
         tools.register(Box::new(ReadTool));
@@ -63,6 +69,7 @@ impl Agent {
             messages,
             system_prompt_logged: false,
             context_size,
+            bash_timeout,
         }
     }
 
@@ -86,10 +93,60 @@ impl Agent {
         self.messages.truncate(1); // keep system prompt
     }
 
+    /// Trim oldest non-system messages when context usage exceeds threshold.
+    /// Removes complete exchanges (user + assistant + tool messages) as units.
+    fn trim_context(&mut self, current_prompt_tokens: u64) -> Option<(usize, u64)> {
+        if self.context_size == 0 {
+            return None;
+        }
+
+        let threshold = self.context_size * 80 / 100;
+        if current_prompt_tokens <= threshold {
+            return None;
+        }
+
+        // Target: trim down to 60% of context
+        let target = self.context_size * 60 / 100;
+        let need_to_free = current_prompt_tokens.saturating_sub(target);
+
+        let first_non_system = self
+            .messages
+            .iter()
+            .position(|m| !matches!(m.role, crate::message::Role::System))
+            .unwrap_or(self.messages.len());
+
+        let mut freed: u64 = 0;
+        let mut remove_until = first_non_system;
+
+        // Walk forward, removing complete exchanges (up to the next User message)
+        let mut i = first_non_system;
+        while freed < need_to_free && i < self.messages.len().saturating_sub(1) {
+            freed += self.messages[i].estimated_tokens();
+            i += 1;
+            // Keep going until we hit the next User message (start of a new exchange)
+            while i < self.messages.len().saturating_sub(1)
+                && !matches!(self.messages[i].role, crate::message::Role::User)
+            {
+                freed += self.messages[i].estimated_tokens();
+                i += 1;
+            }
+            remove_until = i;
+        }
+
+        if remove_until > first_non_system {
+            let removed = remove_until - first_non_system;
+            self.messages.drain(first_non_system..remove_until);
+            Some((removed, freed))
+        } else {
+            None
+        }
+    }
+
     pub async fn run(
         &mut self,
         user_input: &str,
         events: &mpsc::UnboundedSender<AgentEvent>,
+        confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
     ) -> Result<()> {
         // Log system prompt on first run
         if !self.system_prompt_logged {
@@ -178,6 +235,17 @@ impl Agent {
                         prompt_tokens: response.prompt_eval_count,
                     },
                 )?;
+
+                // Auto-trim context if approaching the limit
+                if let Some((removed, freed)) = self.trim_context(response.prompt_eval_count) {
+                    send_event(
+                        events,
+                        AgentEvent::ContextTrimmed {
+                            removed_messages: removed,
+                            estimated_tokens_freed: freed,
+                        },
+                    )?;
+                }
             }
 
             if response.incomplete {
@@ -187,6 +255,40 @@ impl Agent {
                         "Ollama stream ended unexpectedly (connection may have dropped)".to_string(),
                     ),
                 )?;
+            }
+
+            // Check if context window is exhausted
+            if self.context_size > 0 && response.prompt_eval_count > 0 {
+                let total = response.prompt_eval_count + response.eval_count;
+                let context_full = total >= self.context_size;
+                // If tool calls are pending, also check if prompt alone is >90%
+                // of context — tool results will push us over on the next iteration.
+                let context_nearly_full = !response.tool_calls.is_empty()
+                    && response.prompt_eval_count > self.context_size * 90 / 100;
+
+                if context_full || context_nearly_full {
+                    // Save any text the model managed to generate
+                    if !response.content.trim().is_empty() {
+                        let assistant_msg = Message::assistant(&response.content);
+                        self.messages.push(assistant_msg.clone());
+                        send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
+                    }
+                    send_event(
+                        events,
+                        AgentEvent::Error(
+                            "Context window is full — the model can no longer process \
+                             this conversation. Use /clear to start fresh."
+                                .to_string(),
+                        ),
+                    )?;
+                    send_event(
+                        events,
+                        AgentEvent::Done {
+                            prompt_tokens: response.prompt_eval_count,
+                        },
+                    )?;
+                    return Ok(());
+                }
             }
 
             if response.tool_calls.is_empty() {
@@ -276,13 +378,71 @@ impl Agent {
                     events,
                     AgentEvent::ToolCall {
                         name: name.clone(),
-                        args: args_display,
+                        args: args_display.clone(),
                     },
                 )?;
 
-                let (result, success) = match self.tools.execute(name, args) {
-                    Ok(output) => (output, true),
-                    Err(e) => (format!("Error: {}", e), false),
+                // Request user confirmation for tools that modify state
+                let needs_confirm = matches!(name.as_str(), "bash" | "edit" | "write");
+                if needs_confirm {
+                    send_event(
+                        events,
+                        AgentEvent::ToolConfirmRequest {
+                            name: name.clone(),
+                            args: args_display,
+                        },
+                    )?;
+
+                    let approved = confirm_rx.recv().await.unwrap_or(false);
+                    if !approved {
+                        let denied = "Tool execution denied by user.".to_string();
+                        send_event(
+                            events,
+                            AgentEvent::ToolResult {
+                                name: name.clone(),
+                                output: denied.clone(),
+                                success: false,
+                            },
+                        )?;
+                        let tool_msg = Message::tool(&denied, tool_call.id.clone());
+                        self.messages.push(tool_msg.clone());
+                        send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+                        continue;
+                    }
+                }
+
+                let (result, success) = if name == "bash" {
+                    let command = args
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let timeout_dur = self.bash_timeout;
+                    match tokio::process::Command::new("bash")
+                        .arg("-c")
+                        .arg(&command)
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+                                Ok(Ok(output)) => crate::tools::format_bash_output(&output),
+                                Ok(Err(e)) => (format!("Error: {}", e), false),
+                                Err(_) => (
+                                    format!("Error: command timed out after {}s", timeout_dur.as_secs()),
+                                    false,
+                                ),
+                            }
+                        }
+                        Err(e) => (format!("Error: {}", e), false),
+                    }
+                } else {
+                    match self.tools.execute(name, args) {
+                        Ok(output) => (output, true),
+                        Err(e) => (format!("Error: {}", e), false),
+                    }
                 };
 
                 send_event(
