@@ -1,6 +1,7 @@
 mod agent;
 mod commands;
 mod config;
+mod format;
 mod llama_server;
 mod message;
 mod ollama;
@@ -221,18 +222,18 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session) -> Resul
                 std::io::stdout().flush().ok();
             }
             AgentEvent::ToolCall { name, args } => {
-                eprintln!("\n⚙ {} $ {}", name, args);
+                eprintln!(
+                    "\n ● {}({})",
+                    format::capitalize_first(&name),
+                    format::truncate_args(&args, 77),
+                );
             }
-            AgentEvent::ToolResult { output, .. } => {
-                let lines: Vec<&str> = output.lines().collect();
-                if lines.len() > 10 {
-                    for line in &lines[..10] {
-                        eprintln!("  ┃ {}", line);
-                    }
-                    eprintln!("  ┃ ... ({} more lines)", lines.len() - 10);
+            AgentEvent::ToolResult { output, success, .. } => {
+                if !success {
+                    eprintln!("{}", format::format_tool_error(&output));
                 } else {
-                    for line in &lines {
-                        eprintln!("  ┃ {}", line);
+                    for line in format::format_tool_output(&output) {
+                        eprintln!("{}", line);
                     }
                 }
             }

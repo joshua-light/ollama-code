@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use crate::agent::{Agent, AgentEvent};
 use crate::commands;
 use crate::config::Config;
+use crate::format;
 use crate::llama_server::{self, LlamaServer, ModelSource};
 use crate::ollama::OllamaClient;
 use crate::session::Session;
@@ -51,14 +52,6 @@ const VERBS: &[&str] = &[
     "Assembling",
     "Alchemizing",
 ];
-
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-    }
-}
 
 fn patch_leading_circle(lines: &mut [Line]) {
     for line in lines.iter_mut() {
@@ -94,20 +87,9 @@ fn context_bar_spans(used: u64, total: u64, bar_width: usize) -> (u64, Vec<Span<
 }
 
 fn render_expanded_output(lines: &mut Vec<Line<'static>>, output: &str) {
-    let output_lines: Vec<&str> = output.lines().collect();
-    let line_count = output_lines.len();
-    let capped = line_count > 30;
-    let display_count = if capped { 30 } else { line_count };
-    for (i, line) in output_lines[..display_count].iter().enumerate() {
-        let prefix = if i == 0 { "   ⎿  " } else { "      " };
+    for formatted in format::format_tool_output(output) {
         lines.push(Line::from(Span::styled(
-            format!("{}{}", prefix, line),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    if capped {
-        lines.push(Line::from(Span::styled(
-            format!("      ... ({} more lines)", line_count - 30),
+            formatted,
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -1297,19 +1279,10 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     Some(ToolResultData { success: false, .. }) => Color::Red,
                     None => Color::White,
                 };
-                let display_args: String = {
-                    let mut iter = args.chars();
-                    let truncated: String = iter.by_ref().take(77).collect();
-                    if iter.next().is_some() {
-                        format!("{}...", truncated)
-                    } else {
-                        args.clone()
-                    }
-                };
                 lines.push(Line::from(vec![
                     Span::styled(" ● ", Style::default().fg(circle_color)),
                     Span::styled(
-                        format!("{}({})", capitalize_first(name), display_args),
+                        format!("{}({})", format::capitalize_first(name), format::truncate_args(args, 77)),
                         Style::default().fg(Color::White),
                     ),
                 ]));
@@ -1328,7 +1301,7 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 } else {
                     // Tool is still running
                     lines.push(Line::from(vec![
-                        Span::styled("   ⎿  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(format::PREFIX_FIRST, Style::default().fg(Color::DarkGray)),
                         Span::styled(
                             format!("{} Running...", spinner_frame()),
                             Style::default().fg(Color::Yellow),
@@ -1521,7 +1494,7 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 fn render_read_result(lines: &mut Vec<Line<'static>>, result: &ToolResultData, expanded: bool) {
     if !result.success {
         lines.push(Line::from(Span::styled(
-            format!("   ⎿  {}", result.output.trim()),
+            format::format_tool_error(&result.output),
             Style::default().fg(Color::Red),
         )));
         return;
@@ -1535,7 +1508,7 @@ fn render_read_result(lines: &mut Vec<Line<'static>>, result: &ToolResultData, e
             format!("{} lines (ctrl+o to expand)", line_count)
         };
         lines.push(Line::from(Span::styled(
-            format!("   ⎿  {}", summary),
+            format!("{}{}", format::PREFIX_FIRST, summary),
             Style::default().fg(Color::DarkGray),
         )));
         return;
@@ -1547,7 +1520,7 @@ fn render_read_result(lines: &mut Vec<Line<'static>>, result: &ToolResultData, e
 fn render_edit_result(lines: &mut Vec<Line<'static>>, result: &ToolResultData) {
     if !result.success {
         lines.push(Line::from(Span::styled(
-            format!("   ⎿  {}", result.output.trim()),
+            format::format_tool_error(&result.output),
             Style::default().fg(Color::Red),
         )));
         return;
@@ -1584,7 +1557,7 @@ fn render_edit_result(lines: &mut Vec<Line<'static>>, result: &ToolResultData) {
     };
 
     lines.push(Line::from(vec![
-        Span::styled("   ⎿  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format::PREFIX_FIRST, Style::default().fg(Color::DarkGray)),
         Span::styled(summary, Style::default().fg(Color::DarkGray)),
     ]));
 
