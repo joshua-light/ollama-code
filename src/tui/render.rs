@@ -9,7 +9,7 @@ use ratatui::{
 use crate::commands;
 use crate::format;
 
-use super::app::{App, ChatMessage, ToolResultData};
+use super::app::{App, ChatMessage, PendingConfirm, ToolResultData};
 use super::markdown::{render_markdown, MD_INDENT};
 
 pub(super) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -143,17 +143,29 @@ pub(crate) fn get_git_info_sync() -> (Option<String>, bool) {
     (branch, dirty)
 }
 
+// ── Input wrapping helpers ────────────────────────────────────────────────
+
+/// Content width available for input text (accounting for " ❯ " / "   " prefix).
+fn input_content_width(available_width: u16) -> usize {
+    available_width.saturating_sub(3).max(1) as usize
+}
+
+/// Count visual lines a logical line occupies when wrapped to `content_width` chars.
+fn wrapped_line_count(char_count: usize, content_width: usize) -> usize {
+    char_count.max(1).div_ceil(content_width)
+}
+
 // ── Rendering ──────────────────────────────────────────────────────────────
 
 pub(super) fn compute_input_height(input: &str, term_width: u16, term_height: u16, is_processing: bool) -> u16 {
     if is_processing || input.is_empty() {
         return 3; // border + 1 line + border
     }
-    let content_width = term_width.saturating_sub(3).max(1) as usize; // 3 for " ❯ "
+    let content_width = input_content_width(term_width);
     let mut visual_lines: u16 = 0;
     for logical_line in input.split('\n') {
         let char_count = logical_line.chars().count();
-        visual_lines += ((char_count.max(1) + content_width - 1) / content_width).max(1) as u16;
+        visual_lines += wrapped_line_count(char_count, content_width) as u16;
     }
     // Cap so chat area stays usable (leave room for header + status + at least 3 chat lines)
     let max_lines = term_height.saturating_sub(6).max(3);
@@ -241,8 +253,7 @@ fn render_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let prompt = if app.model_choices.is_some() { " # " } else { " ❯ " };
-
-    let content_width = area.width.saturating_sub(3).max(1) as usize;
+    let content_width = input_content_width(area.width);
     let chars: Vec<char> = app.input.chars().collect();
     let mut lines: Vec<Line> = Vec::new();
 
@@ -314,7 +325,7 @@ fn render_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let char_count = logical_line.chars().count();
         if li < before_cursor.matches('\n').count() {
             // This logical line is fully before the cursor — count its visual lines
-            visual_line += ((char_count.max(1) + content_width - 1) / content_width).max(1) as u16;
+            visual_line += wrapped_line_count(char_count, content_width) as u16;
         } else {
             // Cursor is in this logical line
             visual_line += (char_count / content_width) as u16;
@@ -473,7 +484,7 @@ fn render_command_completions(
     f.render_widget(paragraph, area);
 }
 
-// ── Chat content builder ──────────────────────────────────────────────��────
+// ── Chat content builder ──────────────────────────────────────────────────
 
 fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
@@ -490,107 +501,19 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     for msg in &app.messages {
         match msg {
             ChatMessage::User(text) => {
-                let user_bg = Style::default().bg(Color::Indexed(236));
-                lines.push(Line::styled("", user_bg));
-                lines.push(
-                    Line::from(vec![
-                        Span::styled(
-                            "  ❯ ",
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(Color::Indexed(236))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            text.clone(),
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(Color::Indexed(236))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ])
-                    .style(user_bg),
-                );
+                render_chat_user(&mut lines, text);
             }
             ChatMessage::Assistant(text) => {
-                lines.push(Line::from(""));
-                let mut md_lines = render_markdown(text.trim_end(), width);
-                patch_leading_circle(&mut md_lines);
-                lines.extend(md_lines);
+                render_chat_assistant(&mut lines, text, width);
             }
             ChatMessage::ToolCall { name, args, result } => {
-                lines.push(Line::from(""));
-                let circle_color = match result {
-                    Some(ToolResultData { success: true, .. }) => Color::Green,
-                    Some(ToolResultData { success: false, .. }) => Color::Red,
-                    None => Color::White,
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(" ● ", Style::default().fg(circle_color)),
-                    Span::styled(
-                        format!("{}({})", format::capitalize_first(name), format::truncate_args(args, 77)),
-                        Style::default().fg(Color::White),
-                    ),
-                ]));
-                if let Some(result_data) = result {
-                    match name.as_str() {
-                        "read" => {
-                            render_read_result(&mut lines, result_data, app.tools_expanded);
-                        }
-                        "edit" => {
-                            render_edit_result(&mut lines, result_data);
-                        }
-                        _ => {
-                            render_default_result(&mut lines, result_data, app.tools_expanded);
-                        }
-                    }
-                } else {
-                    // Tool is still running
-                    lines.push(Line::from(vec![
-                        Span::styled(format::PREFIX_FIRST, Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            format!("{} Running...", spinner_frame()),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ]));
-                }
+                render_chat_tool_call(&mut lines, name, args, result.as_ref(), app.tools_expanded);
             }
             ChatMessage::Error(e) => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        " \u{F16A1} ",
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        e.clone(),
-                        Style::default().fg(Color::Red),
-                    ),
-                ]));
+                render_chat_error(&mut lines, e);
             }
             ChatMessage::Info(text) => {
-                lines.push(Line::from(""));
-                for (i, line) in text.lines().enumerate() {
-                    if i == 0 {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                "\u{F16A3} ",
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                line.to_string(),
-                                Style::default().fg(Color::Cyan),
-                            ),
-                        ]));
-                    } else {
-                        lines.push(Line::from(Span::styled(
-                            format!("   {}", line),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                }
+                render_chat_info(&mut lines, text);
             }
             ChatMessage::ContextInfo {
                 context_used,
@@ -602,144 +525,35 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 assistant_chars,
                 tool_chars,
             } => {
-                lines.push(Line::from(""));
-                // Header
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        " \u{F16A3} ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "Context",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-
-                // Token counts
-                if *context_size > 0 {
-                    let (pct, bar) = context_bar_spans(*context_used, *context_size, 40);
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "   {} / {} tokens ({}%)",
-                            format_number(*context_used),
-                            format_number(*context_size),
-                            pct
-                        ),
-                        Style::default().fg(Color::White),
-                    )));
-
-                    let mut bar_line = vec![Span::raw("   ")];
-                    bar_line.extend(bar);
-                    lines.push(Line::from(bar_line));
-                } else if *context_used > 0 {
-                    lines.push(Line::from(Span::styled(
-                        format!("   {} tokens used (window size unknown)", format_number(*context_used)),
-                        Style::default().fg(Color::White),
-                    )));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        "   No tokens used yet",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-
-                // Message counts
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled("   Messages  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!(
-                            "{} user · {} assistant · {} tool",
-                            user_messages, assistant_messages, tool_calls
-                        ),
-                        Style::default().fg(Color::White),
-                    ),
-                ]));
-
-                // Character counts
-                let total = *user_chars + *assistant_chars + *tool_chars;
-                if total > 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("   Chars     ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            format!(
-                                "{} user · {} assistant · {} tool",
-                                format_number(*user_chars as u64),
-                                format_number(*assistant_chars as u64),
-                                format_number(*tool_chars as u64),
-                            ),
-                            Style::default().fg(Color::White),
-                        ),
-                    ]));
-                }
+                render_chat_context_info(
+                    &mut lines,
+                    *context_used,
+                    *context_size,
+                    *user_messages,
+                    *assistant_messages,
+                    *tool_calls,
+                    *user_chars,
+                    *assistant_chars,
+                    *tool_chars,
+                );
             }
             ChatMessage::GenerationSummary { duration } => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled(" ✻ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("Crunched for {}", format_elapsed(*duration)),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ]));
+                render_chat_generation_summary(&mut lines, *duration);
             }
             ChatMessage::SubagentToolCall { name, args, success } => {
-                let indicator = match success {
-                    Some(true) => Span::styled("✓", Style::default().fg(Color::Green)),
-                    Some(false) => Span::styled("✗", Style::default().fg(Color::Red)),
-                    None => Span::styled("·", Style::default().fg(Color::DarkGray)),
-                };
-                lines.push(Line::from(vec![
-                    Span::raw("     "),
-                    Span::styled("↳ ", Style::default().fg(Color::DarkGray)),
-                    indicator,
-                    Span::styled(
-                        format!(
-                            " {}({})",
-                            format::capitalize_first(name),
-                            format::truncate_args(args, 60),
-                        ),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
+                render_chat_subagent_tool_call(&mut lines, name, args, *success);
             }
         }
     }
 
-    // Streaming response (rendered with markdown)
+    // Streaming response
     if !app.current_response.is_empty() {
-        lines.push(Line::from(""));
-        let mut md_lines = render_markdown(app.current_response.trim_end(), width);
-        patch_leading_circle(&mut md_lines);
-        lines.extend(md_lines);
+        render_chat_streaming(&mut lines, &app.current_response, width);
     }
 
     // Tool confirmation prompt
     if let Some(confirm) = &app.pending_confirm {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(
-                " ? ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "Allow {}({})? ",
-                    format::capitalize_first(&confirm.name),
-                    format::truncate_args(&confirm.args, 60),
-                ),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled("(y/n)", Style::default().fg(Color::DarkGray)),
-        ]));
+        render_chat_confirm_prompt(&mut lines, confirm);
     }
 
     // Progress indicator
@@ -750,32 +564,304 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Some(ChatMessage::ToolCall { result: None, .. })
         )
     {
-        let elapsed = app
-            .generation_start
-            .map(|s| s.elapsed())
-            .unwrap_or_default();
-        let time_str = format_elapsed(elapsed);
-        let token_str = format_token_count(app.generation_tokens);
-
-        let (symbol, symbol_color) = if app.has_received_tokens {
-            ("·", Color::DarkGray)
-        } else {
-            ("✻", Color::Yellow)
-        };
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", symbol), Style::default().fg(symbol_color)),
-            Span::styled(
-                format!("{}… ({}{})", app.generation_verb, time_str, token_str),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
+        render_chat_progress(&mut lines, app);
     }
 
     lines
+}
+
+// ── Per-variant chat renderers ────────────────────────────────────────────
+
+fn render_chat_user(lines: &mut Vec<Line<'static>>, text: &str) {
+    let user_bg = Style::default().bg(Color::Indexed(236));
+    lines.push(Line::styled("", user_bg));
+    lines.push(
+        Line::from(vec![
+            Span::styled(
+                "  ❯ ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Indexed(236))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                text.to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Indexed(236))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .style(user_bg),
+    );
+}
+
+fn render_chat_assistant(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
+    lines.push(Line::from(""));
+    let mut md_lines = render_markdown(text.trim_end(), width);
+    patch_leading_circle(&mut md_lines);
+    lines.extend(md_lines);
+}
+
+fn render_chat_tool_call(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    args: &str,
+    result: Option<&ToolResultData>,
+    expanded: bool,
+) {
+    lines.push(Line::from(""));
+    let circle_color = match result {
+        Some(ToolResultData { success: true, .. }) => Color::Green,
+        Some(ToolResultData { success: false, .. }) => Color::Red,
+        None => Color::White,
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(circle_color)),
+        Span::styled(
+            format!("{}({})", format::capitalize_first(name), format::truncate_args(args, 77)),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    if let Some(result_data) = result {
+        match name {
+            "read" => {
+                render_read_result(lines, result_data, expanded);
+            }
+            "edit" => {
+                render_edit_result(lines, result_data);
+            }
+            _ => {
+                render_default_result(lines, result_data, expanded);
+            }
+        }
+    } else {
+        // Tool is still running
+        lines.push(Line::from(vec![
+            Span::styled(format::PREFIX_FIRST, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} Running...", spinner_frame()),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+}
+
+fn render_chat_error(lines: &mut Vec<Line<'static>>, text: &str) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " \u{F16A1} ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::Red),
+        ),
+    ]));
+}
+
+fn render_chat_info(lines: &mut Vec<Line<'static>>, text: &str) {
+    lines.push(Line::from(""));
+    for (i, line) in text.lines().enumerate() {
+        if i == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "\u{F16A3} ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", line),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_chat_context_info(
+    lines: &mut Vec<Line<'static>>,
+    context_used: u64,
+    context_size: u64,
+    user_messages: u32,
+    assistant_messages: u32,
+    tool_calls: u32,
+    user_chars: usize,
+    assistant_chars: usize,
+    tool_chars: usize,
+) {
+    lines.push(Line::from(""));
+    // Header
+    lines.push(Line::from(vec![
+        Span::styled(
+            " \u{F16A3} ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Context",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Token counts
+    if context_size > 0 {
+        let (pct, bar) = context_bar_spans(context_used, context_size, 40);
+        lines.push(Line::from(Span::styled(
+            format!(
+                "   {} / {} tokens ({}%)",
+                format_number(context_used),
+                format_number(context_size),
+                pct
+            ),
+            Style::default().fg(Color::White),
+        )));
+
+        let mut bar_line = vec![Span::raw("   ")];
+        bar_line.extend(bar);
+        lines.push(Line::from(bar_line));
+    } else if context_used > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("   {} tokens used (window size unknown)", format_number(context_used)),
+            Style::default().fg(Color::White),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "   No tokens used yet",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Message counts
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("   Messages  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(
+                "{} user · {} assistant · {} tool",
+                user_messages, assistant_messages, tool_calls
+            ),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+
+    // Character counts
+    let total = user_chars + assistant_chars + tool_chars;
+    if total > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("   Chars     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} user · {} assistant · {} tool",
+                    format_number(user_chars as u64),
+                    format_number(assistant_chars as u64),
+                    format_number(tool_chars as u64),
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+}
+
+fn render_chat_generation_summary(lines: &mut Vec<Line<'static>>, duration: std::time::Duration) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" ✻ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("Crunched for {}", format_elapsed(duration)),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]));
+}
+
+fn render_chat_subagent_tool_call(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    args: &str,
+    success: Option<bool>,
+) {
+    let indicator = match success {
+        Some(true) => Span::styled("✓", Style::default().fg(Color::Green)),
+        Some(false) => Span::styled("✗", Style::default().fg(Color::Red)),
+        None => Span::styled("·", Style::default().fg(Color::DarkGray)),
+    };
+    lines.push(Line::from(vec![
+        Span::raw("     "),
+        Span::styled("↳ ", Style::default().fg(Color::DarkGray)),
+        indicator,
+        Span::styled(
+            format!(
+                " {}({})",
+                format::capitalize_first(name),
+                format::truncate_args(args, 60),
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+}
+
+fn render_chat_streaming(lines: &mut Vec<Line<'static>>, response: &str, width: u16) {
+    render_chat_assistant(lines, response, width);
+}
+
+fn render_chat_confirm_prompt(lines: &mut Vec<Line<'static>>, confirm: &PendingConfirm) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " ? ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "Allow {}({})? ",
+                format::capitalize_first(&confirm.name),
+                format::truncate_args(&confirm.args, 60),
+            ),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled("(y/n)", Style::default().fg(Color::DarkGray)),
+    ]));
+}
+
+fn render_chat_progress(lines: &mut Vec<Line<'static>>, app: &App) {
+    let elapsed = app
+        .generation_start
+        .map(|s| s.elapsed())
+        .unwrap_or_default();
+    let time_str = format_elapsed(elapsed);
+    let token_str = format_token_count(app.generation_tokens);
+
+    let (symbol, symbol_color) = if app.has_received_tokens {
+        ("·", Color::DarkGray)
+    } else {
+        ("✻", Color::Yellow)
+    };
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {} ", symbol), Style::default().fg(symbol_color)),
+        Span::styled(
+            format!("{}… ({}{})", app.generation_verb, time_str, token_str),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]));
 }
 
 // ── Tool result rendering ─────────────────────────────────────────────────

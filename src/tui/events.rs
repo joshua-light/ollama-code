@@ -72,7 +72,7 @@ pub(super) fn handle_terminal_event(
 
         if app.is_processing {
             if key.code == KeyCode::Esc {
-                app.should_quit = true;
+                app.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             return;
         }
@@ -364,6 +364,12 @@ pub(super) fn handle_agent_event(event: AgentEvent, app: &mut App) {
         }
         AgentEvent::SubagentEnd { .. } => {
             // The ToolResult event merges the final response into the ToolCall display.
+        }
+        AgentEvent::Cancelled => {
+            app.flush_streaming();
+            app.messages.push(ChatMessage::Info("Generation cancelled.".into()));
+            app.is_processing = false;
+            app.generation_start = None;
         }
         // MessageLogged and Debug are handled by the session logger in the event loop,
         // not by the app state.

@@ -2,7 +2,6 @@ use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
-use std::process::Command;
 
 pub struct ToolDefinition {
     pub name: String,
@@ -48,6 +47,41 @@ pub fn format_bash_output(output: &std::process::Output) -> (String, bool) {
 
 pub struct BashTool;
 
+impl BashTool {
+    /// Async execution with timeout and kill-on-drop. This is the primary
+    /// execution path — the sync `Tool::execute()` should never be called.
+    pub async fn execute_async(
+        &self,
+        arguments: &Value,
+        timeout: std::time::Duration,
+    ) -> (String, bool) {
+        let command = arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => {
+                match tokio::time::timeout(timeout, child.wait_with_output()).await {
+                    Ok(Ok(output)) => format_bash_output(&output),
+                    Ok(Err(e)) => (format!("Error: {}", e), false),
+                    Err(_) => (
+                        format!("Error: command timed out after {}s", timeout.as_secs()),
+                        false,
+                    ),
+                }
+            }
+            Err(e) => (format!("Error: {}", e), false),
+        }
+    }
+}
+
 impl Tool for BashTool {
     fn name(&self) -> &str { "bash" }
     fn definition(&self) -> ToolDefinition {
@@ -71,15 +105,8 @@ impl Tool for BashTool {
         }
     }
 
-    fn execute(&self, arguments: &Value) -> Result<String> {
-        let command = arguments
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
-
-        let output = Command::new("bash").arg("-c").arg(command).output()?;
-        let (result, _) = format_bash_output(&output);
-        Ok(result)
+    fn execute(&self, _arguments: &Value) -> Result<String> {
+        anyhow::bail!("BashTool must be executed via execute_async()")
     }
 }
 
@@ -373,6 +400,193 @@ impl Tool for WriteTool {
 
         let line_count = content.lines().count();
         Ok(format!("Created '{}' ({} lines)", file_path, line_count))
+    }
+}
+
+// --- Glob tool ---
+
+pub struct GlobTool;
+
+impl Tool for GlobTool {
+    fn name(&self) -> &str { "glob" }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "glob".to_string(),
+            description: "Find files matching a glob pattern. Returns matching file paths, \
+                          most recent first. Use for finding files by name or extension. \
+                          Prefer this over bash find commands."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern (e.g. \"*.rs\", \"**/*.ts\", \"src/**/*.json\")"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search in (default: current directory)"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    fn execute(&self, arguments: &Value) -> Result<String> {
+        let pattern = arguments
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' argument"))?;
+        let path = arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+
+        // Decompose the pattern: for "**/*.rs" search path with -name "*.rs"
+        // For "src/**/*.rs" search src with -name "*.rs"
+        let (search_path, name_pattern) = if let Some(pos) = pattern.rfind('/') {
+            let dir_part = &pattern[..pos];
+            let file_part = &pattern[pos + 1..];
+            // If the dir part is just "**" or contains only wildcards, search from root path
+            let dir = if dir_part == "**" || dir_part.chars().all(|c| c == '*') {
+                path.to_string()
+            } else {
+                // Strip leading **/ from dir part
+                let clean_dir = dir_part.trim_start_matches("**/");
+                if clean_dir.is_empty() {
+                    path.to_string()
+                } else if path == "." {
+                    clean_dir.to_string()
+                } else {
+                    format!("{}/{}", path, clean_dir)
+                }
+            };
+            (dir, file_part.to_string())
+        } else {
+            (path.to_string(), pattern.to_string())
+        };
+
+        let output = std::process::Command::new("find")
+            .arg(&search_path)
+            .arg("-type")
+            .arg("f")
+            .arg("-name")
+            .arg(&name_pattern)
+            .arg("-not")
+            .arg("-path")
+            .arg("*/.git/*")
+            .output()
+            .map_err(|e| anyhow::anyhow!("Failed to run find: {}", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            return Ok("No files found matching pattern.".to_string());
+        }
+
+        // Sort by modification time (most recent first)
+        let mut entries: Vec<(std::time::SystemTime, String)> = stdout
+            .lines()
+            .filter_map(|line| {
+                let path = line.trim();
+                if path.is_empty() {
+                    return None;
+                }
+                let mtime = fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                Some((mtime, path.to_string()))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let count = entries.len();
+        let paths: Vec<String> = entries.into_iter().map(|(_, p)| p).collect();
+        let result = paths.join("\n");
+        Ok(format!("{}\n\n({} files)", result, count))
+    }
+}
+
+// --- Grep tool ---
+
+pub struct GrepTool;
+
+impl Tool for GrepTool {
+    fn name(&self) -> &str { "grep" }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "grep".to_string(),
+            description: "Search file contents using regex patterns. Returns matching lines \
+                          with file paths and line numbers. More efficient than bash grep for \
+                          codebase search. Prefer this over bash grep/rg commands."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regular expression pattern to search for"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory to search in (default: current directory)"
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": "File glob to filter (e.g. \"*.rs\", \"*.py\")"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    fn execute(&self, arguments: &Value) -> Result<String> {
+        let pattern = arguments
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' argument"))?;
+        let path = arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        let include = arguments
+            .get("include")
+            .and_then(|v| v.as_str());
+
+        let mut cmd = std::process::Command::new("grep");
+        cmd.arg("-rn")     // recursive, line numbers
+           .arg("-E")      // extended regex
+           .arg("--color=never")
+           .arg("--exclude-dir=.git")
+           .arg("-m").arg("101");  // stop after 101 matches per file
+
+        if let Some(glob) = include {
+            cmd.arg("--include").arg(glob);
+        }
+
+        cmd.arg(pattern).arg(path);
+
+        let output = cmd.output()
+            .map_err(|e| anyhow::anyhow!("Failed to run grep: {}", e))?;
+
+        let result = String::from_utf8_lossy(&output.stdout);
+
+        if result.trim().is_empty() {
+            return Ok("No matches found.".to_string());
+        }
+
+        let lines: Vec<&str> = result.lines().collect();
+        let count = lines.len();
+        if count > 100 {
+            let truncated: String = lines[..100].join("\n");
+            Ok(format!(
+                "{}\n\n... ({} total matches, showing first 100. Refine your pattern.)",
+                truncated, count
+            ))
+        } else {
+            Ok(format!("{}\n\n({} matches)", result.trim(), count))
+        }
     }
 }
 

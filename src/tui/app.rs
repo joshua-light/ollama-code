@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -105,6 +106,8 @@ pub(crate) struct App {
     pub(crate) needs_clear: bool,
     /// Deferred llama-server start (event loop stops old server first, then spawns this)
     pub(crate) pending_server_start: Option<PendingServerStart>,
+    /// Cancel flag shared with the agent task — set to true to request cancellation.
+    pub(crate) cancel_flag: Arc<AtomicBool>,
 }
 
 impl App {
@@ -144,6 +147,7 @@ impl App {
             auto_approve: false,
             needs_clear: false,
             pending_server_start: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 

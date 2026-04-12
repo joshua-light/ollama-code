@@ -115,6 +115,7 @@ impl Session {
             AgentEvent::SubagentEnd { result } => {
                 format!("SUBAGENT_END ({} chars)", result.len())
             }
+            AgentEvent::Cancelled => "CANCELLED".to_string(),
             AgentEvent::MessageLogged(_) => return, // handled separately via log_message
             AgentEvent::Debug(s) => format!("DEBUG {}", s),
         };

@@ -12,6 +12,7 @@ mod tui;
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -50,6 +51,18 @@ struct Cli {
     /// HuggingFace repo to download model from (for llama-cpp backend, e.g. "google/gemma-3-27b-it-GGUF")
     #[arg(long)]
     hf_repo: Option<String>,
+
+    /// Context window size (overrides config)
+    #[arg(long)]
+    context_size: Option<u64>,
+
+    /// Auto-approve all tool calls (skip confirmation prompts)
+    #[arg(long)]
+    no_confirm: bool,
+
+    /// Enable verbose/debug output
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[tokio::main]
@@ -57,7 +70,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load()?;
 
-    let context_size = config.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE);
+    let context_size = cli.context_size
+        .or(config.context_size)
+        .unwrap_or(DEFAULT_CONTEXT_SIZE);
 
     let backend = cli
         .backend
@@ -95,9 +110,9 @@ async fn run_ollama(cli: Cli, mut config: Config, context_size: u64) -> Result<(
     let session = Session::new()?;
 
     if let Some(prompt) = cli.prompt {
-        run_pipe(agent, &prompt, session).await
+        run_pipe(agent, &prompt, session, cli.verbose).await
     } else {
-        tui::run(agent, context_size, session, config, None).await
+        tui::run(agent, context_size, session, config, None, cli.no_confirm).await
     }
 }
 
@@ -177,12 +192,12 @@ async fn run_llama_cpp(cli: Cli, config: Config, context_size: u64) -> Result<()
     let session = Session::new()?;
 
     if let Some(prompt) = cli.prompt {
-        let result = run_pipe(agent, &prompt, session).await;
+        let result = run_pipe(agent, &prompt, session, cli.verbose).await;
         server.stop().await;
         result
     } else {
         // TUI takes ownership of the server and handles its lifecycle
-        tui::run(agent, context_size, session, config, Some(server)).await
+        tui::run(agent, context_size, session, config, Some(server), cli.no_confirm).await
     }
 }
 
@@ -219,14 +234,15 @@ async fn select_model(ollama: &OllamaBackend) -> Result<String> {
     Ok(models[choice - 1].name.clone())
 }
 
-async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session) -> Result<()> {
+async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose: bool) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (confirm_tx, mut confirm_rx) = mpsc::unbounded_channel::<bool>();
 
     eprintln!("Session: {}", session.path().display());
 
     let prompt = prompt.to_string();
-    let handle = tokio::spawn(async move { agent.run(&prompt, &tx, &mut confirm_rx).await });
+    let cancel = Arc::new(AtomicBool::new(false));
+    let handle = tokio::spawn(async move { agent.run(&prompt, &tx, &mut confirm_rx, cancel).await });
 
     while let Some(event) = rx.recv().await {
         session.log_agent_event(&event);
@@ -281,6 +297,13 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session) -> Resul
             }
             AgentEvent::SubagentToolResult { .. } => {}
             AgentEvent::SubagentEnd { .. } => {}
+            AgentEvent::Cancelled => {
+                eprintln!("\n(cancelled)");
+                break;
+            }
+            AgentEvent::Debug(ref msg) if verbose => {
+                eprintln!("[debug] {}", msg);
+            }
             AgentEvent::ContextUpdate { .. } | AgentEvent::ContentReplaced(_) | AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) => {}
         }
     }

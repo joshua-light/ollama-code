@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -5,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::ModelBackend;
 use crate::message::Message;
-use crate::tools::{BashTool, EditTool, ReadTool, SubagentToolDef, WriteTool, ToolRegistry};
+use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SubagentToolDef, WriteTool, ToolRegistry};
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -23,6 +24,8 @@ pub enum AgentEvent {
     /// Context was auto-trimmed to stay within the window.
     ContextTrimmed { removed_messages: usize, estimated_tokens_freed: u64 },
     Done { prompt_tokens: u64 },
+    /// Generation was cancelled by the user.
+    Cancelled,
     Error(String),
     MessageLogged(Message),
     Debug(String),
@@ -51,6 +54,16 @@ fn truncate_tool_output(output: &str) -> String {
         kept,
         lines.len() - MAX_TOOL_OUTPUT_LINES,
     )
+}
+
+/// Poll a cancel flag, resolving when it becomes true.
+async fn poll_cancel(flag: &AtomicBool) {
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Send an event through the channel, returning an error if the receiver is gone.
@@ -93,6 +106,8 @@ impl Agent {
         tools.register(Box::new(ReadTool));
         tools.register(Box::new(EditTool));
         tools.register(Box::new(WriteTool));
+        tools.register(Box::new(GlobTool));
+        tools.register(Box::new(GrepTool));
         let is_subagent = max_turns.is_some();
         if !is_subagent {
             tools.register(Box::new(SubagentToolDef));
@@ -240,6 +255,7 @@ impl Agent {
         user_input: &str,
         events: &mpsc::UnboundedSender<AgentEvent>,
         confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
+        cancel: Arc<AtomicBool>,
     ) -> Result<()> {
         if !self.system_prompt_logged {
             if let Some(sys_msg) = self.messages.first() {
@@ -258,6 +274,12 @@ impl Agent {
         let num_ctx = if self.context_size > 0 { Some(self.context_size) } else { None };
 
         loop {
+            // Check cancellation before each turn
+            if cancel.load(Ordering::Relaxed) {
+                send_event(events, AgentEvent::Cancelled)?;
+                return Ok(());
+            }
+
             // Enforce turn limit (sub-agents)
             if let Some(max) = self.max_turns {
                 if turn >= max as u32 {
@@ -305,17 +327,21 @@ impl Agent {
                 )),
             )?;
 
-            let mut response = match self
-                .backend
-                .chat(&self.model, &self.messages, Some(tool_defs), num_ctx, Box::new(move |token| {
+            let mut response = tokio::select! {
+                r = self.backend.chat(&self.model, &self.messages, Some(tool_defs), num_ctx, Box::new(move |token| {
                     let _ = events_clone.send(AgentEvent::Token(token.to_string()));
-                }))
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    send_event(events, AgentEvent::Error(e.to_string()))?;
-                    send_event(events, AgentEvent::Done { prompt_tokens: 0 })?;
+                })) => {
+                    match r {
+                        Ok(r) => r,
+                        Err(e) => {
+                            send_event(events, AgentEvent::Error(e.to_string()))?;
+                            send_event(events, AgentEvent::Done { prompt_tokens: 0 })?;
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = poll_cancel(&cancel) => {
+                    send_event(events, AgentEvent::Cancelled)?;
                     return Ok(());
                 }
             };
@@ -545,6 +571,14 @@ impl Agent {
                         .and_then(|v| v.as_str())
                         .unwrap_or("?")
                         .to_string(),
+                    "glob" | "grep" => {
+                        let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+                        let path = args.get("path").and_then(|v| v.as_str());
+                        match path {
+                            Some(p) => format!("{} in {}", pattern, p),
+                            None => pattern.to_string(),
+                        }
+                    }
                     _ => args.to_string(),
                 };
 
@@ -586,32 +620,7 @@ impl Agent {
                 }
 
                 let (result, success) = if name == "bash" {
-                    let command = args
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let timeout_dur = self.bash_timeout;
-                    match tokio::process::Command::new("bash")
-                        .arg("-c")
-                        .arg(&command)
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .kill_on_drop(true)
-                        .spawn()
-                    {
-                        Ok(child) => {
-                            match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
-                                Ok(Ok(output)) => crate::tools::format_bash_output(&output),
-                                Ok(Err(e)) => (format!("Error: {}", e), false),
-                                Err(_) => (
-                                    format!("Error: command timed out after {}s", timeout_dur.as_secs()),
-                                    false,
-                                ),
-                            }
-                        }
-                        Err(e) => (format!("Error: {}", e), false),
-                    }
+                    BashTool.execute_async(args, self.bash_timeout).await
                 } else if name == "subagent" {
                     let task = args
                         .get("task")
@@ -621,7 +630,7 @@ impl Agent {
 
                     send_event(events, AgentEvent::SubagentStart { task: task.clone() })?;
 
-                    let mut sub_agent = Agent::new_subagent(
+                    let sub_agent = Agent::new_subagent(
                         Arc::clone(&self.backend),
                         self.model.clone(),
                         self.context_size,
@@ -633,45 +642,77 @@ impl Agent {
                     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<AgentEvent>();
                     let (sub_confirm_tx, mut sub_confirm_rx) = mpsc::unbounded_channel::<bool>();
 
-                    // Forward sub-agent events to parent and auto-approve tool confirms
-                    let events_for_sub = events.clone();
-                    let forward_handle = tokio::spawn(async move {
-                        while let Some(evt) = sub_rx.recv().await {
-                            match &evt {
-                                AgentEvent::ToolConfirmRequest { .. } => {
-                                    let _ = sub_confirm_tx.send(true);
-                                }
-                                AgentEvent::ToolCall { name, args } => {
-                                    let _ = events_for_sub.send(AgentEvent::SubagentToolCall {
-                                        name: name.clone(),
-                                        args: args.clone(),
-                                    });
-                                }
-                                AgentEvent::ToolResult { name, success, .. } => {
-                                    let _ = events_for_sub.send(AgentEvent::SubagentToolResult {
-                                        name: name.clone(),
-                                        success: *success,
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
+                    // Move the sub-agent and channel clones into an owned future.
+                    // This avoids borrow issues: the future owns everything it needs.
+                    let sub_tx_for_agent = sub_tx.clone();
+                    let cancel_for_sub = cancel.clone();
+                    let mut sub_future = Box::pin(async move {
+                        let mut sa = sub_agent;
+                        let result = sa.run(&task, &sub_tx_for_agent, &mut sub_confirm_rx, cancel_for_sub).await;
+                        let last_msg = sa.last_assistant_message();
+                        (result, last_msg)
                     });
 
-                    // Run the sub-agent (blocks until it completes).
-                    // Box::pin required because this is a recursive async call.
-                    let sub_result = Box::pin(sub_agent.run(&task, &sub_tx, &mut sub_confirm_rx)).await;
-                    drop(sub_tx); // close event channel so forward task finishes
-                    let _ = forward_handle.await;
+                    // Drive the sub-agent and its event loop concurrently.
+                    // We poll both the sub-agent future and its event channel so we
+                    // can forward tool confirmations through the parent's confirm_rx
+                    // instead of auto-approving.
+                    let mut sub_finished: Option<(Result<()>, String)> = None;
+                    let mut sub_tx_option = Some(sub_tx);
 
-                    match sub_result {
-                        Ok(()) => {
-                            let response = sub_agent.last_assistant_message();
+                    loop {
+                        tokio::select! {
+                            biased;
+                            // Process sub-agent events first (higher priority)
+                            event = sub_rx.recv() => {
+                                match event {
+                                    Some(AgentEvent::ToolConfirmRequest { name, args }) => {
+                                        // Forward to parent TUI for user confirmation
+                                        send_event(events, AgentEvent::ToolConfirmRequest {
+                                            name,
+                                            args,
+                                        })?;
+                                        let approved = confirm_rx.recv().await.unwrap_or(false);
+                                        let _ = sub_confirm_tx.send(approved);
+                                    }
+                                    Some(AgentEvent::ToolCall { name, args }) => {
+                                        let _ = events.send(AgentEvent::SubagentToolCall {
+                                            name,
+                                            args,
+                                        });
+                                    }
+                                    Some(AgentEvent::ToolResult { name, success, .. }) => {
+                                        let _ = events.send(AgentEvent::SubagentToolResult {
+                                            name,
+                                            success,
+                                        });
+                                    }
+                                    Some(_) => {} // ignore other events
+                                    None => break, // sub-agent channel closed
+                                }
+                            }
+                            // Poll the sub-agent future
+                            result = &mut sub_future, if sub_finished.is_none() => {
+                                sub_finished = Some(result);
+                                // Drop our sender clone to close channel (the future's
+                                // clone was already dropped when the async block ended).
+                                sub_tx_option.take();
+                            }
+                        }
+                    }
+
+                    match sub_finished {
+                        Some((Ok(()), response)) => {
                             send_event(events, AgentEvent::SubagentEnd { result: response.clone() })?;
                             (response, true)
                         }
-                        Err(e) => {
+                        Some((Err(e), _)) => {
                             let err_msg = format!("Sub-agent error: {}", e);
+                            send_event(events, AgentEvent::SubagentEnd { result: err_msg.clone() })?;
+                            (err_msg, false)
+                        }
+                        None => {
+                            let err_msg = "Sub-agent channel closed unexpectedly".to_string();
                             send_event(events, AgentEvent::SubagentEnd { result: err_msg.clone() })?;
                             (err_msg, false)
                         }
