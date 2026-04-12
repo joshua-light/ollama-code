@@ -386,6 +386,17 @@ fn render_status_line(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ));
     }
 
+    // Bypass permissions indicator
+    if app.auto_approve {
+        spans.push(sep_span());
+        spans.push(Span::styled(
+            "⏵⏵ bypass",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // Session duration
     let time_str = format_elapsed(app.session_start.elapsed());
     spans.push(sep_span());
@@ -563,14 +574,14 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     if i == 0 {
                         lines.push(Line::from(vec![
                             Span::styled(
-                                " ℹ ",
+                                "\u{F16A3} ",
                                 Style::default()
-                                    .fg(Color::Yellow)
+                                    .fg(Color::Cyan)
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
                                 line.to_string(),
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(Color::Cyan),
                             ),
                         ]));
                     } else {
@@ -595,15 +606,15 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 // Header
                 lines.push(Line::from(vec![
                     Span::styled(
-                        " ℹ ",
+                        " \u{F16A3} ",
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         "Context",
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -675,6 +686,26 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+            ChatMessage::SubagentToolCall { name, args, success } => {
+                let indicator = match success {
+                    Some(true) => Span::styled("✓", Style::default().fg(Color::Green)),
+                    Some(false) => Span::styled("✗", Style::default().fg(Color::Red)),
+                    None => Span::styled("·", Style::default().fg(Color::DarkGray)),
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled("↳ ", Style::default().fg(Color::DarkGray)),
+                    indicator,
+                    Span::styled(
+                        format!(
+                            " {}({})",
+                            format::capitalize_first(name),
+                            format::truncate_args(args, 60),
+                        ),
+                        Style::default().fg(Color::DarkGray),
                     ),
                 ]));
             }

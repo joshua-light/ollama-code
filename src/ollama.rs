@@ -1,10 +1,114 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::backend::{ChatResponse, ModelBackend, ModelInfo};
 use crate::message::{FunctionCall, Message, ToolCall};
+
+/// Strip leaked special tokens from model output.
+///
+/// Some models (e.g. Gemma 4) emit special/control tokens like `<|channel>`,
+/// `<|turn>`, `<|think|>` as plain text instead of handling them internally.
+/// These should never appear in user-facing content.
+fn strip_special_tokens(text: &str) -> String {
+    // Match patterns like <|something> or <|something|> or <something|>
+    // These are control tokens that leaked through the tokenizer.
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+
+    while let Some(&(i, c)) = chars.peek() {
+        if c == '<' && text[i..].starts_with("<|") {
+            // Look for closing > (with optional | before it)
+            if let Some(end) = text[i..].find('>') {
+                // Skip the entire special token
+                let token_end = i + end + 1;
+                // Advance the iterator past this token
+                while let Some(&(j, _)) = chars.peek() {
+                    if j >= token_end {
+                        break;
+                    }
+                    chars.next();
+                }
+                continue;
+            }
+        }
+        if c == '<' && text[i..].len() > 1 {
+            // Also match <something|> pattern
+            if let Some(end_rel) = text[i..].find("|>") {
+                let candidate = &text[i..i + end_rel + 2];
+                // Only strip if it looks like a token (no spaces, reasonable length)
+                if candidate.len() <= 30 && !candidate[1..].contains(' ') {
+                    let token_end = i + end_rel + 2;
+                    while let Some(&(j, _)) = chars.peek() {
+                        if j >= token_end {
+                            break;
+                        }
+                        chars.next();
+                    }
+                    continue;
+                }
+            }
+        }
+        result.push(c);
+        chars.next();
+    }
+
+    result
+}
+
+/// Detect degenerate repetition in streamed content.
+///
+/// Checks whether the tail of the text consists of a short substring pattern
+/// (3–40 chars) repeated 8+ times consecutively.  This catches the common LLM
+/// failure mode where the model gets stuck in a sampling loop, e.g.
+/// "approach-approach approach-approach approach-approach …"
+fn detect_repetition(text: &str) -> bool {
+    // Need enough text to have a meaningful pattern + repetitions
+    if text.len() < 100 {
+        return false;
+    }
+
+    // Only inspect the tail — repetition is always at the end
+    let start = text.len().saturating_sub(300);
+    // Align to a char boundary
+    let start = text.ceil_char_boundary(start);
+    let tail = &text[start..];
+    let tail_bytes = tail.as_bytes();
+
+    for plen in 3..=40 {
+        let min_repeats = 8;
+        if tail.len() < plen * min_repeats {
+            continue;
+        }
+
+        // Use the *last* `plen` bytes as the candidate pattern, then count
+        // how many consecutive copies appear going backwards.
+        let pattern = &tail_bytes[tail_bytes.len() - plen..];
+        let mut count: usize = 0;
+        let mut pos = tail_bytes.len();
+
+        while pos >= plen {
+            let candidate = &tail_bytes[pos - plen..pos];
+            if candidate == pattern {
+                count += 1;
+                pos -= plen;
+            } else {
+                break;
+            }
+        }
+
+        if count >= min_repeats {
+            return true;
+        }
+    }
+
+    false
+}
 
 /// Find balanced `{…}` JSON objects in a string by brace-matching.
 /// Returns `(json_text, start_byte_offset, end_byte_offset)` for each match.
@@ -125,7 +229,7 @@ fn extract_tool_calls_from_content(
 }
 
 #[derive(Clone)]
-pub struct OllamaClient {
+pub struct OllamaBackend {
     client: Client,
     base_url: String,
 }
@@ -148,6 +252,12 @@ struct ChatRequest {
 #[derive(Debug, Serialize)]
 struct ChatOptions {
     num_ctx: u64,
+    /// Penalize repeated token sequences to prevent degenerate repetition loops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
+    /// How many recent tokens to consider for repeat penalty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_last_n: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,30 +298,8 @@ struct FunctionCallResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ModelInfo {
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct ModelsResponse {
     models: Vec<ModelInfo>,
-}
-
-pub struct ChatResponse {
-    pub content: String,
-    pub tool_calls: Vec<ToolCall>,
-    pub prompt_eval_count: u64,
-    /// Ollama timing metrics (nanoseconds).
-    pub prompt_eval_duration: u64,
-    pub eval_count: u64,
-    pub eval_duration: u64,
-    pub load_duration: u64,
-    pub total_duration: u64,
-    /// True if the stream ended without receiving `done: true` from Ollama.
-    pub incomplete: bool,
-    /// True if tool calls were extracted from text content rather than from
-    /// Ollama's structured `tool_calls` field.
-    pub tool_calls_from_content: bool,
 }
 
 struct TimingMetrics {
@@ -268,12 +356,12 @@ struct OpenAIToolCallAccum {
     arguments: String,
 }
 
-fn process_openai_chunk<F: Fn(&str)>(
+fn process_openai_chunk(
     parsed: &OpenAIChunk,
     content: &mut String,
     tool_accum: &mut Vec<OpenAIToolCallAccum>,
     metrics: &mut TimingMetrics,
-    on_token: &F,
+    on_token: &dyn Fn(&str),
 ) -> Option<String> {
     // finish_reason
     let mut finish = None;
@@ -326,12 +414,12 @@ fn process_openai_chunk<F: Fn(&str)>(
     finish
 }
 
-fn process_chunk<F: Fn(&str)>(
+fn process_chunk(
     parsed: &ChatChunk,
     content: &mut String,
     tool_calls: &mut Vec<ToolCall>,
     metrics: &mut TimingMetrics,
-    on_token: &F,
+    on_token: &dyn Fn(&str),
 ) {
     if let Some(msg) = &parsed.message {
         if let Some(text) = &msg.content {
@@ -408,7 +496,7 @@ fn parse_api_error(body: &str) -> Option<String> {
     error.as_str().map(|s| s.to_string())
 }
 
-impl OllamaClient {
+impl OllamaBackend {
     pub fn new(base_url: Option<String>) -> Self {
         Self {
             client: Client::new(),
@@ -442,237 +530,262 @@ impl OllamaClient {
             .await?;
         Ok(resp.models)
     }
+}
 
-    pub async fn chat<F>(
-        &self,
-        model: &str,
-        messages: &[Message],
+impl ModelBackend for OllamaBackend {
+    fn chat<'a>(
+        &'a self,
+        model: &'a str,
+        messages: &'a [Message],
         tools: Option<Vec<Value>>,
         num_ctx: Option<u64>,
-        on_token: F,
-    ) -> Result<ChatResponse>
-    where
-        F: Fn(&str),
-    {
-        let options = num_ctx
-            .filter(|&n| n > 0)
-            .map(|n| ChatOptions { num_ctx: n });
+        on_token: Box<dyn Fn(&str) + Send + 'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            let options = num_ctx
+                .filter(|&n| n > 0)
+                .map(|n| ChatOptions {
+                    num_ctx: n,
+                    repeat_penalty: Some(1.1),
+                    repeat_last_n: Some(64),
+                });
 
-        // Extract known tool names before `tools` is moved into the request.
-        // Used later to detect tool calls emitted as plain text.
-        let known_tool_names: Vec<String> = tools
-            .as_ref()
-            .map(|t| {
-                t.iter()
-                    .filter_map(|def| {
-                        def.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+            // Extract known tool names before `tools` is moved into the request.
+            // Used later to detect tool calls emitted as plain text.
+            let known_tool_names: Vec<String> = tools
+                .as_ref()
+                .map(|t| {
+                    t.iter()
+                        .filter_map(|def| {
+                            def.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages: messages.to_vec(),
-            tools,
-            stream: true,
-            options,
-            stream_options: Some(StreamOptions { include_usage: true }),
-        };
+            let request = ChatRequest {
+                model: model.to_string(),
+                messages: messages.to_vec(),
+                tools,
+                stream: true,
+                options,
+                stream_options: Some(StreamOptions { include_usage: true }),
+            };
 
-        let resp = self
-            .client
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to connect to Ollama")?;
+            let resp = self
+                .client
+                .post(format!("{}/api/chat", self.base_url))
+                .json(&request)
+                .send()
+                .await
+                .context("Failed to connect to backend")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if let Some(message) = parse_api_error(&body) {
-                anyhow::bail!("{}", message);
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if let Some(message) = parse_api_error(&body) {
+                    anyhow::bail!("{}", message);
+                }
+                anyhow::bail!("API error ({}): {}", status, body);
             }
-            anyhow::bail!("Ollama API error ({}): {}", status, body);
-        }
 
-        let mut content = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut metrics = TimingMetrics {
-            prompt_eval_count: 0,
-            prompt_eval_duration: 0,
-            eval_count: 0,
-            eval_duration: 0,
-            load_duration: 0,
-            total_duration: 0,
-        };
-        let mut saw_done = false;
+            let mut content = String::new();
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            let mut metrics = TimingMetrics {
+                prompt_eval_count: 0,
+                prompt_eval_duration: 0,
+                eval_count: 0,
+                eval_duration: 0,
+                load_duration: 0,
+                total_duration: 0,
+            };
+            let mut saw_done = false;
+            let mut repetition_detected = false;
+            let mut token_count: u32 = 0;
 
-        let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+            let mut stream = resp.bytes_stream();
+            let mut buffer = String::new();
 
-        // Detect format from the first non-empty line.
-        // OpenAI SSE lines start with "data: ", Ollama lines are raw JSON.
-        let mut is_openai: Option<bool> = None;
-        let mut openai_tool_accum: Vec<OpenAIToolCallAccum> = Vec::new();
+            // Detect format from the first non-empty line.
+            // OpenAI SSE lines start with "data: ", Ollama lines are raw JSON.
+            let mut is_openai: Option<bool> = None;
+            let mut openai_tool_accum: Vec<OpenAIToolCallAccum> = Vec::new();
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            'stream: while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim().to_string();
-                buffer = buffer[newline_pos + 1..].to_string();
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim().to_string();
+                    buffer.drain(..=newline_pos);
 
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Auto-detect format on first non-empty line
-                if is_openai.is_none() {
-                    is_openai = Some(line.starts_with("data:"));
-                }
-
-                if is_openai == Some(true) {
-                    // OpenAI SSE format
-                    let data = line.strip_prefix("data:").unwrap_or(&line).trim();
-                    if data == "[DONE]" {
-                        saw_done = true;
-                        break;
-                    }
-                    if data.is_empty() {
+                    if line.is_empty() {
                         continue;
                     }
-                    let parsed: OpenAIChunk = serde_json::from_str(data)
-                        .with_context(|| {
-                            format!("Failed to parse OpenAI response: {}", data)
-                        })?;
-                    let finish = process_openai_chunk(
-                        &parsed,
-                        &mut content,
-                        &mut openai_tool_accum,
-                        &mut metrics,
-                        &on_token,
-                    );
-                    if finish.is_some() {
+
+                    // Auto-detect format on first non-empty line
+                    if is_openai.is_none() {
+                        is_openai = Some(line.starts_with("data:"));
+                    }
+
+                    if is_openai == Some(true) {
+                        // OpenAI SSE format
+                        let data = line.strip_prefix("data:").unwrap_or(&line).trim();
+                        if data == "[DONE]" {
+                            saw_done = true;
+                            break;
+                        }
+                        if data.is_empty() {
+                            continue;
+                        }
+                        let parsed: OpenAIChunk = serde_json::from_str(data)
+                            .with_context(|| {
+                                format!("Failed to parse OpenAI response: {}", data)
+                            })?;
+                        let finish = process_openai_chunk(
+                            &parsed,
+                            &mut content,
+                            &mut openai_tool_accum,
+                            &mut metrics,
+                            &*on_token,
+                        );
+                        if finish.is_some() {
+                            saw_done = true;
+                        }
+                    } else {
+                        // Ollama format
+                        let parsed: ChatChunk = serde_json::from_str(&line)
+                            .with_context(|| {
+                                format!("Failed to parse Ollama response: {}", line)
+                            })?;
+                        process_chunk(
+                            &parsed,
+                            &mut content,
+                            &mut tool_calls,
+                            &mut metrics,
+                            &*on_token,
+                        );
+                        if parsed.done {
+                            saw_done = true;
+                            break;
+                        }
+                    }
+
+                    // Periodically check for degenerate repetition in the
+                    // accumulated content.  Start checking after 50 tokens and
+                    // re-check every 20 tokens to keep overhead low.
+                    token_count += 1;
+                    if token_count >= 50 && token_count.is_multiple_of(20) && detect_repetition(&content) {
+                        repetition_detected = true;
+                        break 'stream;
+                    }
+                }
+            }
+
+            // Process remaining buffer
+            let remaining = buffer.trim();
+            if !remaining.is_empty() && !saw_done {
+                if is_openai == Some(true) {
+                    let data = remaining.strip_prefix("data:").unwrap_or(remaining).trim();
+                    if data != "[DONE]" && !data.is_empty() {
+                        let parsed: OpenAIChunk = serde_json::from_str(data)
+                            .with_context(|| {
+                                format!("Failed to parse remaining OpenAI buffer: {}", data)
+                            })?;
+                        let finish = process_openai_chunk(
+                            &parsed,
+                            &mut content,
+                            &mut openai_tool_accum,
+                            &mut metrics,
+                            &*on_token,
+                        );
+                        if finish.is_some() {
+                            saw_done = true;
+                        }
+                    } else {
                         saw_done = true;
                     }
                 } else {
-                    // Ollama format
-                    let parsed: ChatChunk = serde_json::from_str(&line)
+                    let parsed: ChatChunk = serde_json::from_str(remaining)
                         .with_context(|| {
-                            format!("Failed to parse Ollama response: {}", line)
+                            format!(
+                                "Failed to parse remaining Ollama buffer ({} bytes): {}",
+                                remaining.len(),
+                                &remaining[..remaining.len().min(200)]
+                            )
                         })?;
                     process_chunk(
                         &parsed,
                         &mut content,
                         &mut tool_calls,
                         &mut metrics,
-                        &on_token,
+                        &*on_token,
                     );
                     if parsed.done {
                         saw_done = true;
-                        break;
                     }
                 }
             }
-        }
 
-        // Process remaining buffer
-        let remaining = buffer.trim();
-        if !remaining.is_empty() && !saw_done {
+            // Convert accumulated OpenAI tool calls to our format
             if is_openai == Some(true) {
-                let data = remaining.strip_prefix("data:").unwrap_or(remaining).trim();
-                if data != "[DONE]" && !data.is_empty() {
-                    let parsed: OpenAIChunk = serde_json::from_str(data)
-                        .with_context(|| {
-                            format!("Failed to parse remaining OpenAI buffer: {}", data)
-                        })?;
-                    let finish = process_openai_chunk(
-                        &parsed,
-                        &mut content,
-                        &mut openai_tool_accum,
-                        &mut metrics,
-                        &on_token,
-                    );
-                    if finish.is_some() {
-                        saw_done = true;
+                for accum in &openai_tool_accum {
+                    if !accum.name.is_empty() {
+                        let arguments: Value =
+                            serde_json::from_str(&accum.arguments).unwrap_or(Value::Object(
+                                serde_json::Map::new(),
+                            ));
+                        tool_calls.push(ToolCall {
+                            id: None,
+                            call_type: None,
+                            function: FunctionCall {
+                                name: accum.name.clone(),
+                                arguments,
+                            },
+                        });
                     }
-                } else {
-                    saw_done = true;
-                }
-            } else {
-                let parsed: ChatChunk = serde_json::from_str(remaining)
-                    .with_context(|| {
-                        format!(
-                            "Failed to parse remaining Ollama buffer ({} bytes): {}",
-                            remaining.len(),
-                            &remaining[..remaining.len().min(200)]
-                        )
-                    })?;
-                process_chunk(
-                    &parsed,
-                    &mut content,
-                    &mut tool_calls,
-                    &mut metrics,
-                    &on_token,
-                );
-                if parsed.done {
-                    saw_done = true;
                 }
             }
-        }
 
-        // Convert accumulated OpenAI tool calls to our format
-        if is_openai == Some(true) {
-            for accum in &openai_tool_accum {
-                if !accum.name.is_empty() {
-                    let arguments: Value =
-                        serde_json::from_str(&accum.arguments).unwrap_or(Value::Object(
-                            serde_json::Map::new(),
-                        ));
-                    tool_calls.push(ToolCall {
-                        id: None,
-                        call_type: None,
-                        function: FunctionCall {
-                            name: accum.name.clone(),
-                            arguments,
-                        },
-                    });
+            // Strip leaked special tokens (e.g. <|channel>, <|turn>) that some
+            // models emit as plain text.
+            let content_before = content.len();
+            content = strip_special_tokens(&content);
+            if content.len() != content_before {
+                content = content.trim().to_string();
+            }
+
+            // Some models (e.g. Qwen) emit tool calls as plain-text JSON in the
+            // content instead of using the structured tool_calls field.
+            // When no structured calls were received, try to extract them from the
+            // content as a fallback.
+            let mut tool_calls_from_content = false;
+            if tool_calls.is_empty() && !content.trim().is_empty() && !known_tool_names.is_empty() {
+                let (extracted, remaining) =
+                    extract_tool_calls_from_content(&content, &known_tool_names);
+                if !extracted.is_empty() {
+                    tool_calls = extracted;
+                    content = remaining;
+                    tool_calls_from_content = true;
                 }
             }
-        }
 
-        // Some models (e.g. Qwen) emit tool calls as plain-text JSON in the
-        // content instead of using Ollama's structured tool_calls field.
-        // When no structured calls were received, try to extract them from the
-        // content as a fallback.
-        let mut tool_calls_from_content = false;
-        if tool_calls.is_empty() && !content.trim().is_empty() && !known_tool_names.is_empty() {
-            let (extracted, remaining) =
-                extract_tool_calls_from_content(&content, &known_tool_names);
-            if !extracted.is_empty() {
-                tool_calls = extracted;
-                content = remaining;
-                tool_calls_from_content = true;
-            }
-        }
-
-        Ok(ChatResponse {
-            content,
-            tool_calls,
-            prompt_eval_count: metrics.prompt_eval_count,
-            prompt_eval_duration: metrics.prompt_eval_duration,
-            eval_count: metrics.eval_count,
-            eval_duration: metrics.eval_duration,
-            load_duration: metrics.load_duration,
-            total_duration: metrics.total_duration,
-            incomplete: !saw_done,
-            tool_calls_from_content,
+            Ok(ChatResponse {
+                content,
+                tool_calls,
+                prompt_eval_count: metrics.prompt_eval_count,
+                prompt_eval_duration: metrics.prompt_eval_duration,
+                eval_count: metrics.eval_count,
+                eval_duration: metrics.eval_duration,
+                load_duration: metrics.load_duration,
+                total_duration: metrics.total_duration,
+                incomplete: !saw_done,
+                tool_calls_from_content,
+                repetition_detected,
+            })
         })
     }
 }

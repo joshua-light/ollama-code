@@ -1,4 +1,5 @@
 mod agent;
+mod backend;
 mod commands;
 mod config;
 mod format;
@@ -9,16 +10,18 @@ mod session;
 mod tools;
 mod tui;
 
-use anyhow::Result;
-use clap::Parser;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Result;
+use clap::Parser;
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent};
-use crate::config::{Config, DEFAULT_CONTEXT_SIZE};
-use crate::llama_server::{LlamaServer, ModelSource};
-use crate::ollama::OllamaClient;
+use crate::config::{Config, DEFAULT_CONTEXT_SIZE, DEFAULT_SUBAGENT_MAX_TURNS};
+use crate::llama_server::{LlamaCppBackend, LlamaServer, ModelSource};
+use crate::ollama::OllamaBackend;
 use crate::session::Session;
 
 #[derive(Parser)]
@@ -69,7 +72,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_ollama(cli: Cli, mut config: Config, context_size: u64) -> Result<()> {
-    let ollama = OllamaClient::new(None);
+    let ollama = OllamaBackend::new(None);
 
     let model = if let Some(m) = cli.model {
         m
@@ -86,7 +89,9 @@ async fn run_ollama(cli: Cli, mut config: Config, context_size: u64) -> Result<(
     };
 
     let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
-    let agent = Agent::new(ollama.clone(), model, context_size, bash_timeout);
+    let subagent_max_turns = config.subagent_max_turns.unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS);
+    let backend = OllamaBackend::new(None);
+    let agent = Agent::new(Arc::new(backend), model, context_size, bash_timeout, subagent_max_turns);
     let session = Session::new()?;
 
     if let Some(prompt) = cli.prompt {
@@ -140,26 +145,35 @@ async fn run_llama_cpp(cli: Cli, config: Config, context_size: u64) -> Result<()
 
     let extra_args = config.llama_server_args.clone().unwrap_or_default();
 
-    let port = llama_server::find_free_port()?;
-    eprintln!(
-        "Starting llama-server on port {} with {}...",
-        port,
-        match &model_source {
-            ModelSource::File(p) => format!("model {}", p.display()),
-            ModelSource::HuggingFace(repo) => format!("HF repo {}", repo),
-        }
-    );
+    // Try to reuse an existing llama-server for the same model.
+    let mut server = if let Some(server) = LlamaServer::connect_existing(&model_source).await {
+        eprintln!(
+            "Connected to existing llama-server on port {}",
+            server.port
+        );
+        server
+    } else {
+        let port = llama_server::find_free_port()?;
+        eprintln!(
+            "Starting llama-server on port {} with {}...",
+            port,
+            match &model_source {
+                ModelSource::File(p) => format!("model {}", p.display()),
+                ModelSource::HuggingFace(repo) => format!("HF repo {}", repo),
+            }
+        );
+        let server =
+            LlamaServer::start(&server_binary, &model_source, port, context_size, &extra_args)
+                .await?;
+        eprintln!("llama-server ready (log: {})", server.log_path.display());
+        server
+    };
 
-    let mut server =
-        LlamaServer::start(&server_binary, &model_source, port, context_size, &extra_args)
-            .await?;
-
-    eprintln!("llama-server ready (log: {})", server.log_path.display());
-
-    let ollama = OllamaClient::new(Some(server.base_url()));
+    let backend = LlamaCppBackend::new(server.base_url());
 
     let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
-    let agent = Agent::new(ollama.clone(), model_name.to_string(), context_size, bash_timeout);
+    let subagent_max_turns = config.subagent_max_turns.unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS);
+    let agent = Agent::new(Arc::new(backend), model_name.to_string(), context_size, bash_timeout, subagent_max_turns);
     let session = Session::new()?;
 
     if let Some(prompt) = cli.prompt {
@@ -172,7 +186,7 @@ async fn run_llama_cpp(cli: Cli, config: Config, context_size: u64) -> Result<()
     }
 }
 
-async fn select_model(ollama: &OllamaClient) -> Result<String> {
+async fn select_model(ollama: &OllamaBackend) -> Result<String> {
     let models = ollama.list_models().await?;
 
     if models.is_empty() {
@@ -255,6 +269,18 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session) -> Resul
                 eprintln!("\nerror: {}", e);
                 break;
             }
+            AgentEvent::SubagentStart { ref task } => {
+                eprintln!("\n ◈ Subagent: {}", format::truncate_args(task, 77));
+            }
+            AgentEvent::SubagentToolCall { name, args } => {
+                eprintln!(
+                    "   ↳ {}({})",
+                    format::capitalize_first(&name),
+                    format::truncate_args(&args, 60),
+                );
+            }
+            AgentEvent::SubagentToolResult { .. } => {}
+            AgentEvent::SubagentEnd { .. } => {}
             AgentEvent::ContextUpdate { .. } | AgentEvent::ContentReplaced(_) | AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) => {}
         }
     }

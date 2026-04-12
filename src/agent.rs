@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+use crate::backend::ModelBackend;
 use crate::message::Message;
-use crate::ollama::OllamaClient;
-use crate::tools::{BashTool, EditTool, ReadTool, WriteTool, ToolRegistry};
+use crate::tools::{BashTool, EditTool, ReadTool, SubagentToolDef, WriteTool, ToolRegistry};
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -24,6 +26,31 @@ pub enum AgentEvent {
     Error(String),
     MessageLogged(Message),
     Debug(String),
+    // Sub-agent lifecycle events
+    SubagentStart { task: String },
+    SubagentToolCall { name: String, args: String },
+    SubagentToolResult { name: String, success: bool },
+    SubagentEnd { result: String },
+}
+
+/// Maximum number of lines to keep in tool output stored in context.
+const MAX_TOOL_OUTPUT_LINES: usize = 300;
+
+fn truncate_tool_output(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() <= MAX_TOOL_OUTPUT_LINES {
+        return output.to_string();
+    }
+
+    let kept: String = lines[..MAX_TOOL_OUTPUT_LINES]
+        .iter()
+        .flat_map(|l| [*l, "\n"])
+        .collect();
+    format!(
+        "{}... ({} more lines truncated. Refine your command to get more targeted output.)",
+        kept,
+        lines.len() - MAX_TOOL_OUTPUT_LINES,
+    )
 }
 
 /// Send an event through the channel, returning an error if the receiver is gone.
@@ -37,40 +64,91 @@ fn send_event(
 }
 
 pub struct Agent {
-    ollama: OllamaClient,
+    backend: Arc<dyn ModelBackend>,
     tools: ToolRegistry,
     model: String,
     messages: Vec<Message>,
     system_prompt_logged: bool,
     context_size: u64,
     bash_timeout: std::time::Duration,
+    /// If set, limits the number of agent-loop turns (used for sub-agents).
+    max_turns: Option<u16>,
+    /// Turn limit passed to sub-agents spawned by this agent.
+    subagent_max_turns: u16,
 }
 
 impl Agent {
-    pub fn new(ollama: OllamaClient, model: String, context_size: u64, bash_timeout: std::time::Duration) -> Self {
+    /// Shared constructor. When `is_subagent` is true, the subagent tool is
+    /// omitted (prevents recursion) and a turn limit is enforced.
+    fn build(
+        backend: Arc<dyn ModelBackend>,
+        model: String,
+        context_size: u64,
+        bash_timeout: std::time::Duration,
+        subagent_max_turns: u16,
+        max_turns: Option<u16>,
+    ) -> Self {
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(BashTool));
         tools.register(Box::new(ReadTool));
         tools.register(Box::new(EditTool));
         tools.register(Box::new(WriteTool));
+        let is_subagent = max_turns.is_some();
+        if !is_subagent {
+            tools.register(Box::new(SubagentToolDef));
+        }
 
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
-        let system_prompt = include_str!("../SYSTEM_PROMPT.md").replace("{cwd}", &cwd);
+        let subagent_desc = if is_subagent {
+            ""
+        } else {
+            "- subagent(task): Spawn a sub-agent with a fresh context to handle a focused task. \
+             The sub-agent cannot see this conversation, so include all necessary context in the \
+             task description. Use for: research across many files, complex multi-step operations, \
+             or any task that would benefit from a clean context window"
+        };
+
+        let system_prompt = include_str!("../SYSTEM_PROMPT.md")
+            .replace("{cwd}", &cwd)
+            .replace("{subagent_tool}", subagent_desc);
 
         let messages = vec![Message::system(&system_prompt)];
 
         Self {
-            ollama,
+            backend,
             tools,
             model,
             messages,
             system_prompt_logged: false,
             context_size,
             bash_timeout,
+            max_turns,
+            subagent_max_turns,
         }
+    }
+
+    pub fn new(
+        backend: Arc<dyn ModelBackend>,
+        model: String,
+        context_size: u64,
+        bash_timeout: std::time::Duration,
+        subagent_max_turns: u16,
+    ) -> Self {
+        Self::build(backend, model, context_size, bash_timeout, subagent_max_turns, None)
+    }
+
+    /// Create a sub-agent with fresh context and no subagent tool (prevents recursion).
+    fn new_subagent(
+        backend: Arc<dyn ModelBackend>,
+        model: String,
+        context_size: u64,
+        bash_timeout: std::time::Duration,
+        max_turns: u16,
+    ) -> Self {
+        Self::build(backend, model, context_size, bash_timeout, 0, Some(max_turns))
     }
 
     pub fn model(&self) -> &str {
@@ -81,8 +159,8 @@ impl Agent {
         self.model = model;
     }
 
-    pub fn set_client(&mut self, client: OllamaClient) {
-        self.ollama = client;
+    pub fn set_backend(&mut self, backend: Arc<dyn ModelBackend>) {
+        self.backend = backend;
     }
 
     pub fn set_context_size(&mut self, size: u64) {
@@ -91,6 +169,21 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.messages.truncate(1); // keep system prompt
+    }
+
+    /// Return the last assistant message content, or a fallback string.
+    fn last_assistant_message(&self) -> String {
+        self.messages
+            .iter()
+            .rev()
+            .find_map(|m| {
+                if matches!(m.role, crate::message::Role::Assistant) && !m.content.trim().is_empty() {
+                    Some(m.content.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "Sub-agent produced no response.".to_string())
     }
 
     /// Trim oldest non-system messages when context usage exceeds threshold.
@@ -148,7 +241,6 @@ impl Agent {
         events: &mpsc::UnboundedSender<AgentEvent>,
         confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
     ) -> Result<()> {
-        // Log system prompt on first run
         if !self.system_prompt_logged {
             if let Some(sys_msg) = self.messages.first() {
                 send_event(events, AgentEvent::MessageLogged(sys_msg.clone()))?;
@@ -162,8 +254,44 @@ impl Agent {
 
         let mut empty_retries: u32 = 0;
         const MAX_EMPTY_RETRIES: u32 = 10;
+        let mut turn: u32 = 0;
+        let num_ctx = if self.context_size > 0 { Some(self.context_size) } else { None };
 
         loop {
+            // Enforce turn limit (sub-agents)
+            if let Some(max) = self.max_turns {
+                if turn >= max as u32 {
+                    // Force a final response without tools
+                    self.messages.push(Message::user(
+                        "You have reached your turn limit. Summarize your findings and \
+                         provide your final answer now.",
+                    ));
+                    let events_clone = events.clone();
+                    let response = self
+                        .backend
+                        .chat(
+                            &self.model,
+                            &self.messages,
+                            None, // no tools — force text response
+                            num_ctx,
+                            Box::new(move |token| {
+                                let _ = events_clone.send(AgentEvent::Token(token.to_string()));
+                            }),
+                        )
+                        .await;
+                    if let Ok(resp) = response {
+                        if !resp.content.trim().is_empty() {
+                            let msg = Message::assistant(&resp.content);
+                            self.messages.push(msg.clone());
+                            send_event(events, AgentEvent::MessageLogged(msg))?;
+                        }
+                    }
+                    send_event(events, AgentEvent::Done { prompt_tokens: 0 })?;
+                    return Ok(());
+                }
+            }
+            turn += 1;
+
             let tool_defs = self.tools.definitions();
             let events_clone = events.clone();
 
@@ -177,17 +305,11 @@ impl Agent {
                 )),
             )?;
 
-            let num_ctx = if self.context_size > 0 {
-                Some(self.context_size)
-            } else {
-                None
-            };
-
-            let response = match self
-                .ollama
-                .chat(&self.model, &self.messages, Some(tool_defs), num_ctx, move |token| {
+            let mut response = match self
+                .backend
+                .chat(&self.model, &self.messages, Some(tool_defs), num_ctx, Box::new(move |token| {
                     let _ = events_clone.send(AgentEvent::Token(token.to_string()));
-                })
+                }))
                 .await
             {
                 Ok(r) => r,
@@ -249,12 +371,60 @@ impl Agent {
             }
 
             if response.incomplete {
+                // If the stream ended with no real content (e.g. the model
+                // only emitted leaked special tokens that were stripped), treat
+                // it as a retryable empty response instead of showing an error.
+                if response.content.trim().is_empty()
+                    && response.tool_calls.is_empty()
+                    && empty_retries < MAX_EMPTY_RETRIES
+                {
+                    empty_retries += 1;
+                    send_event(
+                        events,
+                        AgentEvent::Debug(format!(
+                            "Incomplete stream with no content (likely special token leak), \
+                             retrying ({}/{})",
+                            empty_retries, MAX_EMPTY_RETRIES
+                        )),
+                    )?;
+                    continue;
+                }
                 send_event(
                     events,
                     AgentEvent::Error(
                         "Ollama stream ended unexpectedly (connection may have dropped)".to_string(),
                     ),
                 )?;
+            }
+
+            // Handle degenerate repetition detected during streaming.
+            if response.repetition_detected {
+                send_event(
+                    events,
+                    AgentEvent::Debug("Repetition detected in model output".to_string()),
+                )?;
+
+                if response.tool_calls.is_empty() {
+                    // No tool calls — treat as a failed generation and retry.
+                    if empty_retries < MAX_EMPTY_RETRIES {
+                        empty_retries += 1;
+                        send_event(
+                            events,
+                            AgentEvent::Debug(format!(
+                                "Degenerate response with no tool calls, retrying ({}/{})",
+                                empty_retries, MAX_EMPTY_RETRIES
+                            )),
+                        )?;
+                        // Clear the streamed garbage from the TUI
+                        send_event(events, AgentEvent::ContentReplaced(String::new()))?;
+                        continue;
+                    }
+                } else {
+                    // Tool calls present — discard the degenerate content but
+                    // keep the tool calls.
+                    response.content = String::new();
+                    send_event(events, AgentEvent::ContentReplaced(String::new()))?;
+                }
             }
 
             // Check if context window is exhausted
@@ -317,7 +487,6 @@ impl Agent {
                 return Ok(());
             }
 
-            // Got a non-empty response, reset retry counter
             empty_retries = 0;
 
             // If tool calls were extracted from text content, tell the UI to
@@ -371,6 +540,11 @@ impl Agent {
                         .and_then(|v| v.as_str())
                         .unwrap_or("?")
                         .to_string(),
+                    "subagent" => args
+                        .get("task")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
                     _ => args.to_string(),
                 };
 
@@ -383,7 +557,7 @@ impl Agent {
                 )?;
 
                 // Request user confirmation for tools that modify state
-                let needs_confirm = matches!(name.as_str(), "bash" | "edit" | "write");
+                let needs_confirm = matches!(name.as_str(), "bash" | "edit" | "write" | "subagent");
                 if needs_confirm {
                     send_event(
                         events,
@@ -438,6 +612,70 @@ impl Agent {
                         }
                         Err(e) => (format!("Error: {}", e), false),
                     }
+                } else if name == "subagent" {
+                    let task = args
+                        .get("task")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    send_event(events, AgentEvent::SubagentStart { task: task.clone() })?;
+
+                    let mut sub_agent = Agent::new_subagent(
+                        Arc::clone(&self.backend),
+                        self.model.clone(),
+                        self.context_size,
+                        self.bash_timeout,
+                        self.subagent_max_turns,
+                    );
+
+                    // Channels for the sub-agent
+                    let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<AgentEvent>();
+                    let (sub_confirm_tx, mut sub_confirm_rx) = mpsc::unbounded_channel::<bool>();
+
+                    // Forward sub-agent events to parent and auto-approve tool confirms
+                    let events_for_sub = events.clone();
+                    let forward_handle = tokio::spawn(async move {
+                        while let Some(evt) = sub_rx.recv().await {
+                            match &evt {
+                                AgentEvent::ToolConfirmRequest { .. } => {
+                                    let _ = sub_confirm_tx.send(true);
+                                }
+                                AgentEvent::ToolCall { name, args } => {
+                                    let _ = events_for_sub.send(AgentEvent::SubagentToolCall {
+                                        name: name.clone(),
+                                        args: args.clone(),
+                                    });
+                                }
+                                AgentEvent::ToolResult { name, success, .. } => {
+                                    let _ = events_for_sub.send(AgentEvent::SubagentToolResult {
+                                        name: name.clone(),
+                                        success: *success,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+
+                    // Run the sub-agent (blocks until it completes).
+                    // Box::pin required because this is a recursive async call.
+                    let sub_result = Box::pin(sub_agent.run(&task, &sub_tx, &mut sub_confirm_rx)).await;
+                    drop(sub_tx); // close event channel so forward task finishes
+                    let _ = forward_handle.await;
+
+                    match sub_result {
+                        Ok(()) => {
+                            let response = sub_agent.last_assistant_message();
+                            send_event(events, AgentEvent::SubagentEnd { result: response.clone() })?;
+                            (response, true)
+                        }
+                        Err(e) => {
+                            let err_msg = format!("Sub-agent error: {}", e);
+                            send_event(events, AgentEvent::SubagentEnd { result: err_msg.clone() })?;
+                            (err_msg, false)
+                        }
+                    }
                 } else {
                     match self.tools.execute(name, args) {
                         Ok(output) => (output, true),
@@ -454,7 +692,10 @@ impl Agent {
                     },
                 )?;
 
-                let tool_msg = Message::tool(&result, tool_call.id.clone());
+                // Truncate before storing in context to avoid blowing the window.
+                // The full output was already sent to the UI above.
+                let context_result = truncate_tool_output(&result);
+                let tool_msg = Message::tool(&context_result, tool_call.id.clone());
                 self.messages.push(tool_msg.clone());
                 send_event(events, AgentEvent::MessageLogged(tool_msg))?;
             }

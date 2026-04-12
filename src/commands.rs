@@ -1,4 +1,5 @@
 pub enum SlashCommand {
+    Bypass,
     Clear,
     Context,
     Model,
@@ -13,6 +14,10 @@ pub struct CommandInfo {
 }
 
 pub const COMMANDS: &[CommandInfo] = &[
+    CommandInfo {
+        name: "/bypass",
+        description: "Toggle auto-approve for tool calls",
+    },
     CommandInfo {
         name: "/clear",
         description: "Clear conversation history",
@@ -41,6 +46,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         return None;
     }
     match trimmed.split_whitespace().next()? {
+        "/bypass" => Some(SlashCommand::Bypass),
         "/clear" => Some(SlashCommand::Clear),
         "/context" => Some(SlashCommand::Context),
         "/model" => Some(SlashCommand::Model),

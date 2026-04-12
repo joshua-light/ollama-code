@@ -1,15 +1,18 @@
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+use crate::backend::ModelBackend;
 use crate::config::Config;
-use crate::ollama::OllamaClient;
+use crate::llama_server::ModelSource;
+use crate::ollama::OllamaBackend;
 
 pub(crate) enum AgentInput {
     Message(String),
     ClearHistory,
     SetModel(String),
     SetContextSize(u64),
-    SetClient(OllamaClient),
+    SetBackend(Arc<dyn ModelBackend>),
 }
 
 #[derive(Clone)]
@@ -40,11 +43,28 @@ pub(crate) enum ChatMessage {
         tool_chars: usize,
     },
     GenerationSummary { duration: std::time::Duration },
+    SubagentToolCall {
+        name: String,
+        args: String,
+        success: Option<bool>,
+    },
 }
 
 pub(crate) struct PendingConfirm {
     pub(crate) name: String,
     pub(crate) args: String,
+}
+
+/// Deferred llama-server start — stored in App so the event loop can stop the
+/// old server before spawning the new one (avoids VRAM contention).
+pub(crate) struct PendingServerStart {
+    pub(crate) server_path: String,
+    pub(crate) model_source: ModelSource,
+    pub(crate) ctx: u64,
+    pub(crate) extra_args: Vec<String>,
+    pub(crate) model_name: String,
+    /// If set, unload this Ollama model before starting the server.
+    pub(crate) unload: Option<(OllamaBackend, String)>,
 }
 
 pub(crate) struct App {
@@ -72,19 +92,23 @@ pub(crate) struct App {
     pub(crate) git_branch: Option<String>,
     pub(crate) git_dirty: bool,
     // Model selection
-    pub(crate) ollama: OllamaClient,
+    pub(crate) ollama: OllamaBackend,
     pub(crate) model_choices: Option<Vec<String>>,
     pub(crate) config: Config,
     /// Set by model selection to signal the event loop to stop the llama-server
     pub(crate) stop_llama_server: bool,
     /// Pending tool confirmation awaiting user response
     pub(crate) pending_confirm: Option<PendingConfirm>,
+    /// When true, all tool confirmations are auto-approved
+    pub(crate) auto_approve: bool,
     /// Force a full terminal clear before the next draw (e.g. after expand/collapse)
     pub(crate) needs_clear: bool,
+    /// Deferred llama-server start (event loop stops old server first, then spawns this)
+    pub(crate) pending_server_start: Option<PendingServerStart>,
 }
 
 impl App {
-    pub(crate) fn new(model: String, context_size: u64, ollama: OllamaClient, config: Config) -> Self {
+    pub(crate) fn new(model: String, context_size: u64, ollama: OllamaBackend, config: Config) -> Self {
         let (git_branch, git_dirty) = super::render::get_git_info_sync();
         let dir_name = std::env::current_dir()
             .ok()
@@ -117,7 +141,9 @@ impl App {
             config,
             stop_llama_server: false,
             pending_confirm: None,
+            auto_approve: false,
             needs_clear: false,
+            pending_server_start: None,
         }
     }
 

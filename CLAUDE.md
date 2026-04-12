@@ -26,16 +26,18 @@ Ollama must be running locally on port 11434 (`ollama serve`), unless using the 
 
 ## Architecture
 
-The agent loop lives in `src/agent.rs`. `Agent::run()` sends messages to Ollama, streams the response, and if tool calls are present, executes them and loops back for the model's next response. Events are emitted via an `mpsc::UnboundedSender<AgentEvent>` channel — both the TUI and pipe mode consume from this channel.
+The agent loop lives in `src/agent.rs`. `Agent::run()` sends messages to the model backend, streams the response, and if tool calls are present, executes them and loops back for the model's next response. Events are emitted via an `mpsc::UnboundedSender<AgentEvent>` channel — both the TUI and pipe mode consume from this channel. The agent holds a `Box<dyn ModelBackend>` and is backend-agnostic.
 
-**Ollama client** (`src/ollama.rs`): Streams responses from `POST /api/chat` line-by-line (newline-delimited JSON). Collects content tokens and tool calls from the streamed chunks. The `on_token` callback enables live token streaming to the UI.
+**Backend trait** (`src/backend.rs`): The `ModelBackend` trait defines the `chat()` method that all backends implement. Also contains the shared `ChatResponse` and `ModelInfo` types. Two implementations exist: `OllamaBackend` and `LlamaCppBackend`.
 
-**Tool system** (`src/tools.rs`): `Tool` trait with `definition()` and `execute()`. `ToolRegistry` holds registered tools and converts definitions to Ollama's JSON tool format. Currently only `BashTool` is registered — it runs commands via `bash -c` and returns combined stdout/stderr.
+**Ollama backend** (`src/ollama.rs`): `OllamaBackend` implements `ModelBackend`. Streams responses from `POST /api/chat` line-by-line, auto-detecting Ollama (newline-delimited JSON) vs OpenAI SSE format. Collects content tokens and tool calls from the streamed chunks. Also provides Ollama-specific methods: `list_models()` and `unload_model()`.
 
-**TUI** (`src/tui.rs`): Ratatui alternate-screen app with three panels (header, chat, input). Uses `tokio::select!` over terminal events, agent events, and an 80ms tick for the spinner. Includes a basic markdown renderer for assistant messages (code blocks, headings, lists, inline bold/code). The `/model` command supports runtime switching between Ollama models and HuggingFace models (via llama-server). The TUI owns the llama-server lifecycle when using HF models.
+**llama-cpp backend** (`src/llama_server.rs`): `LlamaCppBackend` implements `ModelBackend` by delegating to `OllamaBackend` pointed at the llama-server URL (both speak the same HTTP chat protocol). Also contains `LlamaServer`, which spawns and manages a `llama-server` child process — handling startup, health-check polling, and cleanup. Can resolve GGUF model files from Ollama's local blob storage.
+
+**Tool system** (`src/tools.rs`): `Tool` trait with `definition()` and `execute()`. `ToolRegistry` holds registered tools and converts definitions to the JSON tool format.
+
+**TUI** (`src/tui/`): Ratatui alternate-screen app with three panels (header, chat, input). Uses `tokio::select!` over terminal events, agent events, and an 80ms tick for the spinner. Includes a basic markdown renderer for assistant messages (code blocks, headings, lists, inline bold/code). The `/model` command supports runtime switching between Ollama models and HuggingFace models (via llama-server). The TUI owns the llama-server lifecycle when using HF models.
 
 **Message types** (`src/message.rs`): Serializable message structs matching Ollama's chat API format (system/user/assistant/tool roles).
 
 **Config** (`src/config.rs`): Loads from `~/.config/ollama-code/config.toml`. Stores model, context_size, and optional llama-cpp backend settings (backend, llama_server_path, model_path, llama_server_args).
-
-**llama-server manager** (`src/llama_server.rs`): Spawns and manages a `llama-server` child process for the llama-cpp backend. Handles startup, health-check polling, and cleanup. Can resolve GGUF model files from Ollama's local blob storage.

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const DEFAULT_CONTEXT_SIZE: u64 = 32768;
+pub const DEFAULT_SUBAGENT_MAX_TURNS: u16 = 15;
 
 /// Root data directory for ollama-code (`$XDG_DATA_HOME/ollama-code` or `./ollama-code`).
 pub fn data_dir() -> PathBuf {
@@ -42,6 +43,14 @@ pub struct Config {
     /// Timeout for bash tool commands in seconds (default: 120).
     #[serde(default)]
     pub bash_timeout: Option<u64>,
+
+    /// Maximum number of agent-loop turns a sub-agent is allowed (default: 15).
+    #[serde(default)]
+    pub subagent_max_turns: Option<u16>,
+
+    /// Recently used HuggingFace model repos (most recent first, max 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_hf_models: Option<Vec<String>>,
 }
 
 impl Config {
@@ -69,5 +78,14 @@ impl Config {
         }
         std::fs::write(&path, toml::to_string_pretty(self)?)?;
         Ok(())
+    }
+
+    /// Add a HuggingFace repo to the recent list (most recent first, max 10).
+    pub fn add_recent_hf_model(&mut self, repo: &str) {
+        let mut list = self.recent_hf_models.take().unwrap_or_default();
+        list.retain(|m| m != repo);
+        list.insert(0, repo.to_string());
+        list.truncate(10);
+        self.recent_hf_models = Some(list);
     }
 }

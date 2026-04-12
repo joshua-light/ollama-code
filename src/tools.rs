@@ -136,15 +136,16 @@ impl Tool for ReadTool {
 
         let start = (offset - 1).min(total_lines);
 
+        const DEFAULT_LIMIT: usize = 200;
+
         let limit = arguments
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+            .map(|v| v as usize)
+            .unwrap_or(DEFAULT_LIMIT);
 
-        let end = match limit {
-            Some(l) => (start + l).min(total_lines),
-            None => total_lines,
-        };
+        let end = (start + limit).min(total_lines);
+        let truncated = end < total_lines && arguments.get("limit").is_none();
 
         let mut result = String::new();
         for (i, line) in lines[start..end].iter().enumerate() {
@@ -154,6 +155,11 @@ impl Tool for ReadTool {
 
         if result.is_empty() {
             result = "(empty file)".to_string();
+        } else if truncated {
+            result.push_str(&format!(
+                "\n... ({} more lines not shown. Use offset and limit to read more.)\n",
+                total_lines - end
+            ));
         }
 
         Ok(result)
@@ -226,9 +232,9 @@ impl Tool for EditTool {
             Some(pos) => pos,
         };
 
-        // Check for a second occurrence
-        if content[first_pos + old_string.len()..].contains(old_string) {
-            let match_count = content.matches(old_string).count();
+        // Check for multiple occurrences
+        let match_count = content.matches(old_string).count();
+        if match_count > 1 {
             anyhow::bail!(
                 "old_string found {} times in '{}'. Provide more surrounding \
                  context to make the match unique.",
@@ -367,6 +373,40 @@ impl Tool for WriteTool {
 
         let line_count = content.lines().count();
         Ok(format!("Created '{}' ({} lines)", file_path, line_count))
+    }
+}
+
+// --- Subagent tool (definition only — execution handled by agent loop) ---
+
+pub struct SubagentToolDef;
+
+impl Tool for SubagentToolDef {
+    fn name(&self) -> &str { "subagent" }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "subagent".to_string(),
+            description: "Spawn a sub-agent with a fresh, clean context to handle a focused task. \
+                          The sub-agent has its own conversation history (only the task you give it), \
+                          making it ideal for research, exploration, and self-contained coding tasks \
+                          that benefit from a clean context window. Returns the sub-agent's final \
+                          response. The sub-agent cannot see this conversation, so include all \
+                          necessary context in the task description."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "A self-contained task description. Include all necessary context — the sub-agent cannot see the current conversation."
+                    }
+                },
+                "required": ["task"]
+            }),
+        }
+    }
+
+    fn execute(&self, _arguments: &Value) -> Result<String> {
+        anyhow::bail!("subagent tool must be executed by the agent loop, not the tool registry")
     }
 }
 

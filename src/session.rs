@@ -103,6 +103,18 @@ impl Session {
                     removed_messages, estimated_tokens_freed
                 )
             }
+            AgentEvent::SubagentStart { task } => {
+                format!("SUBAGENT_START task={}", task)
+            }
+            AgentEvent::SubagentToolCall { name, args } => {
+                format!("SUBAGENT_TOOL_CALL {}({})", name, args)
+            }
+            AgentEvent::SubagentToolResult { name, success } => {
+                format!("SUBAGENT_TOOL_RESULT {} success={}", name, success)
+            }
+            AgentEvent::SubagentEnd { result } => {
+                format!("SUBAGENT_END ({} chars)", result.len())
+            }
             AgentEvent::MessageLogged(_) => return, // handled separately via log_message
             AgentEvent::Debug(s) => format!("DEBUG {}", s),
         };
