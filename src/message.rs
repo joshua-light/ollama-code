@@ -15,10 +15,19 @@ pub struct Message {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// OpenAI-compatible: links a tool result to the tool call that produced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// Unique identifier for this tool call (OpenAI-compatible).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Always "function" (OpenAI-compatible).
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
     pub function: FunctionCall,
 }
 
@@ -28,12 +37,25 @@ pub struct FunctionCall {
     pub arguments: serde_json::Value,
 }
 
+impl ToolCall {
+    /// Generate a simple unique ID for this tool call.
+    pub fn with_id(mut self) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        self.id = Some(format!("call_{}", n));
+        self.call_type = Some("function".to_string());
+        self
+    }
+}
+
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
             content: content.into(),
             tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -42,6 +64,7 @@ impl Message {
             role: Role::User,
             content: content.into(),
             tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -50,14 +73,16 @@ impl Message {
             role: Role::Assistant,
             content: content.into(),
             tool_calls: None,
+            tool_call_id: None,
         }
     }
 
-    pub fn tool(content: impl Into<String>) -> Self {
+    pub fn tool(content: impl Into<String>, tool_call_id: Option<String>) -> Self {
         Self {
             role: Role::Tool,
             content: content.into(),
             tool_calls: None,
+            tool_call_id,
         }
     }
 }

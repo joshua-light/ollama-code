@@ -98,6 +98,8 @@ fn extract_tool_calls_from_content(
             ) {
                 if known_tools.iter().any(|t| t == name) {
                     calls.push(ToolCall {
+                        id: None,
+                        call_type: None,
                         function: FunctionCall {
                             name: name.to_string(),
                             arguments: arguments.clone(),
@@ -137,11 +139,20 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<ChatOptions>,
+    /// Request token usage stats in OpenAI-compatible streaming responses.
+    /// Ollama ignores this field; llama-server requires it to report token counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChatOptions {
     num_ctx: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +209,9 @@ pub struct ChatResponse {
     pub total_duration: u64,
     /// True if the stream ended without receiving `done: true` from Ollama.
     pub incomplete: bool,
+    /// True if tool calls were extracted from text content rather than from
+    /// Ollama's structured `tool_calls` field.
+    pub tool_calls_from_content: bool,
 }
 
 struct TimingMetrics {
@@ -207,6 +221,107 @@ struct TimingMetrics {
     eval_duration: u64,
     load_duration: u64,
     total_duration: u64,
+}
+
+// --- OpenAI SSE format types (used by llama-server's /api/chat) ---
+
+#[derive(Debug, Deserialize)]
+struct OpenAIChunk {
+    choices: Option<Vec<OpenAIChoice>>,
+    usage: Option<OpenAIUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIChoice {
+    delta: Option<OpenAIDelta>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIToolCallDelta {
+    function: Option<OpenAIFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+/// State for accumulating streamed OpenAI tool calls (name and arguments
+/// arrive in separate chunks).
+struct OpenAIToolCallAccum {
+    name: String,
+    arguments: String,
+}
+
+fn process_openai_chunk<F: Fn(&str)>(
+    parsed: &OpenAIChunk,
+    content: &mut String,
+    tool_accum: &mut Vec<OpenAIToolCallAccum>,
+    metrics: &mut TimingMetrics,
+    on_token: &F,
+) -> Option<String> {
+    // finish_reason
+    let mut finish = None;
+
+    if let Some(choices) = &parsed.choices {
+        for choice in choices {
+            if let Some(delta) = &choice.delta {
+                if let Some(text) = &delta.content {
+                    if !text.is_empty() {
+                        content.push_str(text);
+                        on_token(text);
+                    }
+                }
+                if let Some(tool_calls) = &delta.tool_calls {
+                    for (i, tc) in tool_calls.iter().enumerate() {
+                        // Grow accumulators as needed
+                        while tool_accum.len() <= i {
+                            tool_accum.push(OpenAIToolCallAccum {
+                                name: String::new(),
+                                arguments: String::new(),
+                            });
+                        }
+                        if let Some(func) = &tc.function {
+                            if let Some(name) = &func.name {
+                                tool_accum[i].name = name.clone();
+                            }
+                            if let Some(args) = &func.arguments {
+                                tool_accum[i].arguments.push_str(args);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(reason) = &choice.finish_reason {
+                finish = Some(reason.clone());
+            }
+        }
+    }
+
+    if let Some(usage) = &parsed.usage {
+        if let Some(n) = usage.prompt_tokens {
+            metrics.prompt_eval_count = n;
+        }
+        if let Some(n) = usage.completion_tokens {
+            metrics.eval_count = n;
+        }
+    }
+
+    finish
 }
 
 fn process_chunk<F: Fn(&str)>(
@@ -226,6 +341,8 @@ fn process_chunk<F: Fn(&str)>(
         if let Some(calls) = &msg.tool_calls {
             for call in calls {
                 tool_calls.push(ToolCall {
+                    id: None,
+                    call_type: None,
                     function: FunctionCall {
                         name: call.function.name.clone(),
                         arguments: call.function.arguments.clone(),
@@ -264,38 +381,19 @@ impl OllamaClient {
         }
     }
 
-    /// Fetch model metadata from `/api/show` and extract the context window size.
-    /// Scans `model_info` keys for one ending in `.context_length`.
-    pub async fn context_length(&self, model: &str) -> Result<u64> {
-        let body = serde_json::json!({ "name": model });
-        let resp = self
+    /// Tell Ollama to unload a model from memory (frees VRAM).
+    pub async fn unload_model(&self, model: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "model": model,
+            "keep_alive": 0
+        });
+        let _ = self
             .client
-            .post(format!("{}/api/show", self.base_url))
+            .post(format!("{}/api/generate", self.base_url))
             .json(&body)
             .send()
-            .await
-            .context("Failed to connect to Ollama")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Ollama /api/show error ({}): {}", status, text);
-        }
-
-        let data: Value = resp.json().await?;
-
-        if let Some(model_info) = data.get("model_info").and_then(|v| v.as_object()) {
-            for (key, val) in model_info {
-                if key.ends_with(".context_length") {
-                    if let Some(n) = val.as_u64() {
-                        return Ok(n);
-                    }
-                }
-            }
-        }
-
-        // Fallback: not all models expose this; default to 0 (unknown)
-        Ok(0)
+            .await;
+        Ok(())
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
@@ -347,6 +445,7 @@ impl OllamaClient {
             tools,
             stream: true,
             options,
+            stream_options: Some(StreamOptions { include_usage: true }),
         };
 
         let resp = self
@@ -378,6 +477,11 @@ impl OllamaClient {
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
 
+        // Detect format from the first non-empty line.
+        // OpenAI SSE lines start with "data: ", Ollama lines are raw JSON.
+        let mut is_openai: Option<bool> = None;
+        let mut openai_tool_accum: Vec<OpenAIToolCallAccum> = Vec::new();
+
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -390,32 +494,118 @@ impl OllamaClient {
                     continue;
                 }
 
-                let parsed: ChatChunk = serde_json::from_str(&line)
-                    .with_context(|| format!("Failed to parse Ollama response: {}", line))?;
+                // Auto-detect format on first non-empty line
+                if is_openai.is_none() {
+                    is_openai = Some(line.starts_with("data:"));
+                }
 
-                process_chunk(&parsed, &mut content, &mut tool_calls, &mut metrics, &on_token);
-
-                if parsed.done {
-                    saw_done = true;
-                    break;
+                if is_openai == Some(true) {
+                    // OpenAI SSE format
+                    let data = line.strip_prefix("data:").unwrap_or(&line).trim();
+                    if data == "[DONE]" {
+                        saw_done = true;
+                        break;
+                    }
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let parsed: OpenAIChunk = serde_json::from_str(data)
+                        .with_context(|| {
+                            format!("Failed to parse OpenAI response: {}", data)
+                        })?;
+                    let finish = process_openai_chunk(
+                        &parsed,
+                        &mut content,
+                        &mut openai_tool_accum,
+                        &mut metrics,
+                        &on_token,
+                    );
+                    if finish.is_some() {
+                        saw_done = true;
+                    }
+                } else {
+                    // Ollama format
+                    let parsed: ChatChunk = serde_json::from_str(&line)
+                        .with_context(|| {
+                            format!("Failed to parse Ollama response: {}", line)
+                        })?;
+                    process_chunk(
+                        &parsed,
+                        &mut content,
+                        &mut tool_calls,
+                        &mut metrics,
+                        &on_token,
+                    );
+                    if parsed.done {
+                        saw_done = true;
+                        break;
+                    }
                 }
             }
         }
 
         // Process remaining buffer
         let remaining = buffer.trim();
-        if !remaining.is_empty() {
-            let parsed: ChatChunk = serde_json::from_str(remaining)
-                .with_context(|| {
-                    format!(
-                        "Failed to parse remaining Ollama buffer ({} bytes): {}",
-                        remaining.len(),
-                        &remaining[..remaining.len().min(200)]
-                    )
-                })?;
-            process_chunk(&parsed, &mut content, &mut tool_calls, &mut metrics, &on_token);
-            if parsed.done {
-                saw_done = true;
+        if !remaining.is_empty() && !saw_done {
+            if is_openai == Some(true) {
+                let data = remaining.strip_prefix("data:").unwrap_or(remaining).trim();
+                if data != "[DONE]" && !data.is_empty() {
+                    let parsed: OpenAIChunk = serde_json::from_str(data)
+                        .with_context(|| {
+                            format!("Failed to parse remaining OpenAI buffer: {}", data)
+                        })?;
+                    let finish = process_openai_chunk(
+                        &parsed,
+                        &mut content,
+                        &mut openai_tool_accum,
+                        &mut metrics,
+                        &on_token,
+                    );
+                    if finish.is_some() {
+                        saw_done = true;
+                    }
+                } else {
+                    saw_done = true;
+                }
+            } else {
+                let parsed: ChatChunk = serde_json::from_str(remaining)
+                    .with_context(|| {
+                        format!(
+                            "Failed to parse remaining Ollama buffer ({} bytes): {}",
+                            remaining.len(),
+                            &remaining[..remaining.len().min(200)]
+                        )
+                    })?;
+                process_chunk(
+                    &parsed,
+                    &mut content,
+                    &mut tool_calls,
+                    &mut metrics,
+                    &on_token,
+                );
+                if parsed.done {
+                    saw_done = true;
+                }
+            }
+        }
+
+        // Convert accumulated OpenAI tool calls to our format
+        if is_openai == Some(true) {
+            for accum in &openai_tool_accum {
+                if !accum.name.is_empty() {
+                    let arguments: Value =
+                        serde_json::from_str(&accum.arguments).unwrap_or(Value::Object(
+                            serde_json::Map::new(),
+                        ));
+                    tool_calls.push(ToolCall {
+                        id: None,
+                        call_type: None,
+                        function: FunctionCall {
+                            name: accum.name.clone(),
+                            arguments,
+                        },
+                    });
+                }
             }
         }
 
@@ -423,12 +613,14 @@ impl OllamaClient {
         // content instead of using Ollama's structured tool_calls field.
         // When no structured calls were received, try to extract them from the
         // content as a fallback.
+        let mut tool_calls_from_content = false;
         if tool_calls.is_empty() && !content.trim().is_empty() && !known_tool_names.is_empty() {
             let (extracted, remaining) =
                 extract_tool_calls_from_content(&content, &known_tool_names);
             if !extracted.is_empty() {
                 tool_calls = extracted;
                 content = remaining;
+                tool_calls_from_content = true;
             }
         }
 
@@ -442,6 +634,7 @@ impl OllamaClient {
             load_duration: metrics.load_duration,
             total_duration: metrics.total_duration,
             incomplete: !saw_done,
+            tool_calls_from_content,
         })
     }
 }

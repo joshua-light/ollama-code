@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::AgentEvent;
+use crate::config;
 use crate::message::Message;
 
 pub struct Session {
@@ -14,10 +15,7 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> anyhow::Result<Self> {
-        let base = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("ollama-code")
-            .join("sessions");
+        let base = config::data_dir().join("sessions");
 
         let id = generate_session_id();
         let dir = base.join(&id);
@@ -83,10 +81,16 @@ impl Session {
                     output.len()
                 )
             }
+            AgentEvent::ContextUpdate { prompt_tokens } => {
+                format!("CONTEXT_UPDATE prompt_tokens={}", prompt_tokens)
+            }
             AgentEvent::Done { prompt_tokens } => {
                 format!("DONE prompt_tokens={}", prompt_tokens)
             }
             AgentEvent::Error(e) => format!("ERROR {}", e),
+            AgentEvent::ContentReplaced(_) => {
+                "CONTENT_REPLACED (tool calls extracted from text)".to_string()
+            }
             AgentEvent::MessageLogged(_) => return, // handled separately via log_message
             AgentEvent::Debug(s) => format!("DEBUG {}", s),
         };

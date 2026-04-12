@@ -1,6 +1,7 @@
 mod agent;
 mod commands;
 mod config;
+mod llama_server;
 mod message;
 mod ollama;
 mod session;
@@ -10,10 +11,12 @@ mod tui;
 use anyhow::Result;
 use clap::Parser;
 use std::io::Write;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent};
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_CONTEXT_SIZE};
+use crate::llama_server::{LlamaServer, ModelSource};
 use crate::ollama::OllamaClient;
 use crate::session::Session;
 
@@ -27,6 +30,22 @@ struct Cli {
     /// Model to use (overrides config)
     #[arg(short, long)]
     model: Option<String>,
+
+    /// Backend: "ollama" (default) or "llama-cpp"
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// Path to llama-server binary (for llama-cpp backend)
+    #[arg(long)]
+    llama_server_path: Option<String>,
+
+    /// Path to GGUF model file (for llama-cpp backend)
+    #[arg(long)]
+    model_path: Option<String>,
+
+    /// HuggingFace repo to download model from (for llama-cpp backend, e.g. "google/gemma-3-27b-it-GGUF")
+    #[arg(long)]
+    hf_repo: Option<String>,
 }
 
 #[tokio::main]
@@ -34,6 +53,21 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load()?;
 
+    let context_size = config.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE);
+
+    let backend = cli
+        .backend
+        .as_deref()
+        .or(config.backend.as_deref())
+        .unwrap_or("ollama");
+
+    match backend {
+        "llama-cpp" => run_llama_cpp(cli, config, context_size).await,
+        _ => run_ollama(cli, config, context_size).await,
+    }
+}
+
+async fn run_ollama(cli: Cli, mut config: Config, context_size: u64) -> Result<()> {
     let ollama = OllamaClient::new(None);
 
     let model = if let Some(m) = cli.model {
@@ -42,15 +76,13 @@ async fn main() -> Result<()> {
         m
     } else {
         let m = select_model(&ollama).await?;
-        let mut config = config;
         config.model = Some(m.clone());
+        config.context_size = Some(context_size);
         if let Err(e) = config.save() {
             eprintln!("Warning: could not save config: {}", e);
         }
         m
     };
-
-    let context_size = ollama.context_length(&model).await.unwrap_or(0);
 
     let agent = Agent::new(ollama.clone(), model, context_size);
     let session = Session::new()?;
@@ -58,7 +90,82 @@ async fn main() -> Result<()> {
     if let Some(prompt) = cli.prompt {
         run_pipe(agent, &prompt, session).await
     } else {
-        tui::run(agent, context_size, session, ollama).await
+        tui::run(agent, context_size, session, config, None).await
+    }
+}
+
+async fn run_llama_cpp(cli: Cli, config: Config, context_size: u64) -> Result<()> {
+    let server_path = cli
+        .llama_server_path
+        .as_deref()
+        .or(config.llama_server_path.as_deref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "llama-cpp backend requires --llama-server-path or llama_server_path in config"
+            )
+        })?;
+
+    let server_binary = PathBuf::from(server_path);
+    if !server_binary.exists() {
+        anyhow::bail!("llama-server binary not found at: {}", server_binary.display());
+    }
+
+    // Determine model name (used as the alias for the API)
+    let model_name = cli
+        .model
+        .as_deref()
+        .or(config.model.as_deref())
+        .unwrap_or("default");
+
+    // Determine model source: --model-path > --hf-repo > config > Ollama blob resolution
+    let model_source =
+        if let Some(p) = cli.model_path.as_deref().or(config.model_path.as_deref()) {
+            let path = PathBuf::from(p);
+            if !path.exists() {
+                anyhow::bail!("Model file not found: {}", path.display());
+            }
+            ModelSource::File(path)
+        } else if let Some(hf) = cli.hf_repo.as_deref().or(config.hf_repo.as_deref()) {
+            ModelSource::HuggingFace(hf.to_string())
+        } else if model_name.contains('/') {
+            // Looks like a HuggingFace repo (e.g. "unsloth/gemma-4-26B-A4B-it-GGUF")
+            ModelSource::HuggingFace(model_name.to_string())
+        } else {
+            // Try to resolve from Ollama's model storage via the Ollama API
+            eprintln!("Resolving model '{}' from Ollama storage...", model_name);
+            ModelSource::File(llama_server::find_ollama_model_path(model_name).await?)
+        };
+
+    let extra_args = config.llama_server_args.clone().unwrap_or_default();
+
+    let port = llama_server::find_free_port()?;
+    eprintln!(
+        "Starting llama-server on port {} with {}...",
+        port,
+        match &model_source {
+            ModelSource::File(p) => format!("model {}", p.display()),
+            ModelSource::HuggingFace(repo) => format!("HF repo {}", repo),
+        }
+    );
+
+    let mut server =
+        LlamaServer::start(&server_binary, &model_source, port, context_size, &extra_args)
+            .await?;
+
+    eprintln!("llama-server ready (log: {})", server.log_path.display());
+
+    let ollama = OllamaClient::new(Some(server.base_url()));
+
+    let agent = Agent::new(ollama.clone(), model_name.to_string(), context_size);
+    let session = Session::new()?;
+
+    if let Some(prompt) = cli.prompt {
+        let result = run_pipe(agent, &prompt, session).await;
+        server.stop().await;
+        result
+    } else {
+        // TUI takes ownership of the server and handles its lifecycle
+        tui::run(agent, context_size, session, config, Some(server)).await
     }
 }
 
@@ -137,7 +244,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session) -> Resul
                 eprintln!("\nerror: {}", e);
                 break;
             }
-            AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) => {}
+            AgentEvent::ContextUpdate { .. } | AgentEvent::ContentReplaced(_) | AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) => {}
         }
     }
 

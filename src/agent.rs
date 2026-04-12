@@ -8,8 +8,13 @@ use crate::tools::{BashTool, EditTool, ReadTool, WriteTool, ToolRegistry};
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Token(String),
+    /// Replace previously streamed content. Emitted when tool calls were
+    /// extracted from the text content (some models emit tool calls as plain
+    /// JSON instead of using structured tool_calls).
+    ContentReplaced(String),
     ToolCall { name: String, args: String },
     ToolResult { name: String, output: String, success: bool },
+    ContextUpdate { prompt_tokens: u64 },
     Done { prompt_tokens: u64 },
     Error(String),
     MessageLogged(Message),
@@ -67,6 +72,10 @@ impl Agent {
 
     pub fn set_model(&mut self, model: String) {
         self.model = model;
+    }
+
+    pub fn set_client(&mut self, client: OllamaClient) {
+        self.ollama = client;
     }
 
     pub fn set_context_size(&mut self, size: u64) {
@@ -162,6 +171,15 @@ impl Agent {
                 )),
             )?;
 
+            if response.prompt_eval_count > 0 {
+                send_event(
+                    events,
+                    AgentEvent::ContextUpdate {
+                        prompt_tokens: response.prompt_eval_count,
+                    },
+                )?;
+            }
+
             if response.incomplete {
                 send_event(
                     events,
@@ -200,12 +218,28 @@ impl Agent {
             // Got a non-empty response, reset retry counter
             empty_retries = 0;
 
+            // If tool calls were extracted from text content, tell the UI to
+            // replace the already-streamed raw JSON with the cleaned content.
+            if response.tool_calls_from_content {
+                send_event(
+                    events,
+                    AgentEvent::ContentReplaced(response.content.clone()),
+                )?;
+            }
+
+            // Ensure all tool calls have IDs (needed for OpenAI-compatible backends).
+            let tool_calls_with_ids: Vec<_> = response
+                .tool_calls
+                .into_iter()
+                .map(|tc| if tc.id.is_some() { tc } else { tc.with_id() })
+                .collect();
+
             let mut assistant_msg = Message::assistant(&response.content);
-            assistant_msg.tool_calls = Some(response.tool_calls.clone());
+            assistant_msg.tool_calls = Some(tool_calls_with_ids.clone());
             self.messages.push(assistant_msg.clone());
             send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
 
-            for tool_call in &response.tool_calls {
+            for tool_call in &tool_calls_with_ids {
                 let name = &tool_call.function.name;
                 let args = &tool_call.function.arguments;
 
@@ -260,7 +294,7 @@ impl Agent {
                     },
                 )?;
 
-                let tool_msg = Message::tool(&result);
+                let tool_msg = Message::tool(&result, tool_call.id.clone());
                 self.messages.push(tool_msg.clone());
                 send_event(events, AgentEvent::MessageLogged(tool_msg))?;
             }

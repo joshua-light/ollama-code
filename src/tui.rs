@@ -19,6 +19,8 @@ use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent};
 use crate::commands;
+use crate::config::Config;
+use crate::llama_server::{self, LlamaServer, ModelSource};
 use crate::ollama::OllamaClient;
 use crate::session::Session;
 
@@ -27,6 +29,7 @@ enum AgentInput {
     ClearHistory,
     SetModel(String),
     SetContextSize(u64),
+    SetClient(OllamaClient),
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -205,10 +208,13 @@ struct App {
     // Model selection
     ollama: OllamaClient,
     model_choices: Option<Vec<String>>,
+    config: Config,
+    /// Set by model selection to signal the event loop to stop the llama-server
+    stop_llama_server: bool,
 }
 
 impl App {
-    fn new(model: String, context_size: u64, ollama: OllamaClient) -> Self {
+    fn new(model: String, context_size: u64, ollama: OllamaClient, config: Config) -> Self {
         let (git_branch, git_dirty) = get_git_info_sync();
         let dir_name = std::env::current_dir()
             .ok()
@@ -238,6 +244,8 @@ impl App {
             git_dirty,
             ollama,
             model_choices: None,
+            config,
+            stop_llama_server: false,
         }
     }
 
@@ -289,6 +297,12 @@ impl App {
         }
     }
 
+    fn dismiss_model_chooser(&mut self) {
+        self.model_choices = None;
+        self.input.clear();
+        self.cursor_pos = 0;
+    }
+
     fn reset_conversation(&mut self, input_tx: &mpsc::UnboundedSender<AgentInput>, msg: &str) {
         self.messages.clear();
         self.current_response.clear();
@@ -301,7 +315,7 @@ impl App {
     }
 }
 
-pub async fn run(agent: Agent, context_size: u64, mut session: Session, ollama: OllamaClient) -> Result<()> {
+pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: Config, mut llama_server: Option<LlamaServer>) -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -316,7 +330,8 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, ollama: 
     let mut terminal = Terminal::new(backend)?;
 
     let model = agent.model().to_string();
-    let mut app = App::new(model.clone(), context_size, ollama);
+    let ollama = OllamaClient::new(None); // always points to real Ollama for model listing
+    let mut app = App::new(model.clone(), context_size, ollama, config);
 
     session.log_debug(&format!("TUI_START model={}", model));
     let session_path = session.path().display().to_string();
@@ -324,7 +339,7 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, ollama: 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
     let (model_tx, mut model_rx) = mpsc::unbounded_channel::<Result<Vec<String>>>();
-    let (ctx_tx, mut ctx_rx) = mpsc::unbounded_channel::<u64>();
+    let (backend_tx, mut backend_rx) = mpsc::unbounded_channel::<Result<(OllamaClient, String, LlamaServer)>>();
 
     // Keep a clone for the panic handler
     let panic_event_tx = event_tx.clone();
@@ -349,6 +364,9 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, ollama: 
                     }
                     AgentInput::SetContextSize(size) => {
                         agent.set_context_size(size);
+                    }
+                    AgentInput::SetClient(client) => {
+                        agent.set_client(client);
                     }
                 }
             }
@@ -384,7 +402,13 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, ollama: 
                 // Only redraw on tick when processing (spinner/progress needs animation)
             }
             Some(Ok(evt)) = reader.next() => {
-                handle_terminal_event(evt, &mut app, &input_tx, &model_tx, &ctx_tx, &session);
+                handle_terminal_event(evt, &mut app, &input_tx, &model_tx, &backend_tx, &session);
+                if app.stop_llama_server {
+                    app.stop_llama_server = false;
+                    if let Some(mut old) = llama_server.take() {
+                        tokio::spawn(async move { old.stop().await; });
+                    }
+                }
                 needs_redraw = true;
             }
             event = event_rx.recv() => {
@@ -407,35 +431,81 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, ollama: 
                 }
                 needs_redraw = true;
             }
-            Some(ctx) = ctx_rx.recv() => {
-                app.context_size = ctx;
-                let _ = input_tx.send(AgentInput::SetContextSize(ctx));
-                needs_redraw = true;
-            }
             Some(result) = model_rx.recv() => {
                 let was_at_bottom = app.is_at_bottom();
                 match result {
                     Ok(models) if models.is_empty() => {
-                        app.messages.push(ChatMessage::Info(
-                            "No models found. Pull a model first: ollama pull <model>".into(),
-                        ));
+                        let mut info = String::from("No Ollama models found.\n");
+                        info.push_str("\nEnter a HuggingFace repo to use llama.cpp\n");
+                        info.push_str("(e.g. \"bartowski/Qwen2.5-Coder-7B-Instruct-GGUF\").\n");
+                        info.push_str("Esc to cancel.");
+                        app.messages.push(ChatMessage::Info(info));
+                        app.model_choices = Some(Vec::new());
                     }
                     Ok(models) => {
-                        let mut info = String::from("Available models:\n");
+                        let mut info = String::from("Available models (Ollama):\n");
                         for (i, name) in models.iter().enumerate() {
                             let marker = if *name == app.model { " (current)" } else { "" };
                             info.push_str(&format!("  {}. {}{}\n", i + 1, name, marker));
                         }
-                        info.push_str("\nType a number to select, or <number> <context_size> to override context window.\nEsc to cancel.");
+                        info.push_str("\nType a number to select, or enter a HuggingFace repo for llama.cpp\n");
+                        info.push_str("(e.g. \"bartowski/Qwen2.5-Coder-7B-Instruct-GGUF\").\nEsc to cancel.");
                         app.messages.push(ChatMessage::Info(info));
                         app.model_choices = Some(models);
                     }
                     Err(e) => {
+                        // Ollama not reachable — still allow HF model selection
+                        let mut info = format!("Could not reach Ollama: {}\n", e);
+                        info.push_str("\nEnter a HuggingFace repo to use llama.cpp\n");
+                        info.push_str("(e.g. \"bartowski/Qwen2.5-Coder-7B-Instruct-GGUF\").\n");
+                        info.push_str("Esc to cancel.");
+                        app.messages.push(ChatMessage::Info(info));
+                        app.model_choices = Some(Vec::new());
+                    }
+                }
+                if was_at_bottom {
+                    app.scroll_offset = 0;
+                }
+                needs_redraw = true;
+            }
+            Some(result) = backend_rx.recv() => {
+                let was_at_bottom = app.is_at_bottom();
+                match result {
+                    Ok((client, model_name, server)) => {
+                        // Stop old server if any
+                        if let Some(mut old) = llama_server.take() {
+                            tokio::spawn(async move { old.stop().await; });
+                        }
+                        llama_server = Some(server);
+                        let _ = input_tx.send(AgentInput::SetClient(client));
+                        let _ = input_tx.send(AgentInput::SetModel(model_name.clone()));
+                        app.model = model_name.clone();
+                        app.context_used = 0;
+                        app.messages.push(ChatMessage::Info(format!(
+                            "Switched to {} (llama.cpp, context: {}).",
+                            model_name, format_number(app.context_size)
+                        )));
+
+                        // Save to config
+                        let mut config = app.config.clone();
+                        config.model = Some(model_name.clone());
+                        config.backend = Some("llama-cpp".to_string());
+                        config.hf_repo = Some(model_name);
+                        if let Err(e) = config.save() {
+                            app.messages.push(ChatMessage::Error(format!(
+                                "Warning: could not save config: {}", e
+                            )));
+                        }
+                        app.config = config;
+                    }
+                    Err(e) => {
                         app.messages.push(ChatMessage::Error(format!(
-                            "Failed to fetch models: {}", e
+                            "Failed to start llama-server: {}", e
                         )));
                     }
                 }
+                app.is_processing = false;
+                app.generation_start = None;
                 if was_at_bottom {
                     app.scroll_offset = 0;
                 }
@@ -452,6 +522,11 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, ollama: 
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
+    // Stop any running llama-server
+    if let Some(mut server) = llama_server {
+        server.stop().await;
+    }
+
     eprintln!("Session: {}", session_path);
 
     Ok(())
@@ -462,7 +537,7 @@ fn handle_terminal_event(
     app: &mut App,
     input_tx: &mpsc::UnboundedSender<AgentInput>,
     model_tx: &mpsc::UnboundedSender<Result<Vec<String>>>,
-    ctx_tx: &mpsc::UnboundedSender<u64>,
+    backend_tx: &mpsc::UnboundedSender<Result<(OllamaClient, String, LlamaServer)>>,
     session: &Session,
 ) {
     if let Event::Key(key) = evt {
@@ -502,64 +577,125 @@ fn handle_terminal_event(
         if app.model_choices.is_some() {
             match key.code {
                 KeyCode::Esc => {
-                    app.model_choices = None;
-                    app.input.clear();
-                    app.cursor_pos = 0;
+                    app.dismiss_model_chooser();
                     app.messages.push(ChatMessage::Info("Model selection cancelled.".into()));
                 }
                 KeyCode::Enter => {
-                    let parts: Vec<&str> = app.input.trim().split_whitespace().collect();
+                    let raw = app.input.trim().to_string();
+                    let parts: Vec<&str> = raw.split_whitespace().collect();
                     let choice = parts.first().and_then(|s| s.parse::<usize>().ok());
-                    let ctx_override = parts.get(1).and_then(|s| s.parse::<u64>().ok());
 
-                    if let Some(choice) = choice {
+                    if raw.contains('/') {
+                        // HuggingFace repo — start llama-server
+                        let hf_repo = raw.clone();
+                        let server_path = app.config.llama_server_path.clone();
+                        let extra_args = app.config.llama_server_args.clone().unwrap_or_default();
+                        let ctx = app.context_size;
+
+                        if let Some(server_path) = server_path {
+                            app.messages.push(ChatMessage::Info(format!(
+                                "Starting llama-server for {}...", hf_repo
+                            )));
+                            app.dismiss_model_chooser();
+                            app.is_processing = true;
+                            app.generation_start = Some(Instant::now());
+                            app.generation_tokens = 0;
+                            app.has_received_tokens = false;
+                            app.generation_verb = "Starting server".to_string();
+
+                            let tx = backend_tx.clone();
+                            let current_model = app.model.clone();
+                            let ollama_for_unload = app.ollama.clone();
+                            tokio::spawn(async move {
+                                // Unload current Ollama model to free VRAM
+                                let _ = ollama_for_unload.unload_model(&current_model).await;
+                                let server_binary = std::path::PathBuf::from(&server_path);
+                                if !server_binary.exists() {
+                                    let _ = tx.send(Err(anyhow::anyhow!(
+                                        "llama-server binary not found at: {}", server_binary.display()
+                                    )));
+                                    return;
+                                }
+                                let port = match llama_server::find_free_port() {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e));
+                                        return;
+                                    }
+                                };
+                                let model_source = ModelSource::HuggingFace(hf_repo.clone());
+                                match LlamaServer::start(
+                                    &server_binary,
+                                    &model_source,
+                                    port,
+                                    ctx,
+                                    &extra_args,
+                                ).await {
+                                    Ok(server) => {
+                                        let client = OllamaClient::new(Some(server.base_url()));
+                                        let _ = tx.send(Ok((client, hf_repo, server)));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e));
+                                    }
+                                }
+                            });
+                        } else {
+                            app.messages.push(ChatMessage::Error(
+                                "Set llama_server_path in ~/.config/ollama-code/config.toml to use HuggingFace models.".into(),
+                            ));
+                            app.dismiss_model_chooser();
+                        }
+                    } else if let Some(choice) = choice {
+                        // Ollama model selection
+                        let ctx_override = parts.get(1).and_then(|s| s.parse::<u64>().ok());
                         let models = app.model_choices.take().unwrap();
                         if choice >= 1 && choice <= models.len() {
                             let new_model = models[choice - 1].clone();
-                            if new_model == app.model && ctx_override.is_none() {
+                            let ctx = ctx_override.unwrap_or(app.context_size);
+                            if new_model == app.model && ctx == app.context_size {
                                 app.messages.push(ChatMessage::Info(format!(
-                                    "Already using {}.", new_model
+                                    "Already using {} (context: {}).", new_model, format_number(ctx)
                                 )));
                             } else {
+                                // Switch to Ollama backend (stop server in event loop)
+                                app.stop_llama_server = true;
+                                let ollama_client = OllamaClient::new(None);
+                                let _ = input_tx.send(AgentInput::SetClient(ollama_client));
                                 app.model = new_model.clone();
                                 let _ = input_tx.send(AgentInput::SetModel(new_model.clone()));
                                 app.context_used = 0;
+                                app.context_size = ctx;
+                                let _ = input_tx.send(AgentInput::SetContextSize(ctx));
+                                app.messages.push(ChatMessage::Info(format!(
+                                    "Switched to {} (context: {}).", new_model, format_number(ctx)
+                                )));
 
-                                if let Some(ctx) = ctx_override {
-                                    // User specified context size explicitly
-                                    app.context_size = ctx;
-                                    let _ = input_tx.send(AgentInput::SetContextSize(ctx));
-                                    app.messages.push(ChatMessage::Info(format!(
-                                        "Switched to {} (context: {}).", new_model, format_number(ctx)
+                                // Save to config
+                                let mut config = app.config.clone();
+                                config.model = Some(new_model);
+                                config.context_size = Some(ctx);
+                                config.backend = None; // back to Ollama
+                                config.hf_repo = None;
+                                if let Err(e) = config.save() {
+                                    app.messages.push(ChatMessage::Error(format!(
+                                        "Warning: could not save config: {}", e
                                     )));
-                                } else {
-                                    // Fetch context size from model metadata
-                                    app.context_size = 0;
-                                    app.messages.push(ChatMessage::Info(format!(
-                                        "Switched to {}.", new_model
-                                    )));
-                                    let ollama = app.ollama.clone();
-                                    let ctx_tx = ctx_tx.clone();
-                                    tokio::spawn(async move {
-                                        if let Ok(ctx) = ollama.context_length(&new_model).await {
-                                            let _ = ctx_tx.send(ctx);
-                                        }
-                                    });
                                 }
+                                app.config = config;
                             }
                         } else {
                             app.messages.push(ChatMessage::Info(format!(
                                 "Invalid selection: {}", choice
                             )));
                         }
+                        app.dismiss_model_chooser();
                     } else {
                         app.messages.push(ChatMessage::Info(
-                            "Please enter a number, e.g. '2' or '2 32768'.".into(),
+                            "Enter a number for Ollama, or a HuggingFace repo (org/model).".into(),
                         ));
+                        app.dismiss_model_chooser();
                     }
-                    app.model_choices = None;
-                    app.input.clear();
-                    app.cursor_pos = 0;
                 }
                 KeyCode::Char(c) => {
                     app.input.insert(app.cursor_pos, c);
@@ -636,6 +772,11 @@ fn handle_agent_event(event: AgentEvent, app: &mut App) {
             app.generation_tokens += 1;
             app.has_received_tokens = true;
         }
+        AgentEvent::ContentReplaced(content) => {
+            // Tool calls were extracted from streamed text — replace the
+            // raw JSON the user saw with the cleaned content.
+            app.current_response = content;
+        }
         AgentEvent::ToolCall { name, args } => {
             app.flush_streaming();
             app.tool_call_count += 1;
@@ -663,6 +804,9 @@ fn handle_agent_event(event: AgentEvent, app: &mut App) {
                     format!("Orphaned tool result for '{}' (no pending tool call found)", name),
                 ));
             }
+        }
+        AgentEvent::ContextUpdate { prompt_tokens } => {
+            app.context_used = prompt_tokens;
         }
         AgentEvent::Done { prompt_tokens, .. } => {
             app.flush_streaming();
@@ -1194,10 +1338,16 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             }
             ChatMessage::Error(e) => {
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    format!("   error: {}", e),
-                    Style::default().fg(Color::Red),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        " \u{F16A1} ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        e.clone(),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]));
             }
             ChatMessage::Info(text) => {
                 lines.push(Line::from(""));
@@ -1478,7 +1628,7 @@ fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_code_block = false;
     let width = width as usize;
-    let code_bg = Color::Indexed(235);
+
     let code_prefix = "   │ ";
     let code_prefix_len = 5; // "   │ " = 5 chars
 
@@ -1540,7 +1690,7 @@ fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
                 Span::styled(code_prefix, Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{}{}", display, " ".repeat(padding)),
-                    Style::default().fg(Color::Green).bg(code_bg),
+                    Style::default().fg(Color::White),
                 ),
             ]));
             continue;
