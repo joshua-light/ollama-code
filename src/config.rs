@@ -26,7 +26,6 @@ impl Config {
         }
     }
 
-    #[allow(dead_code)]
     pub fn save(&self) -> Result<()> {
         let path = Self::path();
         if let Some(parent) = path.parent() {

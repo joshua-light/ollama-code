@@ -1,7 +1,9 @@
 mod agent;
+mod commands;
 mod config;
 mod message;
 mod ollama;
+mod session;
 mod tools;
 mod tui;
 
@@ -13,6 +15,7 @@ use tokio::sync::mpsc;
 use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
 use crate::ollama::OllamaClient;
+use crate::session::Session;
 
 #[derive(Parser)]
 #[command(name = "ollama-code", about = "A CLI agent built on Ollama")]
@@ -38,15 +41,24 @@ async fn main() -> Result<()> {
     } else if let Some(m) = config.model.clone() {
         m
     } else {
-        select_model(&ollama).await?
+        let m = select_model(&ollama).await?;
+        let mut config = config;
+        config.model = Some(m.clone());
+        if let Err(e) = config.save() {
+            eprintln!("Warning: could not save config: {}", e);
+        }
+        m
     };
 
-    let agent = Agent::new(ollama, model);
+    let context_size = ollama.context_length(&model).await.unwrap_or(0);
+
+    let agent = Agent::new(ollama.clone(), model, context_size);
+    let session = Session::new()?;
 
     if let Some(prompt) = cli.prompt {
-        run_pipe(agent, &prompt).await
+        run_pipe(agent, &prompt, session).await
     } else {
-        tui::run(agent).await
+        tui::run(agent, context_size, session, ollama).await
     }
 }
 
@@ -83,13 +95,19 @@ async fn select_model(ollama: &OllamaClient) -> Result<String> {
     Ok(models[choice - 1].name.clone())
 }
 
-async fn run_pipe(mut agent: Agent, prompt: &str) -> Result<()> {
+async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
+
+    eprintln!("Session: {}", session.path().display());
 
     let prompt = prompt.to_string();
     let handle = tokio::spawn(async move { agent.run(&prompt, &tx).await });
 
     while let Some(event) = rx.recv().await {
+        session.log_agent_event(&event);
+        if let AgentEvent::MessageLogged(ref msg) = event {
+            session.log_message(msg);
+        }
         match event {
             AgentEvent::Token(t) => {
                 print!("{}", t);
@@ -111,7 +129,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str) -> Result<()> {
                     }
                 }
             }
-            AgentEvent::Done => {
+            AgentEvent::Done { .. } => {
                 println!();
                 break;
             }
@@ -119,6 +137,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str) -> Result<()> {
                 eprintln!("\nerror: {}", e);
                 break;
             }
+            AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) => {}
         }
     }
 
