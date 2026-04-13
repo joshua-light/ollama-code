@@ -25,7 +25,7 @@ pub(super) fn handle_command(
                 "Bypass permissions {}.", status
             )));
         }
-        SlashCommand::Clear => {
+        SlashCommand::Clear | SlashCommand::New => {
             app.reset_conversation(input_tx, "Conversation cleared.");
         }
         SlashCommand::Rewind => {
@@ -257,9 +257,6 @@ pub(super) fn handle_command(
                 }
                 app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
             }
-        }
-        SlashCommand::New => {
-            app.reset_conversation(input_tx, "New conversation started.");
         }
         SlashCommand::Unknown(name) => {
             let skill_name = name.trim_start_matches('/');

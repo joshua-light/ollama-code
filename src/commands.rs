@@ -61,7 +61,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "/new",
-        description: "Start a new conversation",
+        description: "Start a new conversation (alias for /clear)",
     },
 ];
 

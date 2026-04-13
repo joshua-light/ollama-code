@@ -347,12 +347,13 @@ pub fn find_free_port() -> Result<u16> {
 
 /// Resolve a GGUF model blob path by querying the running Ollama instance.
 /// Parses the `FROM /path/to/blob` line from the modelfile returned by `/api/show`.
-pub async fn find_ollama_model_path(model_name: &str) -> Result<PathBuf> {
+pub async fn find_ollama_model_path(model_name: &str, ollama_url: Option<&str>) -> Result<PathBuf> {
+    let base_url = ollama_url.unwrap_or(crate::config::DEFAULT_OLLAMA_URL);
     let client = reqwest::Client::new();
     let body = serde_json::json!({ "name": model_name });
 
     let resp = client
-        .post("http://localhost:11434/api/show")
+        .post(format!("{}/api/show", base_url))
         .json(&body)
         .send()
         .await

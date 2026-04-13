@@ -79,9 +79,22 @@ impl Tool for GlobTool {
 
         entries.sort_by(|a, b| b.0.cmp(&a.0));
 
-        let count = entries.len();
+        const MAX_RESULTS: usize = 200;
+        let total_count = entries.len();
+        let truncated = total_count > MAX_RESULTS;
+        if truncated {
+            entries.truncate(MAX_RESULTS);
+        }
+
         let paths: Vec<String> = entries.into_iter().map(|(_, p)| p).collect();
         let result = paths.join("\n");
-        Ok(format!("{}\n\n({} files)", result, count))
+        if truncated {
+            Ok(format!(
+                "{}\n\n({} of {} files shown. Narrow your pattern to see more.)",
+                result, MAX_RESULTS, total_count
+            ))
+        } else {
+            Ok(format!("{}\n\n({} files)", result, total_count))
+        }
     }
 }

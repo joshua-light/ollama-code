@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::mcp::McpServerConfig;
 
+pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_CONTEXT_SIZE: u64 = 32768;
 pub const DEFAULT_SUBAGENT_MAX_TURNS: u16 = 15;
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;

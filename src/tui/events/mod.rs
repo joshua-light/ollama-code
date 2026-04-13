@@ -121,119 +121,20 @@ fn handle_model_selection(
             app.messages.push(ChatMessage::Info("Model selection cancelled.".into()));
         }
         KeyCode::Enter => {
-            let raw = app.input.trim().to_string();
-            let parts: Vec<&str> = raw.split_whitespace().collect();
-            let choice = parts.first().and_then(|s| s.parse::<usize>().ok());
-            let ctx_override = parts.get(1).and_then(|s| s.parse::<u64>().ok());
-
-            // Resolve input to a model name: numbered selection or free text
-            let resolved = if let Some(num) = choice {
-                let models = app.model_choices.as_ref().unwrap();
-                if num >= 1 && num <= models.len() {
-                    Some(models[num - 1].clone())
-                } else {
-                    app.messages.push(ChatMessage::Info(format!(
-                        "Invalid selection: {}", num
-                    )));
-                    app.dismiss_model_chooser();
-                    None
-                }
-            } else if raw.contains('/') {
-                Some(raw.clone())
-            } else if !raw.is_empty() {
-                app.messages.push(ChatMessage::Info(
-                    "Enter a number to select, or a HuggingFace repo (org/model).".into(),
-                ));
-                app.dismiss_model_chooser();
-                None
-            } else {
-                None
-            };
-
-            if let Some(model_name) = resolved {
-                if model_name.contains('/') && app.config.llama_server_url.is_some() {
-                    // Remote server — cannot spawn a local llama-server
-                    app.messages.push(ChatMessage::Error(
-                        "Cannot start a local llama-server while connected to a remote server. \
-                         Change the model on the remote server directly.".into(),
-                    ));
-                    app.dismiss_model_chooser();
-                } else if model_name.contains('/') {
-                    // HuggingFace repo — defer start so event loop stops old server first
-                    let hf_repo = model_name;
-                    let server_path = app.config.llama_server_path.clone();
-                    let extra_args = app.config.llama_server_args.clone().unwrap_or_default();
-                    let ctx = ctx_override.unwrap_or(app.context_size);
-
-                    if let Some(server_path) = server_path {
-                        app.messages.push(ChatMessage::Info(format!(
-                            "Starting llama-server for {}...", hf_repo
-                        )));
-                        app.dismiss_model_chooser();
-                        app.begin_processing("Starting server".to_string());
-
-                        app.server.pending_server_start = Some(PendingServerStart {
-                            server_path,
-                            model_source: ModelSource::HuggingFace(hf_repo.clone()),
-                            ctx,
-                            extra_args,
-                            model_name: hf_repo,
-                            sampling: crate::ollama::SamplingParams {
-                                temperature: app.config.temperature,
-                                top_p: app.config.top_p,
-                                top_k: app.config.top_k,
-                            },
-                            unload: Some((app.ollama.clone(), app.model.clone())),
-                        });
-                        app.server.stop_llama_server = true;
-                    } else {
+            if let Some((model_name, ctx_override)) = resolve_model_input(app) {
+                let ctx = ctx_override.unwrap_or(app.context_size);
+                if model_name.contains('/') {
+                    if app.config.llama_server_url.is_some() {
                         app.messages.push(ChatMessage::Error(
-                            "Set llama_server_path in ~/.config/ollama-code/config.toml to use HuggingFace models.".into(),
+                            "Cannot start a local llama-server while connected to a remote server. \
+                             Change the model on the remote server directly.".into(),
                         ));
                         app.dismiss_model_chooser();
+                    } else {
+                        start_hf_model(app, model_name, ctx);
                     }
                 } else {
-                    // Ollama model selection
-                    let ctx = ctx_override.unwrap_or(app.context_size);
-                    if model_name == app.model && ctx == app.context_size {
-                        app.messages.push(ChatMessage::Info(format!(
-                            "Already using {} (context: {}).", model_name, format_number(ctx)
-                        )));
-                    } else {
-                        // Switch to Ollama backend (stop server in event loop)
-                        app.server.stop_llama_server = true;
-                        let backend = OllamaBackend::with_sampling(
-                            app.config.ollama_url.clone(),
-                            crate::ollama::SamplingParams {
-                                temperature: app.config.temperature,
-                                top_p: app.config.top_p,
-                                top_k: app.config.top_k,
-                            },
-                        );
-                        let _ = input_tx.send(AgentInput::SetBackend(Arc::new(backend)));
-                        app.model = model_name.clone();
-                        let _ = input_tx.send(AgentInput::SetModel(model_name.clone()));
-                        app.context_used = 0;
-                        app.context_size = ctx;
-                        let _ = input_tx.send(AgentInput::SetContextSize(ctx));
-                        app.messages.push(ChatMessage::Info(format!(
-                            "Switched to {} (context: {}).", model_name, format_number(ctx)
-                        )));
-
-                        // Save to config
-                        let mut config = app.config.clone();
-                        config.model = Some(model_name);
-                        config.context_size = Some(ctx);
-                        config.backend = None; // back to Ollama
-                        config.hf_repo = None;
-                        if let Err(e) = config.save() {
-                            app.messages.push(ChatMessage::Error(format!(
-                                "Warning: could not save config: {}", e
-                            )));
-                        }
-                        app.config = config;
-                    }
-                    app.dismiss_model_chooser();
+                    switch_ollama_model(app, model_name, ctx, input_tx);
                 }
             }
         }
@@ -246,6 +147,120 @@ fn handle_model_selection(
         }
         _ => {}
     }
+}
+
+/// Parse the model chooser input into a (model_name, optional_context_size).
+/// Returns `None` (and shows an error) if the input is invalid.
+fn resolve_model_input(app: &mut App) -> Option<(String, Option<u64>)> {
+    let raw = app.input.trim().to_string();
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    let choice = parts.first().and_then(|s| s.parse::<usize>().ok());
+    let ctx_override = parts.get(1).and_then(|s| s.parse::<u64>().ok());
+
+    let model_name = if let Some(num) = choice {
+        let models = app.model_choices.as_ref().unwrap();
+        if num >= 1 && num <= models.len() {
+            Some(models[num - 1].clone())
+        } else {
+            app.messages.push(ChatMessage::Info(format!("Invalid selection: {}", num)));
+            app.dismiss_model_chooser();
+            None
+        }
+    } else if raw.contains('/') {
+        Some(raw.clone())
+    } else if !raw.is_empty() {
+        app.messages.push(ChatMessage::Info(
+            "Enter a number to select, or a HuggingFace repo (org/model).".into(),
+        ));
+        app.dismiss_model_chooser();
+        None
+    } else {
+        None
+    };
+
+    model_name.map(|name| (name, ctx_override))
+}
+
+/// Start a HuggingFace model via llama-server.
+fn start_hf_model(app: &mut App, hf_repo: String, ctx: u64) {
+    let server_path = app.config.llama_server_path.clone();
+    let extra_args = app.config.llama_server_args.clone().unwrap_or_default();
+
+    if let Some(server_path) = server_path {
+        app.messages.push(ChatMessage::Info(format!(
+            "Starting llama-server for {}...", hf_repo
+        )));
+        app.dismiss_model_chooser();
+        app.begin_processing("Starting server".to_string());
+
+        app.server.pending_server_start = Some(PendingServerStart {
+            server_path,
+            model_source: ModelSource::HuggingFace(hf_repo.clone()),
+            ctx,
+            extra_args,
+            model_name: hf_repo,
+            sampling: crate::ollama::SamplingParams {
+                temperature: app.config.temperature,
+                top_p: app.config.top_p,
+                top_k: app.config.top_k,
+            },
+            unload: Some((app.ollama.clone(), app.model.clone())),
+        });
+        app.server.stop_llama_server = true;
+    } else {
+        app.messages.push(ChatMessage::Error(
+            "Set llama_server_path in ~/.config/ollama-code/config.toml to use HuggingFace models.".into(),
+        ));
+        app.dismiss_model_chooser();
+    }
+}
+
+/// Switch to an Ollama model, update the agent backend, and persist to config.
+fn switch_ollama_model(
+    app: &mut App,
+    model_name: String,
+    ctx: u64,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+) {
+    if model_name == app.model && ctx == app.context_size {
+        app.messages.push(ChatMessage::Info(format!(
+            "Already using {} (context: {}).", model_name, format_number(ctx)
+        )));
+        app.dismiss_model_chooser();
+        return;
+    }
+
+    app.server.stop_llama_server = true;
+    let backend = OllamaBackend::with_sampling(
+        app.config.ollama_url.clone(),
+        crate::ollama::SamplingParams {
+            temperature: app.config.temperature,
+            top_p: app.config.top_p,
+            top_k: app.config.top_k,
+        },
+    );
+    let _ = input_tx.send(AgentInput::SetBackend(Arc::new(backend)));
+    app.model = model_name.clone();
+    let _ = input_tx.send(AgentInput::SetModel(model_name.clone()));
+    app.context_used = 0;
+    app.context_size = ctx;
+    let _ = input_tx.send(AgentInput::SetContextSize(ctx));
+    app.messages.push(ChatMessage::Info(format!(
+        "Switched to {} (context: {}).", model_name, format_number(ctx)
+    )));
+
+    let mut config = app.config.clone();
+    config.model = Some(model_name);
+    config.context_size = Some(ctx);
+    config.backend = None;
+    config.hf_repo = None;
+    if let Err(e) = config.save() {
+        app.messages.push(ChatMessage::Error(format!(
+            "Warning: could not save config: {}", e
+        )));
+    }
+    app.config = config;
+    app.dismiss_model_chooser();
 }
 
 fn handle_normal_input(

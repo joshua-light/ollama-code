@@ -233,7 +233,7 @@ async fn run_llama_cpp(prompt: Option<String>, config: Config, context_size: u64
             ModelSource::HuggingFace(model_name.to_string())
         } else {
             eprintln!("Resolving model '{}' from Ollama storage...", model_name);
-            ModelSource::File(llama_server::find_ollama_model_path(model_name).await?)
+            ModelSource::File(llama_server::find_ollama_model_path(model_name, config.ollama_url.as_deref()).await?)
         };
 
     let extra_args = config.llama_server_args.clone().unwrap_or_default();
