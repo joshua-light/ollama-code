@@ -2,6 +2,9 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use syntect::easy::HighlightLines;
+
+use super::syntax;
 
 pub(super) const MD_INDENT: &str = "   ";
 
@@ -169,6 +172,7 @@ fn render_table(table_lines: &[&str], output: &mut Vec<Line<'static>>, max_width
 pub(super) fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_code_block = false;
+    let mut highlighter: Option<HighlightLines<'static>> = None;
     let width = width as usize;
 
     let code_prefix = "   │ ";
@@ -187,6 +191,7 @@ pub(super) fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
                 // Opening fence — extract language
                 let lang = fence_rest.trim().to_string();
                 in_code_block = true;
+                highlighter = syntax::highlighter_for_lang(&lang);
 
                 let label = if lang.is_empty() {
                     String::new()
@@ -210,6 +215,7 @@ pub(super) fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             } else {
                 // Closing fence
                 in_code_block = false;
+                highlighter = None;
                 let bar_len = width.saturating_sub(4);
                 lines.push(Line::from(Span::styled(
                     format!("   └{}", "─".repeat(bar_len)),
@@ -233,13 +239,25 @@ pub(super) fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             let content_len = display.chars().count();
             let padding = max_content.saturating_sub(content_len);
 
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(code_prefix, Style::default().fg(Color::DarkGray)),
-                Span::styled(
+            ];
+
+            if let Some(ref mut hl) = highlighter {
+                // Syntax-highlighted spans + padding
+                let hl_spans = syntax::highlight_line(hl, &display);
+                spans.extend(hl_spans);
+                if padding > 0 {
+                    spans.push(Span::raw(" ".repeat(padding)));
+                }
+            } else {
+                spans.push(Span::styled(
                     format!("{}{}", display, " ".repeat(padding)),
                     Style::default().fg(Color::White),
-                ),
-            ]));
+                ));
+            }
+
+            lines.push(Line::from(spans));
             i += 1;
             continue;
         }

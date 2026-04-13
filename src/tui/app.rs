@@ -28,6 +28,19 @@ pub(crate) struct ToolResultData {
 }
 
 #[derive(Clone)]
+pub(crate) struct ContextInfoData {
+    pub(crate) context_used: u64,
+    pub(crate) context_size: u64,
+    pub(crate) user_messages: u32,
+    pub(crate) assistant_messages: u32,
+    pub(crate) tool_calls: u32,
+    pub(crate) base_prompt_tokens: u64,
+    pub(crate) project_docs_tokens: Vec<(String, u64)>,
+    pub(crate) skills_tokens: u64,
+    pub(crate) tool_defs_tokens: u64,
+}
+
+#[derive(Clone)]
 pub(crate) enum ChatMessage {
     User(String),
     Assistant(String),
@@ -38,17 +51,7 @@ pub(crate) enum ChatMessage {
     },
     Error(String),
     Info(String),
-    ContextInfo {
-        context_used: u64,
-        context_size: u64,
-        user_messages: u32,
-        assistant_messages: u32,
-        tool_calls: u32,
-        base_prompt_tokens: u64,
-        project_docs_tokens: Vec<(String, u64)>,
-        skills_tokens: u64,
-        tool_defs_tokens: u64,
-    },
+    ContextInfo(ContextInfoData),
     GenerationSummary { duration: std::time::Duration },
     SubagentToolCall {
         name: String,
@@ -84,6 +87,40 @@ pub(crate) struct ServerLoadingState {
     pub(crate) model_name: String,
 }
 
+pub(crate) struct GenerationState {
+    pub(crate) start: Option<Instant>,
+    pub(crate) tokens: usize,
+    pub(crate) verb: String,
+    pub(crate) has_received_tokens: bool,
+}
+
+impl GenerationState {
+    pub(crate) fn begin(&mut self, verb: String) {
+        self.start = Some(Instant::now());
+        self.tokens = 0;
+        self.verb = verb;
+        self.has_received_tokens = false;
+    }
+}
+
+pub(crate) struct SessionStats {
+    pub(crate) session_start: Instant,
+    pub(crate) tool_call_count: usize,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) base_prompt_tokens: u64,
+    pub(crate) project_docs_tokens: Vec<(String, u64)>,
+    pub(crate) skills_tokens: u64,
+    pub(crate) tool_defs_tokens: u64,
+}
+
+pub(crate) struct ServerState {
+    pub(crate) stop_llama_server: bool,
+    pub(crate) pending_server_start: Option<PendingServerStart>,
+    pub(crate) loading: Option<ServerLoadingState>,
+    pub(crate) cancel_flag: Arc<AtomicBool>,
+}
+
 pub(crate) struct App {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) current_response: String,
@@ -94,19 +131,10 @@ pub(crate) struct App {
     pub(crate) should_quit: bool,
     pub(crate) scroll_offset: u16,
     pub(crate) max_scroll: u16,
-    // Generation tracking
-    pub(crate) generation_start: Option<Instant>,
-    pub(crate) generation_tokens: usize,
-    pub(crate) generation_verb: String,
-    pub(crate) has_received_tokens: bool,
     // Status line
     pub(crate) dir_name: String,
     pub(crate) context_size: u64,
     pub(crate) context_used: u64,
-    pub(crate) session_start: Instant,
-    pub(crate) tool_call_count: usize,
-    pub(crate) total_input_tokens: u64,
-    pub(crate) total_output_tokens: u64,
     pub(crate) tools_expanded: bool,
     pub(crate) git_branch: Option<String>,
     pub(crate) git_dirty: bool,
@@ -114,30 +142,17 @@ pub(crate) struct App {
     pub(crate) ollama: OllamaBackend,
     pub(crate) model_choices: Option<Vec<String>>,
     pub(crate) config: Config,
-    /// Set by model selection to signal the event loop to stop the llama-server
-    pub(crate) stop_llama_server: bool,
     /// Pending tool confirmation awaiting user response
     pub(crate) pending_confirm: Option<PendingConfirm>,
     /// When true, all tool confirmations are auto-approved
     pub(crate) auto_approve: bool,
     /// Force a full terminal clear before the next draw (e.g. after expand/collapse)
     pub(crate) needs_clear: bool,
-    /// Deferred llama-server start (event loop stops old server first, then spawns this)
-    pub(crate) pending_server_start: Option<PendingServerStart>,
-    /// Cancel flag shared with the agent task — set to true to request cancellation.
-    pub(crate) cancel_flag: Arc<AtomicBool>,
-    /// Estimated tokens for the base system prompt (SYSTEM_PROMPT.md).
-    pub(crate) base_prompt_tokens: u64,
-    /// Estimated tokens for each loaded project doc (filename, tokens).
-    pub(crate) project_docs_tokens: Vec<(String, u64)>,
-    /// Estimated tokens for skill summaries in the system prompt.
-    pub(crate) skills_tokens: u64,
-    /// Estimated tokens for tool definitions sent with each request.
-    pub(crate) tool_defs_tokens: u64,
     /// Discovered skills available as slash commands.
     pub(crate) skills: Vec<SkillMeta>,
-    /// When Some, the initial llama-server is still loading and we show a progress bar.
-    pub(crate) server_loading: Option<ServerLoadingState>,
+    pub(crate) generation: GenerationState,
+    pub(crate) stats: SessionStats,
+    pub(crate) server: ServerState,
 }
 
 impl App {
@@ -157,36 +172,52 @@ impl App {
             should_quit: false,
             scroll_offset: 0,
             max_scroll: 0,
-            generation_start: None,
-            generation_tokens: 0,
-            generation_verb: super::render::pick_verb(),
-            has_received_tokens: false,
             dir_name,
             context_size,
             context_used: 0,
-            session_start: Instant::now(),
-            tool_call_count: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
             tools_expanded: false,
             git_branch,
             git_dirty,
             ollama,
             model_choices: None,
             config,
-            stop_llama_server: false,
             pending_confirm: None,
             auto_approve: false,
             needs_clear: false,
-            pending_server_start: None,
-            cancel_flag: Arc::new(AtomicBool::new(false)),
-            base_prompt_tokens: 0,
-            project_docs_tokens: Vec::new(),
-            skills_tokens: 0,
-            tool_defs_tokens: 0,
             skills,
-            server_loading: None,
+            generation: GenerationState {
+                start: None,
+                tokens: 0,
+                verb: super::render::pick_verb(),
+                has_received_tokens: false,
+            },
+            stats: SessionStats {
+                session_start: Instant::now(),
+                tool_call_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                base_prompt_tokens: 0,
+                project_docs_tokens: Vec::new(),
+                skills_tokens: 0,
+                tool_defs_tokens: 0,
+            },
+            server: ServerState {
+                stop_llama_server: false,
+                pending_server_start: None,
+                loading: None,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+            },
         }
+    }
+
+    pub(crate) fn begin_processing(&mut self, verb: String) {
+        self.is_processing = true;
+        self.generation.begin(verb);
+    }
+
+    pub(crate) fn finish_processing(&mut self) {
+        self.is_processing = false;
+        self.generation.start = None;
     }
 
     pub(crate) fn submit(&mut self) -> Option<String> {
@@ -197,11 +228,7 @@ impl App {
         self.input.clear();
         self.cursor_pos = 0;
         self.messages.push(ChatMessage::User(msg.clone()));
-        self.is_processing = true;
-        self.generation_start = Some(Instant::now());
-        self.generation_tokens = 0;
-        self.generation_verb = super::render::pick_verb();
-        self.has_received_tokens = false;
+        self.begin_processing(super::render::pick_verb());
         Some(msg)
     }
 
@@ -271,9 +298,9 @@ impl App {
         self.messages.clear();
         self.current_response.clear();
         self.context_used = 0;
-        self.tool_call_count = 0;
-        self.total_input_tokens = 0;
-        self.total_output_tokens = 0;
+        self.stats.tool_call_count = 0;
+        self.stats.input_tokens = 0;
+        self.stats.output_tokens = 0;
         self.scroll_offset = 0;
         self.max_scroll = 0;
         let _ = input_tx.send(AgentInput::ClearHistory);

@@ -171,8 +171,8 @@ impl Agent {
 
         let system_prompt_base_len = system_prompt.len();
 
-        // Load project docs (CLAUDE.md / AGENTS.md) for top-level agents only.
-        let project_docs_info = if !is_subagent {
+        // Load project docs (CLAUDE.md / AGENTS.md) so all agents follow conventions.
+        let project_docs_info = {
             let docs = discover_project_docs(&cwd);
             let mut info = Vec::new();
             for (name, content) in &docs {
@@ -183,8 +183,6 @@ impl Agent {
                 info.push((name.clone(), content.len()));
             }
             info
-        } else {
-            Vec::new()
         };
 
         // Discover skills (.agents/skills/*/SKILL.md) for top-level agents only.
@@ -366,6 +364,240 @@ impl Agent {
         }
     }
 
+    /// Force a final text response when the sub-agent turn limit is exceeded.
+    /// Injects a summary request, calls the backend without tools, logs the
+    /// assistant message, and emits `Done`.
+    async fn force_final_response(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        num_ctx: Option<u64>,
+    ) -> Result<()> {
+        self.messages.push(Message::user(
+            "You have reached your turn limit. Summarize your findings and \
+             provide your final answer now.",
+        ));
+        let events_clone = events.clone();
+        let response = self
+            .backend
+            .chat(
+                &self.model,
+                &self.messages,
+                None, // no tools — force text response
+                num_ctx,
+                Box::new(move |token| {
+                    let _ = events_clone.send(AgentEvent::Token(token.to_string()));
+                }),
+            )
+            .await;
+        if let Ok(resp) = response {
+            if !resp.content.trim().is_empty() {
+                let msg = Message::assistant(&resp.content);
+                self.messages.push(msg.clone());
+                send_event(events, AgentEvent::MessageLogged(msg))?;
+            }
+        }
+        send_event(events, AgentEvent::Done { prompt_tokens: 0, eval_count: 0 })?;
+        Ok(())
+    }
+
+    /// Execute a sub-agent for the given `task`, forwarding its events and
+    /// tool-confirmation requests to the parent's channels.
+    /// Returns `(result_text, success)`.
+    async fn execute_subagent(
+        &self,
+        task: &str,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
+        cancel: &Arc<AtomicBool>,
+    ) -> (String, bool) {
+        send_event(events, AgentEvent::SubagentStart { task: task.to_string() })
+            .unwrap_or(());
+
+        let sub_agent = Agent::new_subagent(
+            Arc::clone(&self.backend),
+            self.model.clone(),
+            self.context_size,
+            self.bash_timeout,
+            self.subagent_max_turns,
+        );
+
+        // Channels for the sub-agent
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (sub_confirm_tx, mut sub_confirm_rx) = mpsc::unbounded_channel::<bool>();
+
+        // Move the sub-agent and channel clones into an owned future.
+        // This avoids borrow issues: the future owns everything it needs.
+        let sub_tx_for_agent = sub_tx.clone();
+        let cancel_for_sub = cancel.clone();
+        let task_owned = task.to_string();
+        let mut sub_future = Box::pin(async move {
+            let mut sa = sub_agent;
+            let result = sa
+                .run(&task_owned, &sub_tx_for_agent, &mut sub_confirm_rx, cancel_for_sub)
+                .await;
+            let last_msg = sa.last_assistant_message();
+            (result, last_msg)
+        });
+
+        // Drive the sub-agent and its event loop concurrently.
+        // We poll both the sub-agent future and its event channel so we
+        // can forward tool confirmations through the parent's confirm_rx
+        // instead of auto-approving.
+        let mut sub_finished: Option<(Result<()>, String)> = None;
+        let mut sub_tx_option = Some(sub_tx);
+
+        loop {
+            tokio::select! {
+                biased;
+                // Process sub-agent events first (higher priority)
+                event = sub_rx.recv() => {
+                    match event {
+                        Some(AgentEvent::ToolConfirmRequest { name, args }) => {
+                            // Forward to parent TUI for user confirmation
+                            let _ = send_event(events, AgentEvent::ToolConfirmRequest { name, args });
+                            let approved = confirm_rx.recv().await.unwrap_or(false);
+                            let _ = sub_confirm_tx.send(approved);
+                        }
+                        Some(AgentEvent::ToolCall { name, args }) => {
+                            let _ = events.send(AgentEvent::SubagentToolCall { name, args });
+                        }
+                        Some(AgentEvent::ToolResult { name, success, .. }) => {
+                            let _ = events.send(AgentEvent::SubagentToolResult { name, success });
+                        }
+                        Some(_) => {} // ignore other events
+                        None => break, // sub-agent channel closed
+                    }
+                }
+                // Poll the sub-agent future
+                result = &mut sub_future, if sub_finished.is_none() => {
+                    sub_finished = Some(result);
+                    // Drop our sender clone to close channel (the future's
+                    // clone was already dropped when the async block ended).
+                    sub_tx_option.take();
+                }
+            }
+        }
+
+        match sub_finished {
+            Some((Ok(()), response)) => {
+                let _ = send_event(events, AgentEvent::SubagentEnd { result: response.clone() });
+                (response, true)
+            }
+            Some((Err(e), _)) => {
+                let err_msg = format!("Sub-agent error: {}", e);
+                let _ = send_event(events, AgentEvent::SubagentEnd { result: err_msg.clone() });
+                (err_msg, false)
+            }
+            None => {
+                let err_msg = "Sub-agent channel closed unexpectedly".to_string();
+                let _ = send_event(events, AgentEvent::SubagentEnd { result: err_msg.clone() });
+                (err_msg, false)
+            }
+        }
+    }
+
+    /// Dispatch a single tool call: handle confirmation, execute the tool
+    /// (bash / subagent / registry), emit events, and append the result
+    /// message.  Returns `Ok(true)` normally, `Ok(false)` when the user
+    /// cancelled mid-execution (caller should return early).
+    async fn dispatch_tool_call(
+        &mut self,
+        tool_call: &crate::message::ToolCall,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<bool> {
+        let name = &tool_call.function.name;
+        let args = &tool_call.function.arguments;
+
+        let args_display = crate::format::format_tool_args_display(name, args);
+
+        send_event(
+            events,
+            AgentEvent::ToolCall {
+                name: name.clone(),
+                args: args_display.clone(),
+            },
+        )?;
+
+        // Request user confirmation for tools that modify state
+        let needs_confirm = matches!(name.as_str(), "bash" | "edit" | "write" | "subagent");
+        if needs_confirm {
+            send_event(
+                events,
+                AgentEvent::ToolConfirmRequest {
+                    name: name.clone(),
+                    args: args_display,
+                },
+            )?;
+
+            let approved = confirm_rx.recv().await.unwrap_or(false);
+            if !approved {
+                let denied = "Tool execution denied by user.".to_string();
+                send_event(
+                    events,
+                    AgentEvent::ToolResult {
+                        name: name.clone(),
+                        output: denied.clone(),
+                        success: false,
+                    },
+                )?;
+                let tool_msg = Message::tool(&denied, tool_call.id.clone());
+                self.messages.push(tool_msg.clone());
+                send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+                return Ok(true);
+            }
+        }
+
+        // Check cancellation before each tool call
+        if cancel.load(Ordering::Relaxed) {
+            send_event(events, AgentEvent::Cancelled)?;
+            return Ok(false);
+        }
+
+        let (result, success) = if name == "bash" {
+            // Race tool execution against the cancel flag so ESC kills
+            // long-running bash commands immediately.
+            tokio::select! {
+                output = BashTool.execute_async(args, self.bash_timeout) => output,
+                _ = poll_cancel(cancel) => {
+                    send_event(events, AgentEvent::Cancelled)?;
+                    return Ok(false);
+                }
+            }
+        } else if name == "subagent" {
+            let task = args
+                .get("task")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            self.execute_subagent(&task, events, confirm_rx, cancel).await
+        } else {
+            match self.tools.execute(name, args) {
+                Ok(output) => (output, true),
+                Err(e) => (format!("Error: {}", e), false),
+            }
+        };
+
+        send_event(
+            events,
+            AgentEvent::ToolResult {
+                name: name.clone(),
+                output: result.clone(),
+                success,
+            },
+        )?;
+
+        // Truncate before storing in context to avoid blowing the window.
+        // The full output was already sent to the UI above.
+        let context_result = truncate_tool_output(&result);
+        let tool_msg = Message::tool(&context_result, tool_call.id.clone());
+        self.messages.push(tool_msg.clone());
+        send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+
+        Ok(true)
+    }
+
     pub async fn run(
         &mut self,
         user_input: &str,
@@ -382,12 +614,12 @@ impl Agent {
                 .map(|d| d.to_string().len())
                 .sum();
             send_event(events, AgentEvent::SystemPromptInfo {
-                base_prompt_tokens: message::chars_to_tokens(self.system_prompt_base_len),
+                base_prompt_tokens: message::estimate_tokens(self.system_prompt_base_len),
                 project_docs: self.project_docs_info.iter()
-                    .map(|(name, len)| (name.clone(), message::chars_to_tokens(*len)))
+                    .map(|(name, len)| (name.clone(), message::estimate_tokens(*len)))
                     .collect(),
-                skills_tokens: message::chars_to_tokens(self.skills_summary_len),
-                tool_defs_tokens: message::chars_to_tokens(tool_defs_chars),
+                skills_tokens: message::estimate_tokens(self.skills_summary_len),
+                tool_defs_tokens: message::estimate_tokens(tool_defs_chars),
             })?;
             self.system_prompt_logged = true;
         }
@@ -411,32 +643,7 @@ impl Agent {
             // Enforce turn limit (sub-agents)
             if let Some(max) = self.max_turns {
                 if turn >= max as u32 {
-                    // Force a final response without tools
-                    self.messages.push(Message::user(
-                        "You have reached your turn limit. Summarize your findings and \
-                         provide your final answer now.",
-                    ));
-                    let events_clone = events.clone();
-                    let response = self
-                        .backend
-                        .chat(
-                            &self.model,
-                            &self.messages,
-                            None, // no tools — force text response
-                            num_ctx,
-                            Box::new(move |token| {
-                                let _ = events_clone.send(AgentEvent::Token(token.to_string()));
-                            }),
-                        )
-                        .await;
-                    if let Ok(resp) = response {
-                        if !resp.content.trim().is_empty() {
-                            let msg = Message::assistant(&resp.content);
-                            self.messages.push(msg.clone());
-                            send_event(events, AgentEvent::MessageLogged(msg))?;
-                        }
-                    }
-                    send_event(events, AgentEvent::Done { prompt_tokens: 0, eval_count: 0 })?;
+                    self.force_final_response(events, num_ctx).await?;
                     return Ok(());
                 }
             }
@@ -667,182 +874,12 @@ impl Agent {
             send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
 
             for tool_call in &tool_calls_with_ids {
-                let name = &tool_call.function.name;
-                let args = &tool_call.function.arguments;
-
-                let args_display = crate::format::format_tool_args_display(name, args);
-
-                send_event(
-                    events,
-                    AgentEvent::ToolCall {
-                        name: name.clone(),
-                        args: args_display.clone(),
-                    },
-                )?;
-
-                // Request user confirmation for tools that modify state
-                let needs_confirm = matches!(name.as_str(), "bash" | "edit" | "write" | "subagent");
-                if needs_confirm {
-                    send_event(
-                        events,
-                        AgentEvent::ToolConfirmRequest {
-                            name: name.clone(),
-                            args: args_display,
-                        },
-                    )?;
-
-                    let approved = confirm_rx.recv().await.unwrap_or(false);
-                    if !approved {
-                        let denied = "Tool execution denied by user.".to_string();
-                        send_event(
-                            events,
-                            AgentEvent::ToolResult {
-                                name: name.clone(),
-                                output: denied.clone(),
-                                success: false,
-                            },
-                        )?;
-                        let tool_msg = Message::tool(&denied, tool_call.id.clone());
-                        self.messages.push(tool_msg.clone());
-                        send_event(events, AgentEvent::MessageLogged(tool_msg))?;
-                        continue;
-                    }
-                }
-
-                // Check cancellation before each tool call
-                if cancel.load(Ordering::Relaxed) {
-                    send_event(events, AgentEvent::Cancelled)?;
+                let continue_loop = self
+                    .dispatch_tool_call(tool_call, events, confirm_rx, &cancel)
+                    .await?;
+                if !continue_loop {
                     return Ok(());
                 }
-
-                let (result, success) = if name == "bash" {
-                    // Race tool execution against the cancel flag so ESC kills
-                    // long-running bash commands immediately.
-                    tokio::select! {
-                        output = BashTool.execute_async(args, self.bash_timeout) => output,
-                        _ = poll_cancel(&cancel) => {
-                            send_event(events, AgentEvent::Cancelled)?;
-                            return Ok(());
-                        }
-                    }
-                } else if name == "subagent" {
-                    let task = args
-                        .get("task")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    send_event(events, AgentEvent::SubagentStart { task: task.clone() })?;
-
-                    let sub_agent = Agent::new_subagent(
-                        Arc::clone(&self.backend),
-                        self.model.clone(),
-                        self.context_size,
-                        self.bash_timeout,
-                        self.subagent_max_turns,
-                    );
-
-                    // Channels for the sub-agent
-                    let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<AgentEvent>();
-                    let (sub_confirm_tx, mut sub_confirm_rx) = mpsc::unbounded_channel::<bool>();
-
-                    // Move the sub-agent and channel clones into an owned future.
-                    // This avoids borrow issues: the future owns everything it needs.
-                    let sub_tx_for_agent = sub_tx.clone();
-                    let cancel_for_sub = cancel.clone();
-                    let mut sub_future = Box::pin(async move {
-                        let mut sa = sub_agent;
-                        let result = sa.run(&task, &sub_tx_for_agent, &mut sub_confirm_rx, cancel_for_sub).await;
-                        let last_msg = sa.last_assistant_message();
-                        (result, last_msg)
-                    });
-
-                    // Drive the sub-agent and its event loop concurrently.
-                    // We poll both the sub-agent future and its event channel so we
-                    // can forward tool confirmations through the parent's confirm_rx
-                    // instead of auto-approving.
-                    let mut sub_finished: Option<(Result<()>, String)> = None;
-                    let mut sub_tx_option = Some(sub_tx);
-
-                    loop {
-                        tokio::select! {
-                            biased;
-                            // Process sub-agent events first (higher priority)
-                            event = sub_rx.recv() => {
-                                match event {
-                                    Some(AgentEvent::ToolConfirmRequest { name, args }) => {
-                                        // Forward to parent TUI for user confirmation
-                                        send_event(events, AgentEvent::ToolConfirmRequest {
-                                            name,
-                                            args,
-                                        })?;
-                                        let approved = confirm_rx.recv().await.unwrap_or(false);
-                                        let _ = sub_confirm_tx.send(approved);
-                                    }
-                                    Some(AgentEvent::ToolCall { name, args }) => {
-                                        let _ = events.send(AgentEvent::SubagentToolCall {
-                                            name,
-                                            args,
-                                        });
-                                    }
-                                    Some(AgentEvent::ToolResult { name, success, .. }) => {
-                                        let _ = events.send(AgentEvent::SubagentToolResult {
-                                            name,
-                                            success,
-                                        });
-                                    }
-                                    Some(_) => {} // ignore other events
-                                    None => break, // sub-agent channel closed
-                                }
-                            }
-                            // Poll the sub-agent future
-                            result = &mut sub_future, if sub_finished.is_none() => {
-                                sub_finished = Some(result);
-                                // Drop our sender clone to close channel (the future's
-                                // clone was already dropped when the async block ended).
-                                sub_tx_option.take();
-                            }
-                        }
-                    }
-
-                    match sub_finished {
-                        Some((Ok(()), response)) => {
-                            send_event(events, AgentEvent::SubagentEnd { result: response.clone() })?;
-                            (response, true)
-                        }
-                        Some((Err(e), _)) => {
-                            let err_msg = format!("Sub-agent error: {}", e);
-                            send_event(events, AgentEvent::SubagentEnd { result: err_msg.clone() })?;
-                            (err_msg, false)
-                        }
-                        None => {
-                            let err_msg = "Sub-agent channel closed unexpectedly".to_string();
-                            send_event(events, AgentEvent::SubagentEnd { result: err_msg.clone() })?;
-                            (err_msg, false)
-                        }
-                    }
-                } else {
-                    match self.tools.execute(name, args) {
-                        Ok(output) => (output, true),
-                        Err(e) => (format!("Error: {}", e), false),
-                    }
-                };
-
-                send_event(
-                    events,
-                    AgentEvent::ToolResult {
-                        name: name.clone(),
-                        output: result.clone(),
-                        success,
-                    },
-                )?;
-
-                // Truncate before storing in context to avoid blowing the window.
-                // The full output was already sent to the UI above.
-                let context_result = truncate_tool_output(&result);
-                let tool_msg = Message::tool(&context_result, tool_call.id.clone());
-                self.messages.push(tool_msg.clone());
-                send_event(events, AgentEvent::MessageLogged(tool_msg))?;
             }
 
         }

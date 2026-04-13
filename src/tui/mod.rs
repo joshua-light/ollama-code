@@ -2,6 +2,7 @@ mod app;
 mod events;
 mod markdown;
 pub(crate) mod render;
+mod syntax;
 
 use std::io;
 use std::sync::Arc;
@@ -131,8 +132,7 @@ fn handle_backend_ready(
             )));
         }
     }
-    app.is_processing = false;
-    app.generation_start = None;
+    app.finish_processing();
     if was_at_bottom {
         app.scroll_offset = 0;
     }
@@ -186,7 +186,7 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
 
     // Keep a clone for the panic handler
     let panic_event_tx = event_tx.clone();
-    let cancel_flag = app.cancel_flag.clone();
+    let cancel_flag = app.server.cancel_flag.clone();
 
     tokio::spawn(async move {
         let result = std::panic::AssertUnwindSafe(async {
@@ -254,14 +254,12 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
     let (server_progress_tx, mut server_progress_rx) = mpsc::unbounded_channel::<ServerStartEvent>();
     if let Some(initial) = initial_server_start {
         let model_name = app.model.clone();
-        app.server_loading = Some(ServerLoadingState {
+        app.server.loading = Some(ServerLoadingState {
             progress: 0.0,
             start: std::time::Instant::now(),
             model_name,
         });
-        app.is_processing = true;
-        app.generation_start = Some(std::time::Instant::now());
-        app.generation_verb = "Loading model".to_string();
+        app.begin_processing("Loading model".to_string());
 
         let tx = server_progress_tx;
         tokio::spawn(async move {
@@ -289,10 +287,10 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
             }
             Some(Ok(evt)) = reader.next() => {
                 events::handle_terminal_event(evt, &mut app, &input_tx, &confirm_tx, &model_tx, &session);
-                if app.stop_llama_server {
-                    app.stop_llama_server = false;
+                if app.server.stop_llama_server {
+                    app.server.stop_llama_server = false;
                     let old_server = llama_server.take();
-                    if let Some(pending) = app.pending_server_start.take() {
+                    if let Some(pending) = app.server.pending_server_start.take() {
                         // Stop old server, then start new one (single task guarantees ordering)
                         let tx = backend_tx.clone();
                         tokio::spawn(async move {
@@ -326,6 +324,10 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                         if let AgentEvent::MessageLogged(ref msg) = e {
                             session.log_message(msg);
                         }
+                        // Persist trim watermark so resumed sessions skip trimmed messages
+                        if let AgentEvent::ContextTrimmed { removed_messages, .. } = &e {
+                            session.record_trim(*removed_messages);
+                        }
                         events::handle_agent_event(e, &mut app);
                         // Auto-approve tool calls when bypass is enabled
                         if app.auto_approve && app.pending_confirm.is_some() {
@@ -337,8 +339,7 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                         session.log_debug("AGENT_DISCONNECTED");
                         app.flush_streaming();
                         app.messages.push(ChatMessage::Error("Agent disconnected".into()));
-                        app.is_processing = false;
-                        app.generation_start = None;
+                        app.finish_processing();
                     }
                 }
                 needs_redraw = true;
@@ -354,24 +355,22 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
             Some(evt) = server_progress_rx.recv() => {
                 match evt {
                     ServerStartEvent::Progress(pct) => {
-                        if let Some(ref mut loading) = app.server_loading {
+                        if let Some(ref mut loading) = app.server.loading {
                             loading.progress = pct;
                         }
                     }
                     ServerStartEvent::Ready(server) => {
                         llama_server = Some(server);
-                        app.server_loading = None;
-                        app.is_processing = false;
-                        app.generation_start = None;
+                        app.server.loading = None;
+                        app.finish_processing();
                         let model = app.model.clone();
                         app.messages.push(ChatMessage::Info(format!(
                             "Model {} loaded.", model
                         )));
                     }
                     ServerStartEvent::Failed(err) => {
-                        app.server_loading = None;
-                        app.is_processing = false;
-                        app.generation_start = None;
+                        app.server.loading = None;
+                        app.finish_processing();
                         app.messages.push(ChatMessage::Error(format!(
                             "Failed to start llama-server: {}", err
                         )));

@@ -21,7 +21,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent};
-use crate::config::{Config, DEFAULT_CONTEXT_SIZE, DEFAULT_SUBAGENT_MAX_TURNS};
+use crate::config::{Config, DEFAULT_CONTEXT_SIZE};
 use crate::llama_server::{LlamaCppBackend, LlamaServer, ModelSource};
 use crate::ollama::OllamaBackend;
 use crate::session::Session;
@@ -142,6 +142,48 @@ fn resolve_session(resume: &Option<String>) -> Result<(Session, Option<Vec<messa
     }
 }
 
+/// Shared dispatch: resolve the session, then run pipe or TUI.
+///
+/// `llama_server` and `initial_server_start` are only set when using a local
+/// llama-cpp backend; they are `None` for Ollama and remote llama-cpp.
+async fn run_with_backend(
+    prompt: Option<String>,
+    config: Config,
+    context_size: u64,
+    agent: Agent,
+    llama_server: Option<LlamaServer>,
+    initial_server_start: Option<tui::InitialServerStart>,
+    resume: Option<String>,
+) -> Result<()> {
+    let verbose = config.verbose.unwrap_or(false);
+    let (session, restored) = resolve_session(&resume)?;
+
+    if let Some(prompt) = prompt {
+        // Pipe mode: wait for server synchronously (no TUI to show progress)
+        let mut agent = agent;
+        if let Some(msgs) = restored {
+            agent.restore_messages(msgs);
+        }
+        // Unpack the pending server start (if any) so we can wait for readiness
+        // and clean up afterwards.
+        let mut owned_server = if let Some(mut is) = initial_server_start {
+            is.server.wait_until_ready(&is.model_source).await?;
+            eprintln!("llama-server ready (log: {})", is.server.log_path.display());
+            Some(is.server)
+        } else {
+            llama_server
+        };
+        let result = run_pipe(agent, &prompt, session, verbose).await;
+        if let Some(ref mut s) = owned_server {
+            s.stop().await;
+        }
+        result
+    } else {
+        // TUI mode: defer server readiness to event loop (shows progress bar)
+        tui::run(agent, context_size, session, config, llama_server, restored, initial_server_start).await
+    }
+}
+
 async fn run_ollama(prompt: Option<String>, mut config: Config, context_size: u64, resume: Option<String>) -> Result<()> {
     let ollama = OllamaBackend::new(config.ollama_url.clone());
 
@@ -157,22 +199,9 @@ async fn run_ollama(prompt: Option<String>, mut config: Config, context_size: u6
         m
     };
 
-    let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
-    let subagent_max_turns = config.subagent_max_turns.unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS);
-    let backend = OllamaBackend::new(config.ollama_url.clone());
-    let agent = Agent::new(Arc::new(backend), model, context_size, bash_timeout, subagent_max_turns);
-    let verbose = config.verbose.unwrap_or(false);
-    let (session, restored) = resolve_session(&resume)?;
+    let agent = Agent::new(Arc::new(ollama), model, context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns());
 
-    if let Some(prompt) = prompt {
-        let mut agent = agent;
-        if let Some(msgs) = restored {
-            agent.restore_messages(msgs);
-        }
-        run_pipe(agent, &prompt, session, verbose).await
-    } else {
-        tui::run(agent, context_size, session, config, None, restored, None).await
-    }
+    run_with_backend(prompt, config, context_size, agent, None, None, resume).await
 }
 
 async fn run_llama_cpp(prompt: Option<String>, config: Config, context_size: u64, resume: Option<String>) -> Result<()> {
@@ -245,38 +274,13 @@ async fn run_llama_cpp(prompt: Option<String>, config: Config, context_size: u64
     };
     let backend = LlamaCppBackend::new(base_url);
 
-    let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
-    let subagent_max_turns = config.subagent_max_turns.unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS);
-    let agent = Agent::new(Arc::new(backend), model_name.to_string(), context_size, bash_timeout, subagent_max_turns);
-    let verbose = config.verbose.unwrap_or(false);
-    let (session, restored) = resolve_session(&resume)?;
+    let agent = Agent::new(Arc::new(backend), model_name.to_string(), context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns());
 
-    if let Some(prompt) = prompt {
-        // Pipe mode: wait for server synchronously (no TUI to show progress)
-        let mut agent = agent;
-        if let Some(msgs) = &restored {
-            agent.restore_messages(msgs.clone());
-        }
-        if let Some((mut server, model_source)) = initial_start {
-            server.wait_until_ready(&model_source).await?;
-            eprintln!("llama-server ready (log: {})", server.log_path.display());
-            let result = run_pipe(agent, &prompt, session, verbose).await;
-            server.stop().await;
-            result
-        } else {
-            let mut server = llama_server.unwrap();
-            let result = run_pipe(agent, &prompt, session, verbose).await;
-            server.stop().await;
-            result
-        }
-    } else {
-        // TUI mode: defer server readiness to event loop (shows progress bar)
-        let initial = initial_start.map(|(server, ms)| tui::InitialServerStart {
-            server,
-            model_source: ms,
-        });
-        tui::run(agent, context_size, session, config, llama_server, restored, initial).await
-    }
+    let initial = initial_start.map(|(server, ms)| tui::InitialServerStart {
+        server,
+        model_source: ms,
+    });
+    run_with_backend(prompt, config, context_size, agent, llama_server, initial, resume).await
 }
 
 async fn run_remote_llama_cpp(prompt: Option<String>, mut config: Config, context_size: u64, url: String, resume: Option<String>) -> Result<()> {
@@ -306,21 +310,9 @@ async fn run_remote_llama_cpp(prompt: Option<String>, mut config: Config, contex
     config.llama_server_url = Some(url.clone());
 
     let backend = LlamaCppBackend::new(url);
-    let bash_timeout = std::time::Duration::from_secs(config.bash_timeout.unwrap_or(120));
-    let subagent_max_turns = config.subagent_max_turns.unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS);
-    let agent = Agent::new(Arc::new(backend), model_name, context_size, bash_timeout, subagent_max_turns);
-    let verbose = config.verbose.unwrap_or(false);
-    let (session, restored) = resolve_session(&resume)?;
+    let agent = Agent::new(Arc::new(backend), model_name, context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns());
 
-    if let Some(prompt) = prompt {
-        let mut agent = agent;
-        if let Some(msgs) = restored {
-            agent.restore_messages(msgs);
-        }
-        run_pipe(agent, &prompt, session, verbose).await
-    } else {
-        tui::run(agent, context_size, session, config, None, restored, None).await
-    }
+    run_with_backend(prompt, config, context_size, agent, None, None, resume).await
 }
 
 async fn select_model(ollama: &OllamaBackend) -> Result<String> {
@@ -371,6 +363,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
     // format) — without buffering, the raw text leaks to stdout before
     // extraction can clean it up.
     let mut token_buf = String::new();
+    let mut agent_error: Option<String> = None;
 
     while let Some(event) = rx.recv().await {
         session.log_agent_event(&event);
@@ -412,6 +405,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
                 }
             }
             AgentEvent::ContextTrimmed { removed_messages, estimated_tokens_freed } => {
+                session.record_trim(removed_messages);
                 eprintln!("(context trimmed: {} messages, ~{} tokens freed)", removed_messages, estimated_tokens_freed);
             }
             AgentEvent::Done { .. } => {
@@ -425,6 +419,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
             }
             AgentEvent::Error(e) => {
                 eprintln!("\nerror: {}", e);
+                agent_error = Some(e);
                 break;
             }
             AgentEvent::SubagentStart { ref task } => {
@@ -451,5 +446,10 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
     }
 
     handle.await??;
+
+    if let Some(e) = agent_error {
+        anyhow::bail!("{}", e);
+    }
+
     Ok(())
 }

@@ -49,20 +49,23 @@ impl ToolCall {
     }
 }
 
-/// Rough token estimate: chars / 4 heuristic for English text.
-pub fn chars_to_tokens(len: usize) -> u64 {
-    (len as u64) / 4
+/// Approximate chars-per-token ratio (biased toward code).
+pub const CHARS_PER_TOKEN: u64 = 3;
+
+/// Estimate tokens from a raw char length.
+pub fn estimate_tokens(char_len: usize) -> u64 {
+    (char_len as u64) / CHARS_PER_TOKEN
 }
 
 impl Message {
-    /// Rough token estimate (chars / 4 heuristic for English text + overhead).
+    /// Rough token estimate (chars / CHARS_PER_TOKEN heuristic + overhead).
     pub fn estimated_tokens(&self) -> u64 {
-        let content_tokens = chars_to_tokens(self.content.len());
+        let content_tokens = estimate_tokens(self.content.len());
         let tool_call_tokens = self.tool_calls.as_ref().map_or(0, |calls| {
             calls
                 .iter()
                 .map(|tc| {
-                    chars_to_tokens(tc.function.name.len() + tc.function.arguments.to_string().len())
+                    estimate_tokens(tc.function.name.len() + tc.function.arguments.to_string().len())
                 })
                 .sum()
         });

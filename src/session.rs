@@ -11,6 +11,7 @@ pub struct Session {
     dir: PathBuf,
     messages_file: File,
     debug_file: File,
+    trim_watermark: usize,
 }
 
 impl Session {
@@ -35,6 +36,7 @@ impl Session {
             dir,
             messages_file,
             debug_file,
+            trim_watermark: 0,
         };
 
         session.log_debug("SESSION_START");
@@ -76,6 +78,13 @@ impl Session {
             }
         }
 
+        // Read trim watermark from metadata (skip previously-trimmed messages)
+        let trim_watermark = read_trim_watermark(&dir);
+        if trim_watermark > 0 && messages.len() > 1 {
+            let skip = trim_watermark.min(messages.len() - 1);
+            messages.drain(1..1 + skip);
+        }
+
         let messages_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -90,6 +99,7 @@ impl Session {
             dir,
             messages_file,
             debug_file,
+            trim_watermark,
         };
 
         session.log_debug("SESSION_RESUME");
@@ -158,6 +168,14 @@ impl Session {
 
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    /// Record that a context trim removed `removed` messages.
+    /// Persists the cumulative watermark so resumed sessions skip trimmed messages.
+    pub fn record_trim(&mut self, removed: usize) {
+        self.trim_watermark += removed;
+        let meta = serde_json::json!({"trim_watermark": self.trim_watermark});
+        let _ = fs::write(self.dir.join("meta.json"), meta.to_string());
     }
 
     pub fn log_message(&mut self, msg: &Message) {
@@ -299,4 +317,15 @@ fn epoch_to_utc(epoch_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let y = if mon <= 2 { y + 1 } else { y };
 
     (y, mon, d, h, m, s)
+}
+
+/// Read the trim watermark from a session's meta.json.
+/// Returns 0 if the file is missing or malformed (backward-compatible).
+fn read_trim_watermark(session_dir: &Path) -> usize {
+    let meta_path = session_dir.join("meta.json");
+    fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("trim_watermark")?.as_u64())
+        .unwrap_or(0) as usize
 }

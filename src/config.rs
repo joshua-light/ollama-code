@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONTEXT_SIZE: u64 = 32768;
 pub const DEFAULT_SUBAGENT_MAX_TURNS: u16 = 15;
+pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 
 /// Root data directory for ollama-code (`$XDG_DATA_HOME/ollama-code` or `./ollama-code`).
 pub fn data_dir() -> PathBuf {
@@ -159,6 +160,14 @@ impl Config {
             recent_hf_models: other.recent_hf_models.clone(),
             project_config_path: None,
         }
+    }
+
+    pub fn bash_timeout_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.bash_timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS))
+    }
+
+    pub fn effective_subagent_max_turns(&self) -> u16 {
+        self.subagent_max_turns.unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS)
     }
 
     pub fn save(&self) -> Result<()> {
