@@ -233,7 +233,7 @@ pub(super) fn process_remaining_buffer(
     on_token: &dyn Fn(&str),
 ) -> Result<bool> {
     let remaining = buffer.trim();
-    if remaining.is_empty() {
+    if remaining.is_empty() || remaining.starts_with(':') {
         return Ok(false);
     }
     let mut saw_done = false;

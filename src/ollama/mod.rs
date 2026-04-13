@@ -69,7 +69,7 @@ impl OllamaBackend {
     pub fn new(base_url: Option<String>) -> Self {
         Self {
             client: Client::new(),
-            base_url: base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            base_url: base_url.unwrap_or_else(|| crate::config::DEFAULT_OLLAMA_URL.to_string()),
         }
     }
 
@@ -169,7 +169,10 @@ impl ModelBackend for OllamaBackend {
             let mut token_count: u32 = 0;
 
             let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
+            // Use a byte buffer so that multi-byte UTF-8 characters split
+            // across HTTP chunk boundaries are preserved intact instead of
+            // being replaced with U+FFFD by String::from_utf8_lossy.
+            let mut buffer: Vec<u8> = Vec::new();
 
             // Detect format from the first non-empty line.
             // OpenAI SSE lines start with "data: ", Ollama lines are raw JSON.
@@ -182,13 +185,21 @@ impl ModelBackend for OllamaBackend {
                     Ok(None) => break,               // stream ended normally
                     Err(_) => break 'stream,          // inactivity timeout
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                buffer.extend_from_slice(&chunk);
 
-                while let Some(newline_pos) = buffer.find('\n') {
-                    let line = buffer[..newline_pos].trim().to_string();
+                while let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+                    let line = match std::str::from_utf8(&buffer[..newline_pos]) {
+                        Ok(s) => s.trim().to_string(),
+                        Err(_) => String::from_utf8_lossy(&buffer[..newline_pos]).trim().to_string(),
+                    };
                     buffer.drain(..=newline_pos);
 
                     if line.is_empty() {
+                        continue;
+                    }
+
+                    // Skip SSE comment/heartbeat lines (e.g. ": keepalive").
+                    if line.starts_with(':') {
                         continue;
                     }
 
@@ -251,10 +262,10 @@ impl ModelBackend for OllamaBackend {
                 }
             }
 
-            // Process remaining buffer
+            let remaining = String::from_utf8_lossy(&buffer);
             if !saw_done {
                 saw_done = process_remaining_buffer(
-                    &buffer,
+                    &remaining,
                     is_openai,
                     &mut content,
                     &mut tool_calls,
