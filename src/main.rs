@@ -189,7 +189,7 @@ async fn run_ollama(prompt: Option<String>, mut config: Config, context_size: u6
         m
     };
 
-    let agent = Agent::new(Arc::new(ollama), model, context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns());
+    let agent = Agent::with_config(Arc::new(ollama), model, context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns(), &config);
 
     run_with_backend(prompt, config, context_size, agent, None, None, resume).await
 }
@@ -264,7 +264,7 @@ async fn run_llama_cpp(prompt: Option<String>, config: Config, context_size: u64
     };
     let backend = LlamaCppBackend::new(base_url);
 
-    let agent = Agent::new(Arc::new(backend), model_name.to_string(), context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns());
+    let agent = Agent::with_config(Arc::new(backend), model_name.to_string(), context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns(), &config);
 
     let initial = initial_start.map(|(server, ms)| tui::InitialServerStart {
         server,
@@ -300,7 +300,7 @@ async fn run_remote_llama_cpp(prompt: Option<String>, mut config: Config, contex
     config.llama_server_url = Some(url.clone());
 
     let backend = LlamaCppBackend::new(url);
-    let agent = Agent::new(Arc::new(backend), model_name, context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns());
+    let agent = Agent::with_config(Arc::new(backend), model_name, context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns(), &config);
 
     run_with_backend(prompt, config, context_size, agent, None, None, resume).await
 }

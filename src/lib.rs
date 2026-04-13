@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod format;
 pub mod llama_server;
+pub mod mcp;
 pub mod message;
 pub mod ollama;
 pub mod plugin;

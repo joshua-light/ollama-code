@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::mcp::McpServerConfig;
+
 pub const DEFAULT_CONTEXT_SIZE: u64 = 32768;
 pub const DEFAULT_SUBAGENT_MAX_TURNS: u16 = 15;
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
@@ -92,6 +94,15 @@ pub struct Config {
     #[serde(default)]
     pub plugin_dirs: Option<Vec<String>>,
 
+    /// MCP (Model Context Protocol) servers.
+    ///
+    /// Each entry spawns a server process at startup and registers its tools:
+    ///   `[mcp_servers.filesystem]`
+    ///   `command = "npx"`
+    ///   `args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]`
+    #[serde(default)]
+    pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
+
     /// Recently used HuggingFace model repos (most recent first, max 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_hf_models: Option<Vec<String>>,
@@ -158,6 +169,22 @@ impl Config {
     /// For each field, self's `Some` wins over other's `Some`.
     /// `recent_hf_models` always comes from `other` (user-scope only).
     pub fn merge(self, other: &Config) -> Config {
+        fn merge_hashmap<V: Clone>(
+            hi: Option<HashMap<String, V>>,
+            lo: &Option<HashMap<String, V>>,
+        ) -> Option<HashMap<String, V>> {
+            match (hi, lo) {
+                (Some(mut hi), Some(lo)) => {
+                    for (k, v) in lo {
+                        hi.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                    Some(hi)
+                }
+                (hi @ Some(_), _) => hi,
+                (None, lo) => lo.clone(),
+            }
+        }
+
         Config {
             model: self.model.or_else(|| other.model.clone()),
             context_size: self.context_size.or(other.context_size),
@@ -174,18 +201,9 @@ impl Config {
             no_confirm: self.no_confirm.or(other.no_confirm),
             verbose: self.verbose.or(other.verbose),
             bypass: self.bypass.or(other.bypass),
-            plugins: match (self.plugins, &other.plugins) {
-                (Some(mut hi), Some(lo)) => {
-                    // Merge: high-priority entries win per-key.
-                    for (k, v) in lo {
-                        hi.entry(k.clone()).or_insert_with(|| v.clone());
-                    }
-                    Some(hi)
-                }
-                (hi @ Some(_), None) => hi,
-                (None, lo) => lo.clone(),
-            },
+            plugins: merge_hashmap(self.plugins, &other.plugins),
             plugin_dirs: self.plugin_dirs.or_else(|| other.plugin_dirs.clone()),
+            mcp_servers: merge_hashmap(self.mcp_servers, &other.mcp_servers),
             // User-scope only: always take from the lower-priority layer (user config).
             recent_hf_models: other.recent_hf_models.clone(),
             project_config_path: None,

@@ -2,10 +2,13 @@ pub enum SlashCommand {
     Bypass,
     Clear,
     Context,
+    Help,
+    Mcp,
     Model,
     Resume,
     Rewind,
     Session,
+    Skills,
     New,
     Unknown(String),
 }
@@ -29,6 +32,14 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Show or set context window size",
     },
     CommandInfo {
+        name: "/help",
+        description: "Show available commands",
+    },
+    CommandInfo {
+        name: "/mcp",
+        description: "Show connected MCP servers and their tools",
+    },
+    CommandInfo {
         name: "/model",
         description: "Switch the active model",
     },
@@ -45,6 +56,10 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Show session log directory",
     },
     CommandInfo {
+        name: "/skills",
+        description: "List available skills",
+    },
+    CommandInfo {
         name: "/new",
         description: "Start a new conversation",
     },
@@ -59,9 +74,12 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         "/bypass" => Some(SlashCommand::Bypass),
         "/clear" => Some(SlashCommand::Clear),
         "/context" => Some(SlashCommand::Context),
+        "/help" => Some(SlashCommand::Help),
+        "/mcp" => Some(SlashCommand::Mcp),
         "/model" => Some(SlashCommand::Model),
         "/resume" => Some(SlashCommand::Resume),
         "/session" => Some(SlashCommand::Session),
+        "/skills" => Some(SlashCommand::Skills),
         "/new" => Some(SlashCommand::New),
         "/rewind" => Some(SlashCommand::Rewind),
         cmd => Some(SlashCommand::Unknown(cmd.to_string())),

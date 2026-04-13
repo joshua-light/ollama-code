@@ -8,10 +8,11 @@ use tokio::sync::mpsc;
 
 use crate::backend::ModelBackend;
 use crate::config::Config;
+use crate::mcp;
 use crate::message::{self, Message};
 use crate::plugin::{self, ExternalTool};
 use crate::skills::{self, SkillMeta};
-use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SubagentToolDef, WriteTool, ToolRegistry};
+use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SubagentToolDef, Tool, WriteTool, ToolRegistry};
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -132,6 +133,8 @@ pub struct Agent {
     skills: Vec<SkillMeta>,
     /// External plugin tool names that require user confirmation.
     plugin_confirm_tools: HashSet<String>,
+    /// Running MCP server processes (kept alive so tool connections stay open).
+    _mcp_servers: Vec<mcp::McpServer>,
 }
 
 impl Agent {
@@ -190,6 +193,26 @@ impl Agent {
                         plugin_confirm_tools.insert(tool_def.name.clone());
                     }
                     tools.register(Box::new(ext_tool));
+                }
+            }
+        }
+
+        // Start MCP servers and register their tools.
+        let mut mcp_servers = Vec::new();
+        if !is_subagent {
+            if let Some(ref servers) = cfg.mcp_servers {
+                for server in mcp::start_servers(servers, |name| cfg.is_tool_enabled(name)) {
+                    for mcp_tool in server.create_tools() {
+                        let tool_name = mcp_tool.name().to_string();
+                        if !cfg.is_tool_enabled(&tool_name) {
+                            continue;
+                        }
+                        if server.needs_confirm {
+                            plugin_confirm_tools.insert(tool_name);
+                        }
+                        tools.register(Box::new(mcp_tool));
+                    }
+                    mcp_servers.push(server);
                 }
             }
         }
@@ -257,6 +280,7 @@ impl Agent {
             skills_summary_len,
             skills: discovered_skills,
             plugin_confirm_tools,
+            _mcp_servers: mcp_servers,
         }
     }
 

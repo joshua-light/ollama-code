@@ -155,6 +155,52 @@ pub(super) fn handle_command(
                 }));
             }
         }
+        SlashCommand::Help => {
+            let mut info = String::from("Commands:\n");
+            for cmd in crate::commands::COMMANDS {
+                info.push_str(&format!("  {:12} {}\n", cmd.name, cmd.description));
+            }
+            if !app.skills.is_empty() {
+                info.push_str("\nSkills:\n");
+                for skill in &app.skills {
+                    info.push_str(&format!("  {:12} {}\n", format!("/{}", skill.name), skill.description));
+                }
+            }
+            app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
+        }
+        SlashCommand::Mcp => {
+            match &app.config.mcp_servers {
+                Some(servers) if !servers.is_empty() => {
+                    let mut info = String::new();
+                    for (name, cfg) in servers {
+                        let enabled = app.config.is_tool_enabled(name);
+                        let status = if enabled { "enabled" } else { "disabled" };
+                        let transport = if let Some(ref url) = cfg.url {
+                            format!("http: {}", url)
+                        } else {
+                            format!(
+                                "stdio: {} {}",
+                                cfg.command.as_deref().unwrap_or("?"),
+                                cfg.args.join(" ")
+                            )
+                        };
+                        info.push_str(&format!(
+                            "  {} ({}, {})\n",
+                            name, status, transport,
+                        ));
+                    }
+                    app.messages.push(ChatMessage::Info(format!(
+                        "MCP servers:\n{}",
+                        info.trim_end()
+                    )));
+                }
+                _ => {
+                    app.messages.push(ChatMessage::Info(
+                        "No MCP servers configured. Add [mcp_servers.<name>] to your config.".into(),
+                    ));
+                }
+            }
+        }
         SlashCommand::Model => {
             app.messages.push(ChatMessage::Info("Fetching models...".into()));
             let ollama = app.ollama.clone();
@@ -193,6 +239,19 @@ pub(super) fn handle_command(
                 "Session: {}",
                 session.path().display()
             )));
+        }
+        SlashCommand::Skills => {
+            if app.skills.is_empty() {
+                app.messages.push(ChatMessage::Info(
+                    "No skills found. Add SKILL.md files to .agents/skills/<name>/ or ~/.config/ollama-code/skills/<name>/.".into(),
+                ));
+            } else {
+                let mut info = String::from("Skills:\n");
+                for skill in &app.skills {
+                    info.push_str(&format!("  /{}: {}\n    {}\n", skill.name, skill.description, skill.dir.display()));
+                }
+                app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
+            }
         }
         SlashCommand::New => {
             app.reset_conversation(input_tx, "New conversation started.");
