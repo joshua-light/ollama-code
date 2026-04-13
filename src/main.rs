@@ -1,16 +1,3 @@
-mod agent;
-mod backend;
-mod commands;
-mod config;
-mod format;
-mod llama_server;
-mod message;
-mod ollama;
-mod session;
-mod skills;
-mod tools;
-mod tui;
-
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -20,11 +7,14 @@ use anyhow::Result;
 use clap::Parser;
 use tokio::sync::mpsc;
 
-use crate::agent::{Agent, AgentEvent};
-use crate::config::{Config, DEFAULT_CONTEXT_SIZE};
-use crate::llama_server::{LlamaCppBackend, LlamaServer, ModelSource};
-use crate::ollama::OllamaBackend;
-use crate::session::Session;
+use ollama_code::agent::{Agent, AgentEvent};
+use ollama_code::config::{Config, DEFAULT_CONTEXT_SIZE};
+use ollama_code::format;
+use ollama_code::llama_server::{self, LlamaCppBackend, LlamaServer, ModelSource};
+use ollama_code::message;
+use ollama_code::ollama::OllamaBackend;
+use ollama_code::session::Session;
+use ollama_code::tui;
 
 #[derive(Parser)]
 #[command(name = "ollama-code", about = "A CLI agent built on Ollama")]
