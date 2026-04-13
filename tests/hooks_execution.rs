@@ -575,3 +575,249 @@ command = "{}/deny.sh"
     // Should not fire — hook disabled
     assert!(result.action.is_none());
 }
+
+// ── pre_tool_execute: rewrite ──────────────────────────────────────
+
+#[tokio::test]
+async fn pre_tool_rewrite_changes_name_and_args() {
+    let dir = tempfile::tempdir().unwrap();
+    make_hook_script(
+        dir.path(),
+        "rewrite.sh",
+        r#"#!/bin/sh
+echo '{"action":"rewrite","tool_name":"glob","arguments":{"pattern":"src/**/*"}}'
+"#,
+    );
+    let hooks_path = write_hooks_toml(
+        dir.path(),
+        &format!(
+            r#"
+[bash-to-glob]
+event = "pre_tool_execute"
+command = "{}/rewrite.sh"
+tools = ["bash"]
+"#,
+            dir.path().display()
+        ),
+    );
+
+    let runner = HookRunner::from_file(&hooks_path, None);
+    let result = runner
+        .pre_tool_execute("bash", &serde_json::json!({"command": "ls -la src/"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.action.as_deref(), Some("rewrite"));
+    assert_eq!(result.tool_name.as_deref(), Some("glob"));
+    let args = result.arguments.unwrap();
+    assert_eq!(args["pattern"].as_str(), Some("src/**/*"));
+}
+
+#[tokio::test]
+async fn pre_tool_rewrite_chaining_matches_new_name() {
+    let dir = tempfile::tempdir().unwrap();
+    // Hook A (priority 10): rewrite bash -> glob
+    make_hook_script(
+        dir.path(),
+        "rewrite.sh",
+        r#"#!/bin/sh
+echo '{"action":"rewrite","tool_name":"glob","arguments":{"pattern":"**/*"}}'
+"#,
+    );
+    // Hook B (priority 20): deny glob calls
+    make_hook_script(
+        dir.path(),
+        "deny_glob.sh",
+        r#"#!/bin/sh
+echo '{"action":"deny","message":"glob not allowed"}'
+"#,
+    );
+    let hooks_path = write_hooks_toml(
+        dir.path(),
+        &format!(
+            r#"
+[rewriter]
+event = "pre_tool_execute"
+command = "{dir}/rewrite.sh"
+tools = ["bash"]
+priority = 10
+
+[glob-blocker]
+event = "pre_tool_execute"
+command = "{dir}/deny_glob.sh"
+tools = ["glob"]
+priority = 20
+"#,
+            dir = dir.path().display()
+        ),
+    );
+
+    let runner = HookRunner::from_file(&hooks_path, None);
+    let result = runner
+        .pre_tool_execute("bash", &serde_json::json!({"command": "ls"}))
+        .await
+        .unwrap();
+
+    // Hook B should fire because the rewritten name is "glob"
+    assert_eq!(result.action.as_deref(), Some("deny"));
+    assert_eq!(result.message.as_deref(), Some("glob not allowed"));
+}
+
+#[tokio::test]
+async fn pre_tool_rewrite_chaining_skips_old_name() {
+    let dir = tempfile::tempdir().unwrap();
+    // Hook A (priority 10): rewrite bash -> glob
+    make_hook_script(
+        dir.path(),
+        "rewrite.sh",
+        r#"#!/bin/sh
+echo '{"action":"rewrite","tool_name":"glob","arguments":{"pattern":"**/*"}}'
+"#,
+    );
+    // Hook B (priority 20): deny bash calls — should NOT fire after rewrite
+    make_hook_script(
+        dir.path(),
+        "deny_bash.sh",
+        r#"#!/bin/sh
+echo '{"action":"deny","message":"bash not allowed"}'
+"#,
+    );
+    let hooks_path = write_hooks_toml(
+        dir.path(),
+        &format!(
+            r#"
+[rewriter]
+event = "pre_tool_execute"
+command = "{dir}/rewrite.sh"
+tools = ["bash"]
+priority = 10
+
+[bash-blocker]
+event = "pre_tool_execute"
+command = "{dir}/deny_bash.sh"
+tools = ["bash"]
+priority = 20
+"#,
+            dir = dir.path().display()
+        ),
+    );
+
+    let runner = HookRunner::from_file(&hooks_path, None);
+    let result = runner
+        .pre_tool_execute("bash", &serde_json::json!({"command": "ls"}))
+        .await
+        .unwrap();
+
+    // Hook B should NOT fire — tool name is now "glob", not "bash"
+    assert_eq!(result.action.as_deref(), Some("rewrite"));
+    assert_eq!(result.tool_name.as_deref(), Some("glob"));
+}
+
+#[tokio::test]
+async fn pre_tool_rewrite_then_modify_preserves_rewrite_action() {
+    let dir = tempfile::tempdir().unwrap();
+    // Hook A (priority 10): rewrite bash -> glob
+    make_hook_script(
+        dir.path(),
+        "rewrite.sh",
+        r#"#!/bin/sh
+echo '{"action":"rewrite","tool_name":"glob","arguments":{"pattern":"**/*"}}'
+"#,
+    );
+    // Hook B (priority 20): modify glob args
+    make_hook_script(
+        dir.path(),
+        "modify_glob.sh",
+        r#"#!/bin/sh
+echo '{"action":"modify","arguments":{"pattern":"src/**/*.rs"}}'
+"#,
+    );
+    let hooks_path = write_hooks_toml(
+        dir.path(),
+        &format!(
+            r#"
+[rewriter]
+event = "pre_tool_execute"
+command = "{dir}/rewrite.sh"
+tools = ["bash"]
+priority = 10
+
+[glob-modifier]
+event = "pre_tool_execute"
+command = "{dir}/modify_glob.sh"
+tools = ["glob"]
+priority = 20
+"#,
+            dir = dir.path().display()
+        ),
+    );
+
+    let runner = HookRunner::from_file(&hooks_path, None);
+    let result = runner
+        .pre_tool_execute("bash", &serde_json::json!({"command": "ls src/"}))
+        .await
+        .unwrap();
+
+    // Action should remain "rewrite" since the tool name changed
+    assert_eq!(result.action.as_deref(), Some("rewrite"));
+    assert_eq!(result.tool_name.as_deref(), Some("glob"));
+    let args = result.arguments.unwrap();
+    assert_eq!(args["pattern"].as_str(), Some("src/**/*.rs"));
+}
+
+#[tokio::test]
+async fn pre_tool_rewrite_hook_receives_rewritten_name() {
+    let dir = tempfile::tempdir().unwrap();
+    // Hook A (priority 10): rewrite bash -> glob
+    make_hook_script(
+        dir.path(),
+        "rewrite.sh",
+        r#"#!/bin/sh
+echo '{"action":"rewrite","tool_name":"glob","arguments":{"pattern":"**/*"}}'
+"#,
+    );
+    // Hook B (priority 20): captures stdin to a file
+    let capture_path = dir.path().join("captured_stdin.json");
+    make_hook_script(
+        dir.path(),
+        "capture.sh",
+        &format!(
+            "#!/bin/sh\ncat > {}\n",
+            capture_path.display()
+        ),
+    );
+    let hooks_path = write_hooks_toml(
+        dir.path(),
+        &format!(
+            r#"
+[rewriter]
+event = "pre_tool_execute"
+command = "{dir}/rewrite.sh"
+tools = ["bash"]
+priority = 10
+
+[capturer]
+event = "pre_tool_execute"
+command = "{dir}/capture.sh"
+tools = ["glob"]
+priority = 20
+"#,
+            dir = dir.path().display()
+        ),
+    );
+
+    let runner = HookRunner::from_file(&hooks_path, None);
+    let _result = runner
+        .pre_tool_execute("bash", &serde_json::json!({"command": "ls"}))
+        .await
+        .unwrap();
+
+    // Verify the second hook received the rewritten tool name
+    let captured = fs::read_to_string(&capture_path).unwrap();
+    let captured_json: serde_json::Value = serde_json::from_str(&captured).unwrap();
+    assert_eq!(
+        captured_json["data"]["tool_name"].as_str(),
+        Some("glob"),
+        "chained hook should receive the rewritten tool name"
+    );
+}

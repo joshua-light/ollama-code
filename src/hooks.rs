@@ -152,9 +152,12 @@ struct HookInput {
 pub struct PreToolResult {
     #[serde(default)]
     pub action: Option<String>,
-    /// Modified arguments (when action = "modify").
+    /// Modified arguments (when action = "modify" or "rewrite").
     #[serde(default)]
     pub arguments: Option<Value>,
+    /// Replacement tool name (when action = "rewrite").
+    #[serde(default)]
+    pub tool_name: Option<String>,
     /// Denial reason (when action = "deny").
     #[serde(default)]
     pub message: Option<String>,
@@ -368,20 +371,29 @@ impl HookRunner {
         tool_name: &str,
         arguments: &Value,
     ) -> Result<PreToolResult> {
-        let matching: Vec<&ResolvedHook> = self
+        // Collect all pre_tool_execute hooks (already sorted by priority).
+        // We evaluate matching dynamically so that a "rewrite" that changes the
+        // tool name is visible to subsequent hooks in the chain.
+        let candidates: Vec<&ResolvedHook> = self
             .hooks
             .iter()
             .filter(|h| h.entry.event == HookEvent::PreToolExecute)
-            .filter(|h| h.entry.matches_tool(tool_name))
-            .filter(|h| h.entry.matches_args(arguments))
             .collect();
 
         let mut result = PreToolResult::default();
+        let mut current_tool_name = tool_name.to_string();
         let mut current_args = arguments.clone();
 
-        for hook in matching {
+        for hook in candidates {
+            if !hook.entry.matches_tool(&current_tool_name) {
+                continue;
+            }
+            if !hook.entry.matches_args(&current_args) {
+                continue;
+            }
+
             let data = serde_json::json!({
-                "tool_name": tool_name,
+                "tool_name": current_tool_name,
                 "arguments": current_args,
             });
             match execute_hook(hook, HookEvent::PreToolExecute, data).await {
@@ -389,11 +401,27 @@ impl HookRunner {
                     if let Ok(r) = serde_json::from_value::<PreToolResult>(output) {
                         match r.action.as_deref() {
                             Some("deny") => return Ok(r),
+                            Some("rewrite") => {
+                                if let Some(new_name) = r.tool_name {
+                                    current_tool_name = new_name;
+                                    result.action = Some("rewrite".to_string());
+                                    result.tool_name = Some(current_tool_name.clone());
+                                } else if result.action.as_deref() != Some("rewrite") {
+                                    result.action = Some("modify".to_string());
+                                }
+                                if let Some(args) = r.arguments {
+                                    current_args = args;
+                                }
+                                result.arguments = Some(current_args.clone());
+                            }
                             Some("modify") => {
                                 if let Some(args) = r.arguments {
                                     current_args = args;
                                 }
-                                result.action = Some("modify".to_string());
+                                // Keep "rewrite" if a prior hook already rewrote the name
+                                if result.action.as_deref() != Some("rewrite") {
+                                    result.action = Some("modify".to_string());
+                                }
                                 result.arguments = Some(current_args.clone());
                             }
                             _ => {} // "proceed" or absent — continue
@@ -407,6 +435,7 @@ impl HookRunner {
                             action: Some("deny".to_string()),
                             message: Some(format!("Hook '{}' failed: {}", hook.name, e)),
                             arguments: None,
+                            tool_name: None,
                         });
                     }
                     eprintln!("[hooks] warning: '{}' failed (fail-open): {}", hook.name, e);

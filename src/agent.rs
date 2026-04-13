@@ -628,11 +628,11 @@ impl Agent {
         confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
         cancel: &Arc<AtomicBool>,
     ) -> Result<bool> {
-        let name = &tool_call.function.name;
+        let mut name = tool_call.function.name.clone();
         let original_args = &tool_call.function.arguments;
 
         // --- pre_tool_execute hooks ---
-        let args_override = match self.hooks.pre_tool_execute(name, original_args).await {
+        let args_override = match self.hooks.pre_tool_execute(&name, original_args).await {
             Ok(pre) => match pre.action.as_deref() {
                 Some("deny") => {
                     let msg = pre
@@ -642,7 +642,7 @@ impl Agent {
                         events,
                         AgentEvent::ToolCall {
                             name: name.clone(),
-                            args: crate::format::format_tool_args_display(name, original_args),
+                            args: crate::format::format_tool_args_display(&name, original_args),
                         },
                     )?;
                     send_event(
@@ -658,7 +658,19 @@ impl Agent {
                     send_event(events, AgentEvent::MessageLogged(tool_msg))?;
                     return Ok(true);
                 }
-                Some("modify") => pre.arguments,
+                Some("rewrite") | Some("modify") => {
+                    if let Some(ref new_name) = pre.tool_name {
+                        send_event(
+                            events,
+                            AgentEvent::Debug(format!(
+                                "Hook rewrote tool call: {} -> {}",
+                                name, new_name
+                            )),
+                        )?;
+                        name = new_name.clone();
+                    }
+                    pre.arguments
+                }
                 _ => None, // "proceed" or absent
             },
             Err(e) => {
@@ -671,7 +683,7 @@ impl Agent {
         };
         let args = args_override.as_ref().unwrap_or(original_args);
 
-        let args_display = crate::format::format_tool_args_display(name, args);
+        let args_display = crate::format::format_tool_args_display(&name, args);
 
         send_event(
             events,
@@ -712,7 +724,7 @@ impl Agent {
         }
 
         // Validate tool arguments against schema before execution.
-        if let Some(Err(validation_err)) = self.tools.validate(name, args) {
+        if let Some(Err(validation_err)) = self.tools.validate(&name, args) {
             let msg = format!(
                 "Invalid arguments for '{}': {}",
                 name, validation_err
@@ -755,7 +767,7 @@ impl Agent {
                 .to_string();
             self.execute_subagent(&task, events, confirm_rx, cancel).await
         } else {
-            match self.tools.execute(name, args) {
+            match self.tools.execute(&name, args) {
                 Ok(output) => (output, true),
                 Err(e) => (format!("Error: {}", e), false),
             }
@@ -769,7 +781,7 @@ impl Agent {
         // --- post_tool_execute hooks ---
         let (post_result, post_success) = self
             .hooks
-            .post_tool_execute(name, args, result, success)
+            .post_tool_execute(&name, args, result, success)
             .await;
         result = post_result;
         success = post_success;

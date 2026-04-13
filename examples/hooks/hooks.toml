@@ -1,0 +1,8 @@
+# Example hooks configuration for ollama-code.
+# Copy this file to ~/.config/ollama-code/hooks.toml to enable.
+
+[rewrite-bash-to-native]
+event = "pre_tool_execute"
+command = "./rewrite-bash-to-native.sh"
+tools = ["bash"]
+if_args = "^(ls|find|grep|rg)\\s"
