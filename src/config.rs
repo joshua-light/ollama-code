@@ -103,6 +103,17 @@ pub struct Config {
     #[serde(default)]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
 
+    /// Hook feature flags and per-hook configuration.
+    ///
+    /// Boolean values enable/disable hooks by name:
+    ///   `my-hook = false` disables the hook.
+    ///
+    /// Table values provide hook-specific configuration passed on stdin:
+    ///   `[hooks.my-hook]`
+    ///   `key = "value"`
+    #[serde(default)]
+    pub hooks: Option<HashMap<String, toml::Value>>,
+
     /// Recently used HuggingFace model repos (most recent first, max 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_hf_models: Option<Vec<String>>,
@@ -125,6 +136,27 @@ pub fn find_project_config(start_dir: &Path) -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+/// Check whether a named entry is enabled in an `Option<HashMap<String, toml::Value>>`.
+///
+/// Returns `false` only for an explicit `name = false`. Everything else
+/// (missing key, `true`, table value, absent map) means enabled.
+fn is_feature_enabled(map: &Option<HashMap<String, toml::Value>>, name: &str) -> bool {
+    match map {
+        Some(map) => !matches!(map.get(name), Some(toml::Value::Boolean(false))),
+        None => true,
+    }
+}
+
+/// Return the config table for a named entry, if it exists as a TOML table.
+fn feature_config<'a>(
+    map: &'a Option<HashMap<String, toml::Value>>,
+    name: &str,
+) -> Option<&'a toml::map::Map<String, toml::Value>> {
+    map.as_ref()
+        .and_then(|m| m.get(name))
+        .and_then(|v| v.as_table())
 }
 
 impl Config {
@@ -204,6 +236,7 @@ impl Config {
             plugins: merge_hashmap(self.plugins, &other.plugins),
             plugin_dirs: self.plugin_dirs.or_else(|| other.plugin_dirs.clone()),
             mcp_servers: merge_hashmap(self.mcp_servers, &other.mcp_servers),
+            hooks: merge_hashmap(self.hooks, &other.hooks),
             // User-scope only: always take from the lower-priority layer (user config).
             recent_hf_models: other.recent_hf_models.clone(),
             project_config_path: None,
@@ -228,26 +261,23 @@ impl Config {
     }
 
     /// Check whether a tool/plugin is enabled.
-    ///
-    /// Returns `false` only if `[plugins]` contains an explicit `name = false`.
-    /// Everything else (missing key, `true`, table value) means enabled.
     pub fn is_tool_enabled(&self, name: &str) -> bool {
-        match &self.plugins {
-            Some(map) => !matches!(map.get(name), Some(toml::Value::Boolean(false))),
-            None => true,
-        }
+        is_feature_enabled(&self.plugins, name)
     }
 
     /// Return the plugin-specific config table for `name`, if any.
-    ///
-    /// A `[plugins.<name>]` table in config.toml becomes a `Table` value
-    /// in the plugins map. Returns `None` if the entry is a simple boolean
-    /// or doesn't exist.
     pub fn plugin_config(&self, name: &str) -> Option<&toml::map::Map<String, toml::Value>> {
-        self.plugins
-            .as_ref()
-            .and_then(|map| map.get(name))
-            .and_then(|v| v.as_table())
+        feature_config(&self.plugins, name)
+    }
+
+    /// Check whether a hook is enabled.
+    pub fn is_hook_enabled(&self, name: &str) -> bool {
+        is_feature_enabled(&self.hooks, name)
+    }
+
+    /// Return the hook-specific config table for `name`, if any.
+    pub fn hook_config(&self, name: &str) -> Option<&toml::map::Map<String, toml::Value>> {
+        feature_config(&self.hooks, name)
     }
 
     /// Add a HuggingFace repo to the recent list (most recent first, max 10).

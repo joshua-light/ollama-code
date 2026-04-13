@@ -261,56 +261,8 @@ impl Tool for ExternalTool {
             stdin.write_all(stdin_data.as_bytes())?;
         }
 
-        let output = wait_with_timeout(&mut child, self.timeout)?;
+        let output = crate::process::wait_with_timeout(&mut child, self.timeout, "Plugin command")?;
         let (result, _) = crate::tools::format_bash_output(&output);
         Ok(result)
-    }
-}
-
-/// Wait for a child process with a timeout. Kills the process if it exceeds the deadline.
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    use std::thread;
-    use std::time::Instant;
-
-    let deadline = Instant::now() + timeout;
-    let poll_interval = Duration::from_millis(50);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process exited — collect output.
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    std::io::Read::read_to_end(&mut out, &mut stdout).ok();
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    std::io::Read::read_to_end(&mut err, &mut stderr).ok();
-                }
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => {
-                // Still running.
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!(
-                        "Plugin command timed out after {}s",
-                        timeout.as_secs()
-                    );
-                }
-                thread::sleep(poll_interval);
-            }
-            Err(e) => {
-                anyhow::bail!("Error waiting for plugin process: {}", e);
-            }
-        }
     }
 }

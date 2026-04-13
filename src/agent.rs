@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::ModelBackend;
 use crate::config::Config;
+use crate::hooks::HookRunner;
 use crate::mcp;
 use crate::message::{self, Message};
 use crate::plugin::{self, ExternalTool};
@@ -135,6 +136,8 @@ pub struct Agent {
     plugin_confirm_tools: HashSet<String>,
     /// Running MCP server processes (kept alive so tool connections stay open).
     _mcp_servers: Vec<mcp::McpServer>,
+    /// Hook runner for lifecycle hooks.
+    hooks: HookRunner,
 }
 
 impl Agent {
@@ -263,6 +266,13 @@ impl Agent {
             (Vec::new(), 0)
         };
 
+        // Discover hooks (top-level agents only).
+        let hooks = if !is_subagent {
+            HookRunner::discover(&cwd, config)
+        } else {
+            HookRunner::empty()
+        };
+
         let messages = vec![Message::system(&system_prompt)];
 
         Self {
@@ -281,6 +291,7 @@ impl Agent {
             skills: discovered_skills,
             plugin_confirm_tools,
             _mcp_servers: mcp_servers,
+            hooks,
         }
     }
 
@@ -571,10 +582,11 @@ impl Agent {
         }
     }
 
-    /// Dispatch a single tool call: handle confirmation, execute the tool
-    /// (bash / subagent / registry), emit events, and append the result
-    /// message.  Returns `Ok(true)` normally, `Ok(false)` when the user
-    /// cancelled mid-execution (caller should return early).
+    /// Dispatch a single tool call: run pre-hooks, handle confirmation,
+    /// execute the tool (bash / subagent / registry), run post-hooks,
+    /// emit events, and append the result message.
+    /// Returns `Ok(true)` normally, `Ok(false)` when the user cancelled
+    /// mid-execution (caller should return early).
     async fn dispatch_tool_call(
         &mut self,
         tool_call: &crate::message::ToolCall,
@@ -583,7 +595,47 @@ impl Agent {
         cancel: &Arc<AtomicBool>,
     ) -> Result<bool> {
         let name = &tool_call.function.name;
-        let args = &tool_call.function.arguments;
+        let original_args = &tool_call.function.arguments;
+
+        // --- pre_tool_execute hooks ---
+        let args_override = match self.hooks.pre_tool_execute(name, original_args).await {
+            Ok(pre) => match pre.action.as_deref() {
+                Some("deny") => {
+                    let msg = pre
+                        .message
+                        .unwrap_or_else(|| "Blocked by hook.".to_string());
+                    send_event(
+                        events,
+                        AgentEvent::ToolCall {
+                            name: name.clone(),
+                            args: crate::format::format_tool_args_display(name, original_args),
+                        },
+                    )?;
+                    send_event(
+                        events,
+                        AgentEvent::ToolResult {
+                            name: name.clone(),
+                            output: msg.clone(),
+                            success: false,
+                        },
+                    )?;
+                    let tool_msg = Message::tool(&msg, tool_call.id.clone());
+                    self.messages.push(tool_msg.clone());
+                    send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+                    return Ok(true);
+                }
+                Some("modify") => pre.arguments,
+                _ => None, // "proceed" or absent
+            },
+            Err(e) => {
+                send_event(
+                    events,
+                    AgentEvent::Debug(format!("pre_tool_execute hook error: {}", e)),
+                )?;
+                None
+            }
+        };
+        let args = args_override.as_ref().unwrap_or(original_args);
 
         let args_display = crate::format::format_tool_args_display(name, args);
 
@@ -631,7 +683,7 @@ impl Agent {
             return Ok(false);
         }
 
-        let (result, success) = if name == "bash" {
+        let (mut result, mut success) = if name == "bash" {
             // Race tool execution against the cancel flag so ESC kills
             // long-running bash commands immediately.
             tokio::select! {
@@ -654,6 +706,14 @@ impl Agent {
                 Err(e) => (format!("Error: {}", e), false),
             }
         };
+
+        // --- post_tool_execute hooks ---
+        let (post_result, post_success) = self
+            .hooks
+            .post_tool_execute(name, args, result, success)
+            .await;
+        result = post_result;
+        success = post_success;
 
         send_event(
             events,
@@ -698,6 +758,15 @@ impl Agent {
                 tool_defs_tokens: message::estimate_tokens(tool_defs_chars),
             })?;
             self.system_prompt_logged = true;
+        }
+
+        // --- agent_start hooks ---
+        if let Some(extra_context) = self.hooks.agent_start(user_input, &self.model).await {
+            let ctx_msg = Message::system(format!(
+                "[Hook-injected context]\n{}",
+                extra_context
+            ));
+            self.messages.push(ctx_msg);
         }
 
         let user_msg = Message::user(user_input);
@@ -913,7 +982,23 @@ impl Agent {
                     continue;
                 }
 
-                let assistant_msg = Message::assistant(&response.content);
+                // --- agent_done hooks ---
+                let final_content = match self
+                    .hooks
+                    .agent_done(&response.content, turn, &self.model)
+                    .await
+                {
+                    Some(rewritten) => {
+                        send_event(
+                            events,
+                            AgentEvent::ContentReplaced(rewritten.clone()),
+                        )?;
+                        rewritten
+                    }
+                    None => response.content.clone(),
+                };
+
+                let assistant_msg = Message::assistant(&final_content);
                 self.messages.push(assistant_msg.clone());
                 send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
                 send_event(
