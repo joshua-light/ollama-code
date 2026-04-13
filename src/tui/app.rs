@@ -379,7 +379,7 @@ pub(crate) fn messages_to_chat_messages(messages: &[Message]) -> Vec<ChatMessage
                         if result.is_none() {
                             *result = Some(ToolResultData {
                                 output: msg.content.clone(),
-                                success: true,
+                                success: msg.success.unwrap_or(true),
                             });
                             break;
                         }

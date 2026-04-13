@@ -18,6 +18,9 @@ pub struct Message {
     /// OpenAI-compatible: links a tool result to the tool call that produced it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Whether a tool call succeeded. Only set on Role::Tool messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +81,7 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            success: None,
         }
     }
 
@@ -87,6 +91,7 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            success: None,
         }
     }
 
@@ -96,15 +101,17 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            success: None,
         }
     }
 
-    pub fn tool(content: impl Into<String>, tool_call_id: Option<String>) -> Self {
+    pub fn tool(content: impl Into<String>, tool_call_id: Option<String>, success: bool) -> Self {
         Self {
             role: Role::Tool,
             content: content.into(),
             tool_calls: None,
             tool_call_id,
+            success: Some(success),
         }
     }
 }

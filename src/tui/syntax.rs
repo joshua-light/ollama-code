@@ -31,9 +31,10 @@ fn find_syntax(lang: &str) -> Option<&'static syntect::parsing::SyntaxReference>
         "zsh" | "shell" | "sh" => "bash",
         "yml" => "yaml",
         "ts" | "tsx" => "typescript",
-        "jsx" => "javascript",
+        "jsx" => "JavaScript",
         "dockerfile" => "Dockerfile",
         "makefile" => "Makefile",
+        "cs" | "csharp" => "csharp",
         _ => return None,
     };
     ss.find_syntax_by_token(alias)

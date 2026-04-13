@@ -653,7 +653,7 @@ impl Agent {
                             success: false,
                         },
                     )?;
-                    let tool_msg = Message::tool(&msg, tool_call.id.clone());
+                    let tool_msg = Message::tool(&msg, tool_call.id.clone(), false);
                     self.messages.push(tool_msg.clone());
                     send_event(events, AgentEvent::MessageLogged(tool_msg))?;
                     return Ok(true);
@@ -704,7 +704,7 @@ impl Agent {
                         success: false,
                     },
                 )?;
-                let tool_msg = Message::tool(&denied, tool_call.id.clone());
+                let tool_msg = Message::tool(&denied, tool_call.id.clone(), false);
                 self.messages.push(tool_msg.clone());
                 send_event(events, AgentEvent::MessageLogged(tool_msg))?;
                 return Ok(true);
@@ -725,7 +725,7 @@ impl Agent {
                     success: false,
                 },
             )?;
-            let tool_msg = Message::tool(&msg, tool_call.id.clone());
+            let tool_msg = Message::tool(&msg, tool_call.id.clone(), false);
             self.messages.push(tool_msg.clone());
             send_event(events, AgentEvent::MessageLogged(tool_msg))?;
             return Ok(true);
@@ -786,7 +786,7 @@ impl Agent {
         // Truncate before storing in context to avoid blowing the window.
         // The full output was already sent to the UI above.
         let context_result = truncate_tool_output(&result);
-        let tool_msg = Message::tool(&context_result, tool_call.id.clone());
+        let tool_msg = Message::tool(&context_result, tool_call.id.clone(), success);
         self.messages.push(tool_msg.clone());
         send_event(events, AgentEvent::MessageLogged(tool_msg))?;
 
