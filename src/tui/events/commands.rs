@@ -5,6 +5,7 @@ use crate::commands::SlashCommand;
 use crate::llama_server::ModelSource;
 
 use super::super::app::{AgentInput, App, ChatMessage, ContextInfoData, PendingServerStart, StatsInfoData};
+use super::super::picker::{Picker, PickerItem, PickerKind};
 use super::super::render::{format_number, pick_verb};
 
 pub(super) fn handle_command(
@@ -224,13 +225,18 @@ pub(super) fn handle_command(
                     app.messages.push(ChatMessage::Info("No previous sessions found.".into()));
                 }
                 Ok(sessions) => {
-                    let mut info = String::from("Recent sessions:\n");
-                    for (i, id) in sessions.iter().enumerate() {
-                        let current = if id == session.id() { " (current)" } else { "" };
-                        info.push_str(&format!("  {}. {}{}\n", i + 1, id, current));
-                    }
-                    info.push_str("\nUse --resume <id> to resume a session.");
-                    app.messages.push(ChatMessage::Info(info));
+                    let items: Vec<PickerItem> = sessions
+                        .iter()
+                        .map(|id| PickerItem {
+                            label: id.clone(),
+                            hint: if id == session.id() {
+                                "(current)".into()
+                            } else {
+                                String::new()
+                            },
+                        })
+                        .collect();
+                    app.picker = Some(Picker::new("Resume Session", items, PickerKind::Resume));
                 }
                 Err(e) => {
                     app.messages.push(ChatMessage::Error(format!(

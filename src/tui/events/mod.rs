@@ -11,7 +11,8 @@ use crate::llama_server::{self, LlamaCppBackend, LlamaServer, ModelSource};
 use crate::ollama::OllamaBackend;
 use crate::session::Session;
 
-use super::app::{AgentInput, App, ChatMessage, PendingServerStart};
+use super::app::{AgentInput, App, ChatMessage, PendingServerStart, messages_to_chat_messages};
+use super::picker::{PickerKind, PickerResult};
 use super::render::format_number;
 
 pub(super) use agent_events::handle_agent_event;
@@ -25,7 +26,7 @@ pub(super) fn handle_terminal_event(
     session: &Session,
 ) {
     if let Event::Paste(text) = evt {
-        if !app.is_processing && app.pending_confirm.is_none() && app.model_choices.is_none() {
+        if !app.is_processing && app.pending_confirm.is_none() && app.picker.is_none() {
             app.input.insert_str(app.cursor_pos, &text);
             app.cursor_pos += text.len();
         }
@@ -37,6 +38,10 @@ pub(super) fn handle_terminal_event(
             if app.pending_confirm.is_some() {
                 app.pending_confirm = None;
                 let _ = confirm_tx.send(false);
+                return;
+            }
+            if app.picker.is_some() {
+                app.dismiss_picker();
                 return;
             }
             if app.input.is_empty() {
@@ -57,6 +62,12 @@ pub(super) fn handle_terminal_event(
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             app.tools_expanded = !app.tools_expanded;
             app.needs_clear = true;
+            return;
+        }
+
+        // Picker mode — delegate all keys to the picker (except Ctrl combos above)
+        if app.picker.is_some() {
+            handle_picker_key(key, app, input_tx, session);
             return;
         }
 
@@ -82,12 +93,6 @@ pub(super) fn handle_terminal_event(
             return;
         }
 
-        // Model selection mode
-        if app.model_choices.is_some() {
-            handle_model_selection(key, app, input_tx);
-            return;
-        }
-
         handle_normal_input(key, app, input_tx, model_tx, session);
     }
 }
@@ -110,75 +115,93 @@ fn handle_confirm_keys(
     }
 }
 
-fn handle_model_selection(
+fn handle_picker_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
     input_tx: &mpsc::UnboundedSender<AgentInput>,
+    session: &Session,
 ) {
-    match key.code {
-        KeyCode::Esc => {
-            app.dismiss_model_chooser();
-            app.messages.push(ChatMessage::Info("Model selection cancelled.".into()));
+    let result = app.picker.as_mut().unwrap().handle_key(key);
+
+    match result {
+        PickerResult::Cancelled => {
+            app.dismiss_picker();
         }
-        KeyCode::Enter => {
-            if let Some((model_name, ctx_override)) = resolve_model_input(app) {
-                let ctx = ctx_override.unwrap_or(app.context_size);
-                if model_name.contains('/') {
-                    if app.config.llama_server_url.is_some() {
-                        app.messages.push(ChatMessage::Error(
-                            "Cannot start a local llama-server while connected to a remote server. \
-                             Change the model on the remote server directly.".into(),
-                        ));
-                        app.dismiss_model_chooser();
-                    } else {
-                        start_hf_model(app, model_name, ctx);
-                    }
-                } else {
-                    switch_ollama_model(app, model_name, ctx, input_tx);
-                }
+        PickerResult::Active => {}
+        PickerResult::Selected(idx) => {
+            let picker = app.picker.as_ref().unwrap();
+            let label = picker.item_label(idx).to_string();
+            let is_model = matches!(picker.kind, PickerKind::Model);
+            app.dismiss_picker();
+
+            if is_model {
+                handle_model_picked(app, label, input_tx);
+            } else {
+                handle_resume_picked(app, &label, input_tx, session);
             }
         }
-        KeyCode::Char(c) => {
-            app.input.insert(app.cursor_pos, c);
-            app.cursor_pos += c.len_utf8();
+        PickerResult::FreeText(text) => {
+            let is_model = matches!(app.picker.as_ref().unwrap().kind, PickerKind::Model);
+            app.dismiss_picker();
+            if is_model {
+                handle_model_picked(app, text, input_tx);
+            }
         }
-        KeyCode::Backspace => {
-            app.backspace();
-        }
-        _ => {}
     }
 }
 
-/// Parse the model chooser input into a (model_name, optional_context_size).
-/// Returns `None` (and shows an error) if the input is invalid.
-fn resolve_model_input(app: &mut App) -> Option<(String, Option<u64>)> {
-    let raw = app.input.trim().to_string();
-    let parts: Vec<&str> = raw.split_whitespace().collect();
-    let choice = parts.first().and_then(|s| s.parse::<usize>().ok());
-    let ctx_override = parts.get(1).and_then(|s| s.parse::<u64>().ok());
-
-    let model_name = if let Some(num) = choice {
-        let models = app.model_choices.as_ref().unwrap();
-        if num >= 1 && num <= models.len() {
-            Some(models[num - 1].clone())
+fn handle_model_picked(
+    app: &mut App,
+    model_name: String,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+) {
+    let ctx = app.context_size;
+    if model_name.contains('/') {
+        if app.config.llama_server_url.is_some() {
+            app.messages.push(ChatMessage::Error(
+                "Cannot start a local llama-server while connected to a remote server. \
+                 Change the model on the remote server directly."
+                    .into(),
+            ));
         } else {
-            app.messages.push(ChatMessage::Info(format!("Invalid selection: {}", num)));
-            app.dismiss_model_chooser();
-            None
+            start_hf_model(app, model_name, ctx);
         }
-    } else if raw.contains('/') {
-        Some(raw.clone())
-    } else if !raw.is_empty() {
-        app.messages.push(ChatMessage::Info(
-            "Enter a number to select, or a HuggingFace repo (org/model).".into(),
-        ));
-        app.dismiss_model_chooser();
-        None
     } else {
-        None
-    };
+        switch_ollama_model(app, model_name, ctx, input_tx);
+    }
+}
 
-    model_name.map(|name| (name, ctx_override))
+fn handle_resume_picked(
+    app: &mut App,
+    session_id: &str,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+    session: &Session,
+) {
+    if session_id == session.id() {
+        app.messages
+            .push(ChatMessage::Info("Already in this session.".into()));
+        return;
+    }
+
+    match Session::load_messages(session_id) {
+        Ok(msgs) => {
+            app.reset_conversation(input_tx, &format!("Resumed session {}.", session_id));
+            let chat_messages = messages_to_chat_messages(&msgs);
+            // Insert loaded messages before the "Resumed" info message
+            let info_msg = app.messages.pop();
+            app.messages = chat_messages;
+            if let Some(info) = info_msg {
+                app.messages.push(info);
+            }
+            let _ = input_tx.send(AgentInput::RestoreMessages(msgs));
+        }
+        Err(e) => {
+            app.messages.push(ChatMessage::Error(format!(
+                "Failed to load session: {}",
+                e
+            )));
+        }
+    }
 }
 
 /// Start a HuggingFace model via llama-server.
@@ -190,7 +213,6 @@ fn start_hf_model(app: &mut App, hf_repo: String, ctx: u64) {
         app.messages.push(ChatMessage::Info(format!(
             "Starting llama-server for {}...", hf_repo
         )));
-        app.dismiss_model_chooser();
         app.begin_processing("Starting server".to_string());
 
         app.server.pending_server_start = Some(PendingServerStart {
@@ -211,7 +233,6 @@ fn start_hf_model(app: &mut App, hf_repo: String, ctx: u64) {
         app.messages.push(ChatMessage::Error(
             "Set llama_server_path in ~/.config/ollama-code/config.toml to use HuggingFace models.".into(),
         ));
-        app.dismiss_model_chooser();
     }
 }
 
@@ -226,7 +247,6 @@ fn switch_ollama_model(
         app.messages.push(ChatMessage::Info(format!(
             "Already using {} (context: {}).", model_name, format_number(ctx)
         )));
-        app.dismiss_model_chooser();
         return;
     }
 
@@ -260,7 +280,6 @@ fn switch_ollama_model(
         )));
     }
     app.config = config;
-    app.dismiss_model_chooser();
 }
 
 fn handle_normal_input(

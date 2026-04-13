@@ -1,6 +1,7 @@
 mod app;
 mod events;
 mod markdown;
+pub(crate) mod picker;
 pub(crate) mod render;
 mod syntax;
 
@@ -34,58 +35,57 @@ pub struct InitialServerStart {
     pub model_source: ModelSource,
 }
 
-/// Handle model list results from Ollama.
+/// Handle model list results from Ollama — open a picker with the available models.
 fn handle_model_list_result(app: &mut App, result: Result<Vec<String>>) {
-    let was_at_bottom = app.is_at_bottom();
+    use picker::{Picker, PickerItem, PickerKind};
+
     let recent_hf = app.config.recent_hf_models.clone().unwrap_or_default();
+    let current = app.model.clone();
+
+    let build_items = |models: Vec<String>| -> Vec<PickerItem> {
+        models
+            .into_iter()
+            .map(|name| {
+                let hint = if name == current {
+                    "(current)".to_string()
+                } else {
+                    String::new()
+                };
+                PickerItem { label: name, hint }
+            })
+            .collect()
+    };
 
     match result {
-        Ok(models) if models.is_empty() => {
-            let mut info = String::from("No Ollama models found.\n");
-            if recent_hf.is_empty() {
-                info.push_str("\nEnter a HuggingFace repo to use llama.cpp\n");
-                info.push_str("(e.g. \"bartowski/Qwen2.5-Coder-7B-Instruct-GGUF\").\n");
-            } else {
-                info.push_str("\nRecent HuggingFace models:\n");
-                info.push_str(&format_model_list(&recent_hf, &app.model, 0));
-                info.push_str("\nType a number to select, or enter a new HuggingFace repo\n");
-            }
-            info.push_str("Esc to cancel.");
-            app.messages.push(ChatMessage::Info(info));
-            app.model_choices = Some(recent_hf);
+        Ok(models) if models.is_empty() && recent_hf.is_empty() => {
+            app.messages.push(ChatMessage::Info(
+                "No Ollama models found. Type a HuggingFace repo in the picker filter \
+                 (e.g. \"bartowski/Qwen2.5-Coder-7B-Instruct-GGUF\")."
+                    .into(),
+            ));
+            app.picker = Some(Picker::new("Select Model", Vec::new(), PickerKind::Model));
         }
         Ok(models) => {
-            let mut info = String::from("Available models (Ollama):\n");
-            info.push_str(&format_model_list(&models, &app.model, 0));
-            let ollama_count = models.len();
-            if !recent_hf.is_empty() {
-                info.push_str("\nRecent HuggingFace models:\n");
-                info.push_str(&format_model_list(&recent_hf, &app.model, ollama_count));
-            }
-            info.push_str("\nType a number to select, or enter a HuggingFace repo for llama.cpp\n");
-            info.push_str("(e.g. \"bartowski/Qwen2.5-Coder-7B-Instruct-GGUF\").\nEsc to cancel.");
-            app.messages.push(ChatMessage::Info(info));
-            let mut all_models = models;
-            all_models.extend(recent_hf);
-            app.model_choices = Some(all_models);
+            let mut all = models;
+            all.extend(recent_hf);
+            let items = build_items(all);
+            app.picker = Some(Picker::new("Select Model", items, PickerKind::Model));
         }
         Err(e) => {
-            let mut info = format!("Could not reach Ollama: {}\n", e);
-            if !recent_hf.is_empty() {
-                info.push_str("\nRecent HuggingFace models:\n");
-                info.push_str(&format_model_list(&recent_hf, &app.model, 0));
-                info.push_str("\nType a number to select, or enter a new HuggingFace repo\n");
-            } else {
-                info.push_str("\nEnter a HuggingFace repo to use llama.cpp\n");
-                info.push_str("(e.g. \"bartowski/Qwen2.5-Coder-7B-Instruct-GGUF\").\n");
+            if recent_hf.is_empty() {
+                app.messages.push(ChatMessage::Error(format!(
+                    "Could not reach Ollama: {}",
+                    e
+                )));
+                return;
             }
-            info.push_str("Esc to cancel.");
-            app.messages.push(ChatMessage::Info(info));
-            app.model_choices = Some(recent_hf);
+            app.messages.push(ChatMessage::Info(format!(
+                "Could not reach Ollama: {}. Showing recent HuggingFace models.",
+                e
+            )));
+            let items = build_items(recent_hf);
+            app.picker = Some(Picker::new("Select Model", items, PickerKind::Model));
         }
-    }
-    if was_at_bottom {
-        app.scroll_offset = 0;
     }
 }
 
@@ -136,16 +136,6 @@ fn handle_backend_ready(
     if was_at_bottom {
         app.scroll_offset = 0;
     }
-}
-
-/// Format a numbered model list with `(current)` marker for the active model.
-fn format_model_list(models: &[String], current: &str, start_index: usize) -> String {
-    let mut s = String::new();
-    for (i, name) in models.iter().enumerate() {
-        let marker = if *name == current { " (current)" } else { "" };
-        s.push_str(&format!("  {}. {}{}\n", start_index + i + 1, name, marker));
-    }
-    s
 }
 
 /// Result type sent over the channel when a new llama-server backend is ready.

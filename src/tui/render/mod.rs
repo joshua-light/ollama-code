@@ -183,6 +183,11 @@ pub(super) fn render(f: &mut Frame, app: &mut App) {
     render_chat(f, app, chunks[1]);
     render_input(f, app, chunks[2]);
     render_status_line(f, app, chunks[3]);
+
+    // Picker overlay (rendered on top of everything)
+    if let Some(ref mut picker) = app.picker {
+        picker.render(f, f.area());
+    }
 }
 
 fn render_header(f: &mut Frame, _app: &App, area: ratatui::layout::Rect) {
@@ -245,7 +250,7 @@ fn render_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         return;
     }
 
-    let prompt = if app.model_choices.is_some() { " # " } else { " ❯ " };
+    let prompt = " ❯ ";
     let content_width = input_content_width(area.width);
     let chars: Vec<char> = app.input.chars().collect();
     let mut lines: Vec<Line> = Vec::new();

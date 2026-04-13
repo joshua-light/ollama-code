@@ -12,6 +12,8 @@ use crate::message::{Message, Role};
 use crate::ollama::OllamaBackend;
 use crate::skills::SkillMeta;
 
+use super::picker::Picker;
+
 pub(crate) enum AgentInput {
     Message(String),
     ClearHistory,
@@ -162,9 +164,9 @@ pub(crate) struct App {
     pub(crate) tools_expanded: bool,
     pub(crate) git_branch: Option<String>,
     pub(crate) git_dirty: bool,
-    // Model selection
+    // Model/session picker
     pub(crate) ollama: OllamaBackend,
-    pub(crate) model_choices: Option<Vec<String>>,
+    pub(crate) picker: Option<Picker>,
     pub(crate) config: Config,
     /// Pending tool confirmation awaiting user response
     pub(crate) pending_confirm: Option<PendingConfirm>,
@@ -203,7 +205,7 @@ impl App {
             git_branch,
             git_dirty,
             ollama,
-            model_choices: None,
+            picker: None,
             config,
             pending_confirm: None,
             auto_approve: false,
@@ -292,10 +294,9 @@ impl App {
         }
     }
 
-    pub(crate) fn dismiss_model_chooser(&mut self) {
-        self.model_choices = None;
-        self.input.clear();
-        self.cursor_pos = 0;
+    pub(crate) fn dismiss_picker(&mut self) {
+        self.picker = None;
+        self.needs_clear = true;
     }
 
     /// Remove the last `n` user turns (user message + all subsequent non-user messages).

@@ -52,38 +52,7 @@ impl Session {
             anyhow::bail!("Session not found: {}", id);
         }
 
-        let messages_path = dir.join("messages.jsonl");
-        let mut messages = Vec::new();
-
-        if messages_path.exists() {
-            let file = File::open(&messages_path)?;
-            let reader = std::io::BufReader::new(file);
-            for (i, line) in reader.lines().enumerate() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!("Warning: could not read line {} of messages.jsonl: {}", i + 1, e);
-                        continue;
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Message>(&line) {
-                    Ok(msg) => messages.push(msg),
-                    Err(e) => {
-                        eprintln!("Warning: could not parse line {} of messages.jsonl: {}", i + 1, e);
-                    }
-                }
-            }
-        }
-
-        // Read trim watermark from metadata (skip previously-trimmed messages)
-        let trim_watermark = read_trim_watermark(&dir);
-        if trim_watermark > 0 && messages.len() > 1 {
-            let skip = trim_watermark.min(messages.len() - 1);
-            messages.drain(1..1 + skip);
-        }
+        let messages = load_session_messages(&dir)?;
 
         let messages_file = OpenOptions::new()
             .create(true)
@@ -95,6 +64,7 @@ impl Session {
             .append(true)
             .open(dir.join("debug.log"))?;
 
+        let trim_watermark = read_trim_watermark(&dir);
         let mut session = Self {
             dir,
             messages_file,
@@ -104,6 +74,19 @@ impl Session {
 
         session.log_debug("SESSION_RESUME");
         Ok((session, messages))
+    }
+
+    /// Load messages from a session by ID without opening file handles.
+    /// Used for in-TUI resume where we don't need to switch session ownership.
+    pub fn load_messages(id: &str) -> anyhow::Result<Vec<Message>> {
+        let base = config::data_dir().join("sessions");
+        let dir = base.join(id);
+
+        if !dir.exists() {
+            anyhow::bail!("Session not found: {}", id);
+        }
+
+        load_session_messages(&dir)
     }
 
     /// List recent session IDs, sorted most-recent first.
@@ -317,6 +300,51 @@ fn epoch_to_utc(epoch_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let y = if mon <= 2 { y + 1 } else { y };
 
     (y, mon, d, h, m, s)
+}
+
+/// Read and parse messages from a session directory, applying the trim watermark.
+fn load_session_messages(dir: &Path) -> anyhow::Result<Vec<Message>> {
+    let messages_path = dir.join("messages.jsonl");
+    let mut messages = Vec::new();
+
+    if messages_path.exists() {
+        let file = File::open(&messages_path)?;
+        let reader = std::io::BufReader::new(file);
+        for (i, line) in reader.lines().enumerate() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not read line {} of messages.jsonl: {}",
+                        i + 1,
+                        e
+                    );
+                    continue;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Message>(&line) {
+                Ok(msg) => messages.push(msg),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not parse line {} of messages.jsonl: {}",
+                        i + 1,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    let trim_watermark = read_trim_watermark(dir);
+    if trim_watermark > 0 && messages.len() > 1 {
+        let skip = trim_watermark.min(messages.len() - 1);
+        messages.drain(1..1 + skip);
+    }
+
+    Ok(messages)
 }
 
 /// Read the trim watermark from a session's meta.json.
