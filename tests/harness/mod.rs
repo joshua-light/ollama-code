@@ -23,6 +23,14 @@ use ollama_code::message::{FunctionCall, Message, ToolCall};
 pub struct MockResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Override prompt_eval_count (default: 100).
+    pub prompt_eval_count: Option<u64>,
+    /// Override eval_count (default: 50).
+    pub eval_count: Option<u64>,
+    /// Simulate an incomplete stream.
+    pub incomplete: bool,
+    /// Simulate repetition detection.
+    pub repetition_detected: bool,
 }
 
 impl MockResponse {
@@ -31,6 +39,10 @@ impl MockResponse {
         Self {
             content: content.into(),
             tool_calls: Vec::new(),
+            prompt_eval_count: None,
+            eval_count: None,
+            incomplete: false,
+            repetition_detected: false,
         }
     }
 
@@ -46,6 +58,10 @@ impl MockResponse {
                     arguments,
                 },
             }],
+            prompt_eval_count: None,
+            eval_count: None,
+            incomplete: false,
+            repetition_detected: false,
         }
     }
 
@@ -64,7 +80,35 @@ impl MockResponse {
                     function: FunctionCall { name, arguments },
                 })
                 .collect(),
+            prompt_eval_count: None,
+            eval_count: None,
+            incomplete: false,
+            repetition_detected: false,
         }
+    }
+
+    /// Override the prompt_eval_count for this response.
+    pub fn with_prompt_eval_count(mut self, count: u64) -> Self {
+        self.prompt_eval_count = Some(count);
+        self
+    }
+
+    /// Override the eval_count for this response.
+    pub fn with_eval_count(mut self, count: u64) -> Self {
+        self.eval_count = Some(count);
+        self
+    }
+
+    /// Mark this response as an incomplete stream.
+    pub fn with_incomplete(mut self) -> Self {
+        self.incomplete = true;
+        self
+    }
+
+    /// Mark this response as having repetition detected.
+    pub fn with_repetition(mut self) -> Self {
+        self.repetition_detected = true;
+        self
     }
 }
 
@@ -79,6 +123,22 @@ pub struct CapturedCall {
     pub messages: Vec<Message>,
     pub tools: Option<Vec<Value>>,
     pub num_ctx: Option<u64>,
+}
+
+impl CapturedCall {
+    /// Extract tool names from the tools JSON sent to the backend.
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.tools.as_ref().map_or(Vec::new(), |tools| {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                })
+                .collect()
+        })
+    }
 }
 
 /// Mock implementation of `ModelBackend` that returns scripted responses.
@@ -137,15 +197,15 @@ impl ModelBackend for MockBackend {
             Ok(ChatResponse {
                 content: response.content,
                 tool_calls: response.tool_calls,
-                prompt_eval_count: 100,
+                prompt_eval_count: response.prompt_eval_count.unwrap_or(100),
                 prompt_eval_duration: 1_000_000,
-                eval_count: 50,
+                eval_count: response.eval_count.unwrap_or(50),
                 eval_duration: 1_000_000,
                 load_duration: 0,
                 total_duration: 2_000_000,
-                incomplete: false,
+                incomplete: response.incomplete,
                 tool_calls_from_content: false,
-                repetition_detected: false,
+                repetition_detected: response.repetition_detected,
             })
         })
     }

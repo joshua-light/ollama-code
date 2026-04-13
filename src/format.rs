@@ -92,3 +92,191 @@ pub fn format_tool_args_display(name: &str, args: &serde_json::Value) -> String 
         _ => args.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── capitalize_first ────────────────────────────────────────────
+
+    #[test]
+    fn capitalize_first_normal() {
+        assert_eq!(capitalize_first("hello"), "Hello");
+    }
+
+    #[test]
+    fn capitalize_first_empty() {
+        assert_eq!(capitalize_first(""), "");
+    }
+
+    #[test]
+    fn capitalize_first_already_upper() {
+        assert_eq!(capitalize_first("Hello"), "Hello");
+    }
+
+    #[test]
+    fn capitalize_first_single_char() {
+        assert_eq!(capitalize_first("a"), "A");
+    }
+
+    #[test]
+    fn capitalize_first_unicode() {
+        assert_eq!(capitalize_first("über"), "Über");
+    }
+
+    // ── truncate_args ───────────────────────────────────────────────
+
+    #[test]
+    fn truncate_args_short() {
+        assert_eq!(truncate_args("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_args_exact() {
+        assert_eq!(truncate_args("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_args_over() {
+        assert_eq!(truncate_args("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn truncate_args_empty() {
+        assert_eq!(truncate_args("", 5), "");
+    }
+
+    #[test]
+    fn truncate_args_multibyte() {
+        // Should not panic or split codepoints
+        let s = "こんにちは世界";
+        let result = truncate_args(s, 3);
+        assert_eq!(result, "こんに...");
+    }
+
+    // ── format_tool_output ──────────────────────────────────────────
+
+    #[test]
+    fn format_tool_output_single_line() {
+        let result = format_tool_output("hello");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "   ⎿  hello");
+    }
+
+    #[test]
+    fn format_tool_output_few_lines() {
+        let input = "line1\nline2\nline3";
+        let result = format_tool_output(input);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], "   ⎿  line1");
+        assert_eq!(result[1], "      line2");
+        assert_eq!(result[2], "      line3");
+    }
+
+    #[test]
+    fn format_tool_output_truncated() {
+        let lines: Vec<String> = (0..50).map(|i| format!("line {}", i)).collect();
+        let input = lines.join("\n");
+        let result = format_tool_output(&input);
+        assert_eq!(result.len(), 31); // 30 kept + 1 truncation notice
+        assert!(result.last().unwrap().contains("20 more lines"));
+    }
+
+    #[test]
+    fn format_tool_output_empty() {
+        let result = format_tool_output("");
+        // "".lines() yields nothing in Rust
+        assert!(result.is_empty());
+    }
+
+    // ── format_tool_error ───────────────────────────────────────────
+
+    #[test]
+    fn format_tool_error_trims() {
+        assert_eq!(format_tool_error("  oops  "), "   ⎿  oops");
+    }
+
+    // ── format_tool_args_display ────────────────────────────────────
+
+    #[test]
+    fn display_bash() {
+        let args = json!({"command": "ls -la"});
+        assert_eq!(format_tool_args_display("bash", &args), "ls -la");
+    }
+
+    #[test]
+    fn display_bash_missing_command() {
+        let args = json!({});
+        assert_eq!(format_tool_args_display("bash", &args), "");
+    }
+
+    #[test]
+    fn display_read_simple() {
+        let args = json!({"file_path": "/tmp/foo.rs"});
+        assert_eq!(format_tool_args_display("read", &args), "/tmp/foo.rs");
+    }
+
+    #[test]
+    fn display_read_with_offset_and_limit() {
+        let args = json!({"file_path": "/tmp/foo.rs", "offset": 10, "limit": 20});
+        assert_eq!(
+            format_tool_args_display("read", &args),
+            "/tmp/foo.rs, offset=10, limit=20"
+        );
+    }
+
+    #[test]
+    fn display_read_with_offset_only() {
+        let args = json!({"file_path": "/tmp/foo.rs", "offset": 10});
+        assert_eq!(
+            format_tool_args_display("read", &args),
+            "/tmp/foo.rs, offset=10"
+        );
+    }
+
+    #[test]
+    fn display_edit() {
+        let args = json!({"file_path": "/tmp/foo.rs", "old_string": "a", "new_string": "b"});
+        assert_eq!(format_tool_args_display("edit", &args), "/tmp/foo.rs");
+    }
+
+    #[test]
+    fn display_write() {
+        let args = json!({"file_path": "/tmp/new.rs", "content": "fn main() {}"});
+        assert_eq!(format_tool_args_display("write", &args), "/tmp/new.rs");
+    }
+
+    #[test]
+    fn display_subagent() {
+        let args = json!({"task": "find all TODOs"});
+        assert_eq!(format_tool_args_display("subagent", &args), "find all TODOs");
+    }
+
+    #[test]
+    fn display_glob_with_path() {
+        let args = json!({"pattern": "**/*.rs", "path": "/src"});
+        assert_eq!(format_tool_args_display("glob", &args), "**/*.rs in /src");
+    }
+
+    #[test]
+    fn display_glob_without_path() {
+        let args = json!({"pattern": "**/*.rs"});
+        assert_eq!(format_tool_args_display("glob", &args), "**/*.rs");
+    }
+
+    #[test]
+    fn display_grep_with_path() {
+        let args = json!({"pattern": "TODO", "path": "/src"});
+        assert_eq!(format_tool_args_display("grep", &args), "TODO in /src");
+    }
+
+    #[test]
+    fn display_unknown_tool() {
+        let args = json!({"key": "value"});
+        assert_eq!(
+            format_tool_args_display("custom_tool", &args),
+            args.to_string()
+        );
+    }
+}

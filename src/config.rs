@@ -350,3 +350,309 @@ impl Config {
         self.recent_hf_models = Some(list);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── merge ───────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_hi_wins_over_lo() {
+        let hi = Config {
+            model: Some("hi-model".into()),
+            context_size: Some(16384),
+            bash_timeout: Some(60),
+            ..Default::default()
+        };
+        let lo = Config {
+            model: Some("lo-model".into()),
+            context_size: Some(8192),
+            bash_timeout: Some(30),
+            ..Default::default()
+        };
+        let merged = hi.merge(&lo);
+        assert_eq!(merged.model.as_deref(), Some("hi-model"));
+        assert_eq!(merged.context_size, Some(16384));
+        assert_eq!(merged.bash_timeout, Some(60));
+    }
+
+    #[test]
+    fn merge_lo_fills_gaps() {
+        let hi = Config {
+            model: Some("hi-model".into()),
+            ..Default::default()
+        };
+        let lo = Config {
+            context_size: Some(8192),
+            bash_timeout: Some(30),
+            ..Default::default()
+        };
+        let merged = hi.merge(&lo);
+        assert_eq!(merged.model.as_deref(), Some("hi-model"));
+        assert_eq!(merged.context_size, Some(8192));
+        assert_eq!(merged.bash_timeout, Some(30));
+    }
+
+    #[test]
+    fn merge_both_none() {
+        let hi = Config::default();
+        let lo = Config::default();
+        let merged = hi.merge(&lo);
+        assert!(merged.model.is_none());
+        assert!(merged.context_size.is_none());
+    }
+
+    #[test]
+    fn merge_recent_hf_models_from_lo_only() {
+        let hi = Config {
+            recent_hf_models: Some(vec!["hi-repo".into()]),
+            ..Default::default()
+        };
+        let lo = Config {
+            recent_hf_models: Some(vec!["lo-repo".into()]),
+            ..Default::default()
+        };
+        let merged = hi.merge(&lo);
+        // User-scope only: always from lo
+        assert_eq!(merged.recent_hf_models, Some(vec!["lo-repo".to_string()]));
+    }
+
+    #[test]
+    fn merge_plugins_combined() {
+        let mut hi_plugins = HashMap::new();
+        hi_plugins.insert("bash".to_string(), toml::Value::Boolean(false));
+        let mut lo_plugins = HashMap::new();
+        lo_plugins.insert("read".to_string(), toml::Value::Boolean(false));
+        lo_plugins.insert("bash".to_string(), toml::Value::Boolean(true)); // should be overridden
+
+        let hi = Config { plugins: Some(hi_plugins), ..Default::default() };
+        let lo = Config { plugins: Some(lo_plugins), ..Default::default() };
+
+        let merged = hi.merge(&lo);
+        let plugins = merged.plugins.unwrap();
+        // hi's bash=false wins
+        assert_eq!(plugins.get("bash"), Some(&toml::Value::Boolean(false)));
+        // lo's read=false fills the gap
+        assert_eq!(plugins.get("read"), Some(&toml::Value::Boolean(false)));
+    }
+
+    // ── is_tool_enabled / is_hook_enabled ───────────────────────────
+
+    #[test]
+    fn tool_enabled_by_default() {
+        let cfg = Config::default();
+        assert!(cfg.is_tool_enabled("bash"));
+        assert!(cfg.is_tool_enabled("anything"));
+    }
+
+    #[test]
+    fn tool_disabled_explicit_false() {
+        let mut plugins = HashMap::new();
+        plugins.insert("bash".to_string(), toml::Value::Boolean(false));
+        let cfg = Config { plugins: Some(plugins), ..Default::default() };
+        assert!(!cfg.is_tool_enabled("bash"));
+        assert!(cfg.is_tool_enabled("read")); // other tools unaffected
+    }
+
+    #[test]
+    fn tool_enabled_explicit_true() {
+        let mut plugins = HashMap::new();
+        plugins.insert("bash".to_string(), toml::Value::Boolean(true));
+        let cfg = Config { plugins: Some(plugins), ..Default::default() };
+        assert!(cfg.is_tool_enabled("bash"));
+    }
+
+    #[test]
+    fn tool_enabled_table_value() {
+        // A table value (plugin config) means enabled
+        let mut plugins = HashMap::new();
+        let mut table = toml::map::Map::new();
+        table.insert("key".to_string(), toml::Value::String("value".into()));
+        plugins.insert("my-plugin".to_string(), toml::Value::Table(table));
+        let cfg = Config { plugins: Some(plugins), ..Default::default() };
+        assert!(cfg.is_tool_enabled("my-plugin"));
+    }
+
+    #[test]
+    fn hook_enabled_by_default() {
+        let cfg = Config::default();
+        assert!(cfg.is_hook_enabled("any-hook"));
+    }
+
+    #[test]
+    fn hook_disabled_explicit_false() {
+        let mut hooks = HashMap::new();
+        hooks.insert("deny-rm".to_string(), toml::Value::Boolean(false));
+        let cfg = Config { hooks: Some(hooks), ..Default::default() };
+        assert!(!cfg.is_hook_enabled("deny-rm"));
+    }
+
+    // ── plugin_config / hook_config ─────────────────────────────────
+
+    #[test]
+    fn plugin_config_returns_table() {
+        let mut plugins = HashMap::new();
+        let mut table = toml::map::Map::new();
+        table.insert("api_key".to_string(), toml::Value::String("secret".into()));
+        plugins.insert("my-plugin".to_string(), toml::Value::Table(table));
+        let cfg = Config { plugins: Some(plugins), ..Default::default() };
+
+        let pc = cfg.plugin_config("my-plugin").unwrap();
+        assert_eq!(pc.get("api_key").unwrap().as_str(), Some("secret"));
+    }
+
+    #[test]
+    fn plugin_config_returns_none_for_bool() {
+        let mut plugins = HashMap::new();
+        plugins.insert("bash".to_string(), toml::Value::Boolean(true));
+        let cfg = Config { plugins: Some(plugins), ..Default::default() };
+        assert!(cfg.plugin_config("bash").is_none());
+    }
+
+    #[test]
+    fn plugin_config_returns_none_for_missing() {
+        let cfg = Config::default();
+        assert!(cfg.plugin_config("nonexistent").is_none());
+    }
+
+    // ── effective_* helpers ──────────────────────────────────────────
+
+    #[test]
+    fn effective_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.effective_trim_threshold(), DEFAULT_TRIM_THRESHOLD_PCT);
+        assert_eq!(cfg.effective_trim_target(), DEFAULT_TRIM_TARGET_PCT);
+        assert_eq!(cfg.effective_subagent_max_turns(), DEFAULT_SUBAGENT_MAX_TURNS);
+        assert_eq!(cfg.effective_reinjection_interval(), DEFAULT_REINJECTION_INTERVAL);
+        assert_eq!(cfg.bash_timeout_duration(), std::time::Duration::from_secs(DEFAULT_BASH_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn effective_custom_values() {
+        let cfg = Config {
+            trim_threshold: Some(90),
+            trim_target: Some(50),
+            subagent_max_turns: Some(5),
+            reinjection_interval: Some(10),
+            bash_timeout: Some(300),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_trim_threshold(), 90);
+        assert_eq!(cfg.effective_trim_target(), 50);
+        assert_eq!(cfg.effective_subagent_max_turns(), 5);
+        assert_eq!(cfg.effective_reinjection_interval(), 10);
+        assert_eq!(cfg.bash_timeout_duration(), std::time::Duration::from_secs(300));
+    }
+
+    // ── add_recent_hf_model ─────────────────────────────────────────
+
+    #[test]
+    fn add_recent_hf_model_fresh() {
+        let mut cfg = Config::default();
+        cfg.add_recent_hf_model("org/model-a");
+        assert_eq!(cfg.recent_hf_models, Some(vec!["org/model-a".to_string()]));
+    }
+
+    #[test]
+    fn add_recent_hf_model_dedupes_and_promotes() {
+        let mut cfg = Config {
+            recent_hf_models: Some(vec!["a".into(), "b".into(), "c".into()]),
+            ..Default::default()
+        };
+        cfg.add_recent_hf_model("b");
+        let list = cfg.recent_hf_models.unwrap();
+        assert_eq!(list[0], "b"); // promoted to front
+        assert_eq!(list.len(), 3); // no duplicates
+    }
+
+    #[test]
+    fn add_recent_hf_model_truncates_at_10() {
+        let mut cfg = Config {
+            recent_hf_models: Some((0..10).map(|i| format!("model-{}", i)).collect()),
+            ..Default::default()
+        };
+        cfg.add_recent_hf_model("new-model");
+        let list = cfg.recent_hf_models.unwrap();
+        assert_eq!(list.len(), 10);
+        assert_eq!(list[0], "new-model");
+    }
+
+    // ── TOML parsing ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_minimal_toml() {
+        let toml_str = r#"model = "qwen2.5-coder:7b""#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.model.as_deref(), Some("qwen2.5-coder:7b"));
+        assert!(cfg.context_size.is_none());
+    }
+
+    #[test]
+    fn parse_full_toml() {
+        let toml_str = r#"
+model = "llama3"
+context_size = 16384
+backend = "ollama"
+bash_timeout = 60
+no_confirm = true
+temperature = 0.2
+top_p = 0.9
+top_k = 40
+tool_scoping = true
+task_reinjection = true
+reinjection_interval = 5
+trim_threshold = 90
+trim_target = 50
+
+[plugins]
+bash = false
+
+[mcp_servers.test]
+command = "echo"
+args = ["hello"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.model.as_deref(), Some("llama3"));
+        assert_eq!(cfg.context_size, Some(16384));
+        assert_eq!(cfg.bash_timeout, Some(60));
+        assert_eq!(cfg.no_confirm, Some(true));
+        assert_eq!(cfg.temperature, Some(0.2));
+        assert_eq!(cfg.top_p, Some(0.9));
+        assert_eq!(cfg.top_k, Some(40));
+        assert_eq!(cfg.tool_scoping, Some(true));
+        assert_eq!(cfg.task_reinjection, Some(true));
+        assert_eq!(cfg.trim_threshold, Some(90));
+        assert!(!cfg.is_tool_enabled("bash"));
+    }
+
+    #[test]
+    fn parse_empty_toml() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.model.is_none());
+        assert!(cfg.plugins.is_none());
+    }
+
+    // ── find_project_config ─────────────────────────────────────────
+
+    #[test]
+    fn find_project_config_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".ollama-code.toml");
+        std::fs::write(&config_path, "model = \"test\"").unwrap();
+
+        let child = dir.path().join("subdir");
+        std::fs::create_dir(&child).unwrap();
+
+        // Search from child should find it in parent
+        let found = find_project_config(&child);
+        assert_eq!(found, Some(config_path));
+    }
+
+    #[test]
+    fn find_project_config_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let found = find_project_config(dir.path());
+        assert!(found.is_none());
+    }
+}
