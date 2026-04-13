@@ -1,5 +1,5 @@
 ---
-name: "config"
+name: "self-modify"
 description: "View and modify ollama-code settings, features, and customization"
 ---
 
@@ -82,6 +82,92 @@ The agent has these built-in tools:
 - `subagent(task)` — Spawn a sub-agent with fresh context for focused tasks
 
 Tools that modify state (`bash`, `edit`, `write`, `subagent`) require user confirmation unless bypass mode is on.
+
+## Hooks
+
+Hooks are external scripts that run at specific lifecycle events in the agent loop. They can inspect, modify, or block tool calls and agent responses.
+
+### Hook Files
+
+- **User hooks**: `~/.config/ollama-code/hooks.toml`
+- **Project hooks**: `.agents/hooks.toml` (searched walking up from cwd)
+
+Project hooks override user hooks with the same name.
+
+### Hook Entry Format
+
+Each top-level key in `hooks.toml` is a named hook:
+
+```toml
+[block-dangerous-commands]
+event = "pre_tool_execute"          # Required: lifecycle event
+command = "./check.sh"              # Required: script to run (relative to hooks.toml dir)
+tools = ["bash|shell_exec"]         # Optional: regex patterns for tool names (anchored)
+if_args = "rm -rf"                  # Optional: regex searched against argument string values
+timeout = 30                        # Optional: seconds (default: 30)
+fail_closed = false                 # Optional: if true, hook errors = deny (default: false/fail-open)
+priority = 50                       # Optional: execution order, lower = first (default: 50)
+```
+
+### Events
+
+| Event | When | Hook Can |
+|-------|------|----------|
+| `pre_tool_execute` | Before a tool runs | Deny, modify arguments, or proceed |
+| `post_tool_execute` | After a tool completes | Modify output/success flag |
+| `agent_start` | Before the agent processes user input | Inject extra system context |
+| `agent_done` | After the agent produces a final response | Rewrite the response |
+
+### Tool Matching (`tools` field)
+
+Each entry in the `tools` array is an anchored regex pattern (`^pattern$`):
+
+- `"bash"` — exact match (backward compatible)
+- `"file_.*"` — matches `file_read`, `file_write`, etc.
+- `"bash|write"` — matches either `bash` or `write`
+- `"[a-z]+_file"` — character class matching
+
+If `tools` is omitted, the hook fires for all tools.
+
+### Argument Filtering (`if_args` field)
+
+A regex pattern searched (unanchored) against all string values in the tool arguments JSON. The hook only fires when at least one string value matches. Examples:
+
+- `if_args = "^git push"` — only bash calls where a string arg starts with "git push"
+- `if_args = "\\.rs$"` — only when an arg value ends with ".rs"
+- `if_args = "secret|password"` — when any arg contains "secret" or "password"
+
+If `if_args` is omitted, the hook fires regardless of arguments.
+
+### Hook Input/Output Protocol
+
+**Input**: Hooks receive JSON on stdin:
+```json
+{
+  "hook": "pre_tool_execute",
+  "data": { "tool_name": "bash", "arguments": {"command": "..."} },
+  "config": { "key": "value" }
+}
+```
+
+The `config` field contains per-hook config from `[hooks.<name>]` in `config.toml`.
+
+**Output**: Hooks write JSON to stdout (empty = no-op):
+
+- **pre_tool_execute**: `{"action": "proceed|modify|deny", "arguments": {...}, "message": "..."}`
+- **post_tool_execute**: `{"action": "proceed|modify", "output": "...", "success": true}`
+- **agent_start**: `{"system_context": "extra context to inject"}`
+- **agent_done**: `{"action": "proceed|modify", "response": "rewritten response"}`
+
+### Hook Management in config.toml
+
+```toml
+[hooks]
+my-hook = false              # Disable a hook by name
+
+[hooks.my-hook]
+api_key = "secret123"        # Per-hook config (passed as JSON on stdin)
+```
 
 ## System Prompt
 

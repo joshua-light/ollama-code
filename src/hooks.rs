@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::Result;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -42,8 +43,16 @@ pub struct HookEntry {
     pub event: HookEvent,
     pub command: String,
     /// Only run for specific tools (pre/post_tool_execute only).
+    /// Each entry is treated as an anchored regex pattern (`^pattern$`).
+    /// Plain strings like `"bash"` still work as exact matches.
+    /// Use regex features for flexible matching: `"file_.*"`, `"bash|write_file"`.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
+    /// Regex pattern matched against argument string values.
+    /// If set, the hook only fires when at least one string value in the
+    /// tool arguments matches this pattern (unanchored search).
+    #[serde(default)]
+    pub if_args: Option<String>,
     /// Timeout in seconds (default: 30).
     #[serde(default)]
     pub timeout: Option<u64>,
@@ -53,6 +62,12 @@ pub struct HookEntry {
     /// Priority for ordering (lower = earlier). Default: 50.
     #[serde(default)]
     pub priority: Option<i32>,
+
+    // -- Compiled patterns (populated by `compile_patterns()` after load) --
+    #[serde(skip)]
+    compiled_tools: Vec<Regex>,
+    #[serde(skip)]
+    compiled_if_args: Option<Regex>,
 }
 
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
@@ -71,11 +86,40 @@ impl HookEntry {
         self.priority.unwrap_or(DEFAULT_HOOK_PRIORITY)
     }
 
+    /// Compile `tools` and `if_args` patterns into cached regexes.
+    /// Called once after deserialization so matching is allocation-free.
+    fn compile_patterns(&mut self) {
+        if let Some(tools) = &self.tools {
+            self.compiled_tools = tools
+                .iter()
+                .map(|pattern| {
+                    let anchored = format!("^(?:{})$", pattern);
+                    Regex::new(&anchored).unwrap_or_else(|_| {
+                        // Bad regex — fall back to literal match
+                        Regex::new(&format!("^{}$", regex::escape(pattern))).unwrap()
+                    })
+                })
+                .collect();
+        }
+        if let Some(pattern) = &self.if_args {
+            self.compiled_if_args = Regex::new(pattern).ok();
+        }
+    }
+
     /// Check whether this hook should fire for the given tool name.
     fn matches_tool(&self, tool_name: &str) -> bool {
         match &self.tools {
             None => true,
-            Some(tools) => tools.iter().any(|t| t == tool_name),
+            Some(_) => self.compiled_tools.iter().any(|re| re.is_match(tool_name)),
+        }
+    }
+
+    /// Check whether the tool arguments match the `if_args` pattern.
+    /// Returns `true` if `if_args` is not set.
+    fn matches_args(&self, arguments: &Value) -> bool {
+        match &self.compiled_if_args {
+            None => self.if_args.is_none(),
+            Some(re) => any_string_matches(arguments, re),
         }
     }
 }
@@ -167,7 +211,8 @@ fn load_hooks_file(path: &Path) -> Vec<(String, HookEntry)> {
 
     let mut hooks = Vec::new();
     for (name, value) in table {
-        if let Ok(entry) = value.try_into::<HookEntry>() {
+        if let Ok(mut entry) = value.try_into::<HookEntry>() {
+            entry.compile_patterns();
             hooks.push((name, entry));
         }
     }
@@ -203,6 +248,16 @@ fn find_project_hooks(cwd: &str) -> Option<PathBuf> {
 /// Manages discovered hooks and executes them.
 pub struct HookRunner {
     hooks: Vec<ResolvedHook>,
+}
+
+/// Sort hooks by priority (lower first), then by name.
+fn sort_hooks(hooks: &mut [ResolvedHook]) {
+    hooks.sort_by(|a, b| {
+        a.entry
+            .priority()
+            .cmp(&b.entry.priority())
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 impl HookRunner {
@@ -268,16 +323,31 @@ impl HookRunner {
             hooks_map.into_values().collect()
         };
 
-        // Sort by priority then name
         let mut sorted = hooks;
-        sorted.sort_by(|a, b| {
-            a.entry
-                .priority()
-                .cmp(&b.entry.priority())
-                .then_with(|| a.name.cmp(&b.name))
-        });
-
+        sort_hooks(&mut sorted);
         Self { hooks: sorted }
+    }
+
+    /// Create a hook runner from a specific hooks file, bypassing the
+    /// standard user/project discovery. Useful for testing and for loading
+    /// hooks from non-standard locations.
+    pub fn from_file(path: &Path, config: Option<&crate::config::Config>) -> Self {
+        let base = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let entries = load_hooks_file(path);
+        let mut hooks: Vec<ResolvedHook> = entries
+            .into_iter()
+            .map(|(name, entry)| {
+                let hook_config = config.and_then(|c| c.hook_config(&name)).cloned();
+                ResolvedHook {
+                    name,
+                    entry,
+                    base_dir: base.clone(),
+                    config: hook_config,
+                }
+            })
+            .collect();
+        sort_hooks(&mut hooks);
+        Self { hooks }
     }
 
     /// Create an empty hook runner (no hooks).
@@ -303,6 +373,7 @@ impl HookRunner {
             .iter()
             .filter(|h| h.entry.event == HookEvent::PreToolExecute)
             .filter(|h| h.entry.matches_tool(tool_name))
+            .filter(|h| h.entry.matches_args(arguments))
             .collect();
 
         let mut result = PreToolResult::default();
@@ -361,6 +432,7 @@ impl HookRunner {
             .iter()
             .filter(|h| h.entry.event == HookEvent::PostToolExecute)
             .filter(|h| h.entry.matches_tool(tool_name))
+            .filter(|h| h.entry.matches_args(arguments))
             .collect();
 
         if matching.is_empty() {
@@ -596,6 +668,16 @@ async fn execute_hook(
     })?;
 
     Ok(Some(value))
+}
+
+/// Short-circuit search: returns true as soon as any string value matches `re`.
+fn any_string_matches(value: &Value, re: &Regex) -> bool {
+    match value {
+        Value::String(s) => re.is_match(s),
+        Value::Array(arr) => arr.iter().any(|v| any_string_matches(v, re)),
+        Value::Object(obj) => obj.values().any(|v| any_string_matches(v, re)),
+        _ => false,
+    }
 }
 
 /// Split a command string into program and arguments by whitespace.

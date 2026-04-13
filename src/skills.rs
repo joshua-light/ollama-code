@@ -103,7 +103,7 @@ fn load_skills_from_dir(dir: &Path) -> Vec<SkillMeta> {
 /// Built-in skills that are installed into the user-scoped skills directory
 /// on first run. Each entry is (directory_name, SKILL.md content).
 const DEFAULT_SKILLS: &[(&str, &str)] = &[
-    ("config", include_str!("../skills/config/SKILL.md")),
+    ("self-modify", include_str!("../skills/self-modify/SKILL.md")),
 ];
 
 /// Ensure that built-in default skills exist in the user skills directory.
