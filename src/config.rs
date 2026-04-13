@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONTEXT_SIZE: u64 = 32768;
 pub const DEFAULT_SUBAGENT_MAX_TURNS: u16 = 15;
@@ -73,6 +75,22 @@ pub struct Config {
     /// Enable bypass mode (auto-approve all tool calls) by default.
     #[serde(default)]
     pub bypass: Option<bool>,
+
+    /// Plugin feature flags and configuration.
+    ///
+    /// Boolean values enable/disable tools by name:
+    ///   `bash = false` disables the built-in bash tool.
+    ///
+    /// Table values provide plugin-specific configuration:
+    ///   `[plugins.my-plugin]`
+    ///   `key = "value"`
+    #[serde(default)]
+    pub plugins: Option<HashMap<String, toml::Value>>,
+
+    /// Additional directories to search for plugins (for testing / advanced use).
+    /// Each path is scanned for `*/PLUGIN.toml`.
+    #[serde(default)]
+    pub plugin_dirs: Option<Vec<String>>,
 
     /// Recently used HuggingFace model repos (most recent first, max 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +174,18 @@ impl Config {
             no_confirm: self.no_confirm.or(other.no_confirm),
             verbose: self.verbose.or(other.verbose),
             bypass: self.bypass.or(other.bypass),
+            plugins: match (self.plugins, &other.plugins) {
+                (Some(mut hi), Some(lo)) => {
+                    // Merge: high-priority entries win per-key.
+                    for (k, v) in lo {
+                        hi.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                    Some(hi)
+                }
+                (hi @ Some(_), None) => hi,
+                (None, lo) => lo.clone(),
+            },
+            plugin_dirs: self.plugin_dirs.or_else(|| other.plugin_dirs.clone()),
             // User-scope only: always take from the lower-priority layer (user config).
             recent_hf_models: other.recent_hf_models.clone(),
             project_config_path: None,
@@ -177,6 +207,29 @@ impl Config {
         }
         std::fs::write(&path, toml::to_string_pretty(self)?)?;
         Ok(())
+    }
+
+    /// Check whether a tool/plugin is enabled.
+    ///
+    /// Returns `false` only if `[plugins]` contains an explicit `name = false`.
+    /// Everything else (missing key, `true`, table value) means enabled.
+    pub fn is_tool_enabled(&self, name: &str) -> bool {
+        match &self.plugins {
+            Some(map) => !matches!(map.get(name), Some(toml::Value::Boolean(false))),
+            None => true,
+        }
+    }
+
+    /// Return the plugin-specific config table for `name`, if any.
+    ///
+    /// A `[plugins.<name>]` table in config.toml becomes a `Table` value
+    /// in the plugins map. Returns `None` if the entry is a simple boolean
+    /// or doesn't exist.
+    pub fn plugin_config(&self, name: &str) -> Option<&toml::map::Map<String, toml::Value>> {
+        self.plugins
+            .as_ref()
+            .and_then(|map| map.get(name))
+            .and_then(|v| v.as_table())
     }
 
     /// Add a HuggingFace repo to the recent list (most recent first, max 10).

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -6,7 +7,9 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::backend::ModelBackend;
+use crate::config::Config;
 use crate::message::{self, Message};
+use crate::plugin::{self, ExternalTool};
 use crate::skills::{self, SkillMeta};
 use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SubagentToolDef, WriteTool, ToolRegistry};
 
@@ -127,6 +130,8 @@ pub struct Agent {
     skills_summary_len: usize,
     /// Discovered skills (name + description only; body loaded on activation).
     skills: Vec<SkillMeta>,
+    /// External plugin tool names that require user confirmation.
+    plugin_confirm_tools: HashSet<String>,
 }
 
 impl Agent {
@@ -139,22 +144,55 @@ impl Agent {
         bash_timeout: std::time::Duration,
         subagent_max_turns: u16,
         max_turns: Option<u16>,
+        config: Option<&Config>,
     ) -> Self {
+        let default_config = Config::default();
+        let cfg = config.unwrap_or(&default_config);
+
         let mut tools = ToolRegistry::new();
-        tools.register(Box::new(BashTool));
-        tools.register(Box::new(ReadTool));
-        tools.register(Box::new(EditTool));
-        tools.register(Box::new(WriteTool));
-        tools.register(Box::new(GlobTool));
-        tools.register(Box::new(GrepTool));
         let is_subagent = max_turns.is_some();
+
+        macro_rules! register_if_enabled {
+            ($name:expr, $tool:expr) => {
+                if cfg.is_tool_enabled($name) {
+                    tools.register(Box::new($tool));
+                }
+            };
+        }
+        register_if_enabled!("bash", BashTool);
+        register_if_enabled!("read", ReadTool);
+        register_if_enabled!("edit", EditTool);
+        register_if_enabled!("write", WriteTool);
+        register_if_enabled!("glob", GlobTool);
+        register_if_enabled!("grep", GrepTool);
         if !is_subagent {
-            tools.register(Box::new(SubagentToolDef));
+            register_if_enabled!("subagent", SubagentToolDef);
         }
 
+        let mut plugin_confirm_tools = HashSet::new();
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
+
+        if !is_subagent {
+            let plugin_dirs: Vec<std::path::PathBuf> = cfg.plugin_dirs.as_ref()
+                .map(|dirs| dirs.iter().map(std::path::PathBuf::from).collect())
+                .unwrap_or_default();
+            let discovered = plugin::discover_plugins(&cwd, &plugin_dirs, Some(cfg));
+            for dp in &discovered {
+                for tool_def in &dp.manifest.tools {
+                    if !cfg.is_tool_enabled(&tool_def.name) {
+                        continue;
+                    }
+                    let plugin_cfg = cfg.plugin_config(&dp.manifest.name).cloned();
+                    let ext_tool = ExternalTool::from_plugin(dp, tool_def, plugin_cfg);
+                    if ext_tool.needs_confirm() {
+                        plugin_confirm_tools.insert(tool_def.name.clone());
+                    }
+                    tools.register(Box::new(ext_tool));
+                }
+            }
+        }
 
         let subagent_desc = if is_subagent {
             ""
@@ -218,6 +256,7 @@ impl Agent {
             project_docs_info,
             skills_summary_len,
             skills: discovered_skills,
+            plugin_confirm_tools,
         }
     }
 
@@ -228,7 +267,19 @@ impl Agent {
         bash_timeout: std::time::Duration,
         subagent_max_turns: u16,
     ) -> Self {
-        Self::build(backend, model, context_size, bash_timeout, subagent_max_turns, None)
+        Self::build(backend, model, context_size, bash_timeout, subagent_max_turns, None, None)
+    }
+
+    /// Create an agent with custom config (controls which tools are enabled, etc.).
+    pub fn with_config(
+        backend: Arc<dyn ModelBackend>,
+        model: String,
+        context_size: u64,
+        bash_timeout: std::time::Duration,
+        subagent_max_turns: u16,
+        config: &Config,
+    ) -> Self {
+        Self::build(backend, model, context_size, bash_timeout, subagent_max_turns, None, Some(config))
     }
 
     /// Create a sub-agent with fresh context and no subagent tool (prevents recursion).
@@ -239,7 +290,7 @@ impl Agent {
         bash_timeout: std::time::Duration,
         max_turns: u16,
     ) -> Self {
-        Self::build(backend, model, context_size, bash_timeout, 0, Some(max_turns))
+        Self::build(backend, model, context_size, bash_timeout, 0, Some(max_turns), None)
     }
 
     pub fn model(&self) -> &str {
@@ -521,7 +572,8 @@ impl Agent {
         )?;
 
         // Request user confirmation for tools that modify state
-        let needs_confirm = matches!(name.as_str(), "bash" | "edit" | "write" | "subagent");
+        let needs_confirm = matches!(name.as_str(), "bash" | "edit" | "write" | "subagent")
+            || self.plugin_confirm_tools.contains(name.as_str());
         if needs_confirm {
             send_event(
                 events,

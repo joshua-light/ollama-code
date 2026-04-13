@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use ollama_code::agent::{Agent, AgentEvent};
 use ollama_code::backend::{ChatResponse, ModelBackend};
+use ollama_code::config::Config;
 use ollama_code::message::{FunctionCall, Message, ToolCall};
 
 // ---------------------------------------------------------------------------
@@ -280,6 +281,16 @@ pub async fn run_agent(
     run_agent_with_options(backend, input, confirm, None).await
 }
 
+/// Run with a custom `Config` (for testing feature flags, plugin config, etc.).
+pub async fn run_agent_with_config(
+    backend: Arc<MockBackend>,
+    input: &str,
+    confirm: ConfirmStrategy,
+    config: &Config,
+) -> TestResult {
+    run_agent_full(backend, input, confirm, None, Some(config)).await
+}
+
 /// Run with additional configuration (cancel flag, etc.).
 pub async fn run_agent_with_options(
     backend: Arc<MockBackend>,
@@ -287,13 +298,34 @@ pub async fn run_agent_with_options(
     confirm: ConfirmStrategy,
     cancel: Option<Arc<AtomicBool>>,
 ) -> TestResult {
-    let mut agent = Agent::new(
-        backend.clone(),
-        "test-model".to_string(),
-        8192,
-        std::time::Duration::from_secs(30),
-        4,
-    );
+    run_agent_full(backend, input, confirm, cancel, None).await
+}
+
+/// Internal: full-featured agent runner.
+async fn run_agent_full(
+    backend: Arc<MockBackend>,
+    input: &str,
+    confirm: ConfirmStrategy,
+    cancel: Option<Arc<AtomicBool>>,
+    config: Option<&Config>,
+) -> TestResult {
+    let mut agent = match config {
+        Some(cfg) => Agent::with_config(
+            backend.clone(),
+            "test-model".to_string(),
+            8192,
+            std::time::Duration::from_secs(30),
+            4,
+            cfg,
+        ),
+        None => Agent::new(
+            backend.clone(),
+            "test-model".to_string(),
+            8192,
+            std::time::Duration::from_secs(30),
+            4,
+        ),
+    };
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (confirm_tx, mut confirm_rx) = mpsc::unbounded_channel::<bool>();

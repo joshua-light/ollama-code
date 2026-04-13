@@ -6,6 +6,7 @@ pub mod format;
 pub mod llama_server;
 pub mod message;
 pub mod ollama;
+pub mod plugin;
 pub mod session;
 pub mod skills;
 pub mod tools;
