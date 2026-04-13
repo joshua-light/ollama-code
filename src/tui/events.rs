@@ -402,9 +402,11 @@ pub(super) fn handle_agent_event(event: AgentEvent, app: &mut App) {
             app.is_processing = false;
             app.generation_start = None;
         }
-        AgentEvent::SystemPromptInfo { base_prompt_tokens, project_docs } => {
+        AgentEvent::SystemPromptInfo { base_prompt_tokens, project_docs, skills_tokens, tool_defs_tokens } => {
             app.base_prompt_tokens = base_prompt_tokens;
             app.project_docs_tokens = project_docs;
+            app.skills_tokens = skills_tokens;
+            app.tool_defs_tokens = tool_defs_tokens;
         }
         // MessageLogged and Debug are handled by the session logger in the event loop,
         // not by the app state.
@@ -548,26 +550,11 @@ fn handle_command(
                 let mut user_messages = 0u32;
                 let mut assistant_messages = 0u32;
                 let mut tool_calls = 0u32;
-                let mut user_chars = 0usize;
-                let mut assistant_chars = 0usize;
-                let mut tool_chars = 0usize;
-
                 for msg in &app.messages {
                     match msg {
-                        ChatMessage::User(text) => {
-                            user_messages += 1;
-                            user_chars += text.len();
-                        }
-                        ChatMessage::Assistant(text) => {
-                            assistant_messages += 1;
-                            assistant_chars += text.len();
-                        }
-                        ChatMessage::ToolCall { result, .. } => {
-                            tool_calls += 1;
-                            if let Some(r) = result {
-                                tool_chars += r.output.len();
-                            }
-                        }
+                        ChatMessage::User(_) => user_messages += 1,
+                        ChatMessage::Assistant(_) => assistant_messages += 1,
+                        ChatMessage::ToolCall { .. } => tool_calls += 1,
                         _ => {}
                     }
                 }
@@ -578,11 +565,10 @@ fn handle_command(
                     user_messages,
                     assistant_messages,
                     tool_calls,
-                    user_chars,
-                    assistant_chars,
-                    tool_chars,
                     base_prompt_tokens: app.base_prompt_tokens,
                     project_docs_tokens: app.project_docs_tokens.clone(),
+                    skills_tokens: app.skills_tokens,
+                    tool_defs_tokens: app.tool_defs_tokens,
                 });
             }
         }

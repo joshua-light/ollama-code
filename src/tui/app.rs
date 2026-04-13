@@ -44,11 +44,10 @@ pub(crate) enum ChatMessage {
         user_messages: u32,
         assistant_messages: u32,
         tool_calls: u32,
-        user_chars: usize,
-        assistant_chars: usize,
-        tool_chars: usize,
         base_prompt_tokens: u64,
         project_docs_tokens: Vec<(String, u64)>,
+        skills_tokens: u64,
+        tool_defs_tokens: u64,
     },
     GenerationSummary { duration: std::time::Duration },
     SubagentToolCall {
@@ -131,6 +130,10 @@ pub(crate) struct App {
     pub(crate) base_prompt_tokens: u64,
     /// Estimated tokens for each loaded project doc (filename, tokens).
     pub(crate) project_docs_tokens: Vec<(String, u64)>,
+    /// Estimated tokens for skill summaries in the system prompt.
+    pub(crate) skills_tokens: u64,
+    /// Estimated tokens for tool definitions sent with each request.
+    pub(crate) tool_defs_tokens: u64,
     /// Discovered skills available as slash commands.
     pub(crate) skills: Vec<SkillMeta>,
     /// When Some, the initial llama-server is still loading and we show a progress bar.
@@ -179,6 +182,8 @@ impl App {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             base_prompt_tokens: 0,
             project_docs_tokens: Vec::new(),
+            skills_tokens: 0,
+            tool_defs_tokens: 0,
             skills,
             server_loading: None,
         }

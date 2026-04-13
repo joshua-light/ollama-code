@@ -525,11 +525,10 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 user_messages,
                 assistant_messages,
                 tool_calls,
-                user_chars,
-                assistant_chars,
-                tool_chars,
                 base_prompt_tokens,
                 project_docs_tokens,
+                skills_tokens,
+                tool_defs_tokens,
             } => {
                 render_chat_context_info(
                     &mut lines,
@@ -538,11 +537,10 @@ fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     *user_messages,
                     *assistant_messages,
                     *tool_calls,
-                    *user_chars,
-                    *assistant_chars,
-                    *tool_chars,
                     *base_prompt_tokens,
                     project_docs_tokens,
+                    *skills_tokens,
+                    *tool_defs_tokens,
                 );
             }
             ChatMessage::GenerationSummary { duration } => {
@@ -701,14 +699,27 @@ fn render_chat_context_info(
     user_messages: u32,
     assistant_messages: u32,
     tool_calls: u32,
-    user_chars: usize,
-    assistant_chars: usize,
-    tool_chars: usize,
     base_prompt_tokens: u64,
     project_docs_tokens: &[(String, u64)],
+    skills_tokens: u64,
+    tool_defs_tokens: u64,
 ) {
     lines.push(Line::from(""));
-    // Header
+
+    // Header with inline summary
+    let header_detail = if context_size > 0 {
+        let pct = ((context_used as f64 / context_size as f64) * 100.0).min(100.0) as u64;
+        format!(
+            " — {} / {} tokens ({}%)",
+            format_number(context_used),
+            format_number(context_size),
+            pct,
+        )
+    } else if context_used > 0 {
+        format!(" — {} tokens", format_number(context_used))
+    } else {
+        String::new()
+    };
     lines.push(Line::from(vec![
         Span::styled(
             " \u{F16A3} ",
@@ -722,76 +733,105 @@ fn render_chat_context_info(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(header_detail, Style::default().fg(Color::DarkGray)),
     ]));
 
-    // Token counts
+    // Build segments for the breakdown.
+    // Each segment: (label, estimated tokens, color).
+    // "System" = base prompt; project docs, skills, tool schemas are separate.
+    // "Messages" = everything else (context_used minus the known fixed costs).
+    let dim = Style::default().fg(Color::DarkGray);
+    let white = Style::default().fg(Color::White);
+
+    // Colors for segments (chosen for visual distinctness in 256-color terminals).
+    let c_system = Color::Indexed(67);   // steel blue
+    let c_docs = Color::Indexed(109);    // light teal
+    let c_skills = Color::Indexed(139);  // muted purple
+    let c_tools = Color::Indexed(173);   // salmon
+    let c_msgs = Color::Indexed(150);    // light green
+    let c_free = Color::Indexed(238);    // dark gray
+
+    let docs_total: u64 = project_docs_tokens.iter().map(|(_, t)| *t).sum();
+    let system_overhead = base_prompt_tokens + docs_total + skills_tokens + tool_defs_tokens;
+    // Messages tokens = total used minus the fixed overhead (clamped to 0).
+    let messages_tokens = context_used.saturating_sub(system_overhead);
+    let free_tokens = context_size.saturating_sub(context_used);
+
+    // Segmented progress bar (only when context_size is known).
     if context_size > 0 {
-        let (pct, bar) = context_bar_spans(context_used, context_size, 40);
-        lines.push(Line::from(Span::styled(
-            format!(
-                "   {} / {} tokens ({}%)",
-                format_number(context_used),
-                format_number(context_size),
-                pct
-            ),
-            Style::default().fg(Color::White),
-        )));
-
-        let mut bar_line = vec![Span::raw("   ")];
-        bar_line.extend(bar);
-        lines.push(Line::from(bar_line));
-    } else if context_used > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("   {} tokens used (window size unknown)", format_number(context_used)),
-            Style::default().fg(Color::White),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "   No tokens used yet",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    // System prompt breakdown
-    lines.push(Line::from(""));
-    if base_prompt_tokens > 0 {
-        let mut parts = vec![format!("~{} base", format_number(base_prompt_tokens))];
-        for (name, tokens) in project_docs_tokens {
-            parts.push(format!("~{} {}", format_number(*tokens), name));
+        let bar_width: usize = 40;
+        // Segments: system, docs, skills, tool schemas, messages, free.
+        let segments: Vec<(u64, Color)> = vec![
+            (base_prompt_tokens, c_system),
+            (docs_total, c_docs),
+            (skills_tokens, c_skills),
+            (tool_defs_tokens, c_tools),
+            (messages_tokens, c_msgs),
+            (free_tokens, c_free),
+        ];
+        let mut bar_spans = vec![Span::raw("   ")];
+        let total = context_size.max(1) as f64;
+        let mut used_cols: usize = 0;
+        for (i, (tokens, color)) in segments.iter().enumerate() {
+            let is_last = i == segments.len() - 1;
+            let cols = if is_last {
+                bar_width - used_cols
+            } else {
+                let raw = ((*tokens as f64 / total) * bar_width as f64).round() as usize;
+                // Ensure non-zero tokens get at least 1 column, but don't overflow.
+                if *tokens > 0 && raw == 0 {
+                    1usize.min(bar_width - used_cols)
+                } else {
+                    raw.min(bar_width - used_cols)
+                }
+            };
+            if cols > 0 {
+                let ch = if *color == c_free { "╌" } else { "━" };
+                bar_spans.push(Span::styled(
+                    ch.repeat(cols),
+                    Style::default().fg(*color),
+                ));
+            }
+            used_cols += cols;
         }
-        lines.push(Line::from(vec![
-            Span::styled("   System    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(parts.join(" · "), Style::default().fg(Color::White)),
-        ]));
+        lines.push(Line::from(bar_spans));
     }
 
-    // Message counts
-    lines.push(Line::from(vec![
-        Span::styled("   Messages  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!(
-                "{} user · {} assistant · {} tool",
-                user_messages, assistant_messages, tool_calls
-            ),
-            Style::default().fg(Color::White),
-        ),
-    ]));
+    // Legend: one line per category, with colored bullet + token count.
+    lines.push(Line::from(""));
 
-    // Character counts
-    let total = user_chars + assistant_chars + tool_chars;
-    if total > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("   Chars     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!(
-                    "{} user · {} assistant · {} tool",
-                    format_number(user_chars as u64),
-                    format_number(assistant_chars as u64),
-                    format_number(tool_chars as u64),
-                ),
-                Style::default().fg(Color::White),
-            ),
-        ]));
+    // Helper closure: push a legend line.
+    let push_legend = |lines: &mut Vec<Line<'static>>, color: Color, label: &str, tokens: u64, detail: &str| {
+        let mut spans = vec![
+            Span::styled("   ━ ", Style::default().fg(color)),
+            Span::styled(format!("{:<14}", label), dim),
+            Span::styled(format!("~{}", format_number(tokens)), white),
+        ];
+        if !detail.is_empty() {
+            spans.push(Span::styled(format!("  {}", detail), dim));
+        }
+        lines.push(Line::from(spans));
+    };
+
+    if base_prompt_tokens > 0 {
+        push_legend(lines, c_system, "System", base_prompt_tokens, "");
+    }
+    for (name, tokens) in project_docs_tokens {
+        push_legend(lines, c_docs, name, *tokens, "");
+    }
+    if skills_tokens > 0 {
+        push_legend(lines, c_skills, "Skills", skills_tokens, "");
+    }
+    if tool_defs_tokens > 0 {
+        push_legend(lines, c_tools, "Tool schemas", tool_defs_tokens, "");
+    }
+    let msg_detail = format!(
+        "{} user · {} assistant · {} tool",
+        user_messages, assistant_messages, tool_calls,
+    );
+    push_legend(lines, c_msgs, "Messages", messages_tokens, &msg_detail);
+    if context_size > 0 {
+        push_legend(lines, c_free, "Free", free_tokens, "");
     }
 }
 

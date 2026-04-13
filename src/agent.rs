@@ -6,7 +6,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::backend::ModelBackend;
-use crate::message::Message;
+use crate::message::{self, Message};
 use crate::skills::{self, SkillMeta};
 use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SubagentToolDef, WriteTool, ToolRegistry};
 
@@ -40,6 +40,8 @@ pub enum AgentEvent {
     SystemPromptInfo {
         base_prompt_tokens: u64,
         project_docs: Vec<(String, u64)>,
+        skills_tokens: u64,
+        tool_defs_tokens: u64,
     },
 }
 
@@ -121,6 +123,8 @@ pub struct Agent {
     system_prompt_base_len: usize,
     /// Loaded project doc files: (filename, char_count).
     project_docs_info: Vec<(String, usize)>,
+    /// Char count of the skills summary appended to the system prompt.
+    skills_summary_len: usize,
     /// Discovered skills (name + description only; body loaded on activation).
     skills: Vec<SkillMeta>,
 }
@@ -185,14 +189,19 @@ impl Agent {
 
         // Discover skills (.agents/skills/*/SKILL.md) for top-level agents only.
         // Only name + description are injected into the system prompt (discovery layer).
-        let discovered_skills = if !is_subagent {
+        let (discovered_skills, skills_summary_len) = if !is_subagent {
             let found = skills::discover_skills(&cwd);
-            if !found.is_empty() {
-                system_prompt.push_str(&skills::format_skill_summaries(&found));
-            }
-            found
+            let len = if !found.is_empty() {
+                let summary = skills::format_skill_summaries(&found);
+                let l = summary.len();
+                system_prompt.push_str(&summary);
+                l
+            } else {
+                0
+            };
+            (found, len)
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
 
         let messages = vec![Message::system(&system_prompt)];
@@ -209,6 +218,7 @@ impl Agent {
             subagent_max_turns,
             system_prompt_base_len,
             project_docs_info,
+            skills_summary_len,
             skills: discovered_skills,
         }
     }
@@ -367,11 +377,17 @@ impl Agent {
             if let Some(sys_msg) = self.messages.first() {
                 send_event(events, AgentEvent::MessageLogged(sys_msg.clone()))?;
             }
+            // Estimate tool definition tokens from their JSON representation.
+            let tool_defs_chars: usize = self.tools.definitions().iter()
+                .map(|d| d.to_string().len())
+                .sum();
             send_event(events, AgentEvent::SystemPromptInfo {
-                base_prompt_tokens: (self.system_prompt_base_len as u64) / 4,
+                base_prompt_tokens: message::chars_to_tokens(self.system_prompt_base_len),
                 project_docs: self.project_docs_info.iter()
-                    .map(|(name, len)| (name.clone(), (*len as u64) / 4))
+                    .map(|(name, len)| (name.clone(), message::chars_to_tokens(*len)))
                     .collect(),
+                skills_tokens: message::chars_to_tokens(self.skills_summary_len),
+                tool_defs_tokens: message::chars_to_tokens(tool_defs_chars),
             })?;
             self.system_prompt_logged = true;
         }

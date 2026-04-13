@@ -366,6 +366,12 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
     let cancel = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn(async move { agent.run(&prompt, &tx, &mut confirm_rx, cancel).await });
 
+    // Buffer streamed tokens so ContentReplaced can discard/replace them.
+    // This handles models that emit tool calls as text (e.g. <function=...>
+    // format) — without buffering, the raw text leaks to stdout before
+    // extraction can clean it up.
+    let mut token_buf = String::new();
+
     while let Some(event) = rx.recv().await {
         session.log_agent_event(&event);
         if let AgentEvent::MessageLogged(ref msg) = event {
@@ -373,10 +379,19 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
         }
         match event {
             AgentEvent::Token(t) => {
-                print!("{}", t);
-                std::io::stdout().flush().ok();
+                token_buf.push_str(&t);
+            }
+            AgentEvent::ContentReplaced(new_content) => {
+                // The agent extracted tool calls from the buffered text.
+                // Replace the buffer with the cleaned content.
+                token_buf = new_content;
             }
             AgentEvent::ToolCall { name, args } => {
+                // Flush any buffered content before showing tool info.
+                if !token_buf.is_empty() {
+                    print!("{}", token_buf);
+                    token_buf.clear();
+                }
                 eprintln!(
                     "\n ● {}({})",
                     format::capitalize_first(&name),
@@ -400,6 +415,11 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
                 eprintln!("(context trimmed: {} messages, ~{} tokens freed)", removed_messages, estimated_tokens_freed);
             }
             AgentEvent::Done { .. } => {
+                // Flush remaining buffer and finish.
+                if !token_buf.is_empty() {
+                    print!("{}", token_buf);
+                    token_buf.clear();
+                }
                 println!();
                 break;
             }
@@ -426,7 +446,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
             AgentEvent::Debug(ref msg) if verbose => {
                 eprintln!("[debug] {}", msg);
             }
-            AgentEvent::ContextUpdate { .. } | AgentEvent::ContentReplaced(_) | AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) | AgentEvent::SystemPromptInfo { .. } => {}
+            AgentEvent::ContextUpdate { .. } | AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) | AgentEvent::SystemPromptInfo { .. } => {}
         }
     }
 

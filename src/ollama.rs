@@ -215,12 +215,102 @@ fn extract_tool_calls_from_content(
         }
     }
 
+    if !calls.is_empty() {
+        // Remove matched JSON from the content in reverse order.
+        let mut remaining = cleaned;
+        for &(start, end) in removals.iter().rev() {
+            remaining.replace_range(start..end, "");
+        }
+        return (calls, remaining.trim().to_string());
+    }
+
+    // Fallback: try to extract <function=NAME>...</function> XML-style tool calls.
+    // Some models (e.g. Qwen3-coder) intermittently emit this format instead of
+    // structured tool_calls or JSON objects.
+    let (xml_calls, xml_remaining) = extract_function_tag_calls(&cleaned, known_tools);
+    if !xml_calls.is_empty() {
+        return (xml_calls, xml_remaining);
+    }
+
+    (calls, content.to_string())
+}
+
+/// Parse `<function=NAME>...<parameter=KEY>VALUE</parameter>...</function>` blocks
+/// from text content. Returns extracted tool calls and cleaned content.
+fn extract_function_tag_calls(
+    content: &str,
+    known_tools: &[String],
+) -> (Vec<ToolCall>, String) {
+    let mut calls = Vec::new();
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+
+    let mut search_from = 0;
+    while let Some(func_start_rel) = content[search_from..].find("<function=") {
+        let abs_start = search_from + func_start_rel;
+        let name_start = abs_start + "<function=".len();
+
+        let Some(name_end_rel) = content[name_start..].find('>') else {
+            search_from = name_start;
+            continue;
+        };
+        let name = content[name_start..name_start + name_end_rel].trim();
+
+        if !known_tools.iter().any(|t| t == name) {
+            search_from = name_start + name_end_rel;
+            continue;
+        }
+
+        let body_start = name_start + name_end_rel + 1;
+        let Some(func_end_rel) = content[body_start..].find("</function>") else {
+            search_from = body_start;
+            continue;
+        };
+        let body = &content[body_start..body_start + func_end_rel];
+        let block_end = body_start + func_end_rel + "</function>".len();
+
+        let mut arguments = serde_json::Map::new();
+        let mut param_search = 0;
+        while let Some(param_start_rel) = body[param_search..].find("<parameter=") {
+            let pname_start = param_search + param_start_rel + "<parameter=".len();
+            let Some(pname_end_rel) = body[pname_start..].find('>') else {
+                param_search = pname_start;
+                continue;
+            };
+            let param_name = body[pname_start..pname_start + pname_end_rel].trim();
+            let value_start = pname_start + pname_end_rel + 1;
+
+            let Some(pclose_rel) = body[value_start..].find("</parameter>") else {
+                param_search = value_start;
+                continue;
+            };
+            let value = body[value_start..value_start + pclose_rel].trim();
+
+            arguments.insert(
+                param_name.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+
+            param_search = value_start + pclose_rel + "</parameter>".len();
+        }
+
+        calls.push(ToolCall {
+            id: None,
+            call_type: None,
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: serde_json::Value::Object(arguments),
+            },
+        });
+        removals.push((abs_start, block_end));
+        search_from = block_end;
+    }
+
     if calls.is_empty() {
         return (calls, content.to_string());
     }
 
-    // Remove matched JSON from the content in reverse order.
-    let mut remaining = cleaned;
+    // Remove matched blocks from content in reverse order.
+    let mut remaining = content.to_string();
     for &(start, end) in removals.iter().rev() {
         remaining.replace_range(start..end, "");
     }
@@ -793,5 +883,91 @@ impl ModelBackend for OllamaBackend {
                 repetition_detected,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_function_tag_single_param() {
+        let content = "<function=read>\n<parameter=file_path>\nCLAUDE.md\n</parameter>\n</function>\n</tool_call>";
+        let known = vec!["read".to_string(), "bash".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(
+            calls[0].function.arguments.get("file_path").unwrap().as_str().unwrap(),
+            "CLAUDE.md"
+        );
+        assert!(remaining.is_empty(), "remaining was: {:?}", remaining);
+    }
+
+    #[test]
+    fn extract_function_tag_multiple_params() {
+        let content = "<function=edit>\n<parameter=file_path>\nsrc/main.rs\n</parameter>\n<parameter=old>\nfn main()\n</parameter>\n<parameter=new>\nfn main() -> Result<()>\n</parameter>\n</function>";
+        let known = vec!["edit".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "edit");
+        assert_eq!(
+            calls[0].function.arguments.get("file_path").unwrap().as_str().unwrap(),
+            "src/main.rs"
+        );
+        assert_eq!(
+            calls[0].function.arguments.get("old").unwrap().as_str().unwrap(),
+            "fn main()"
+        );
+        assert_eq!(
+            calls[0].function.arguments.get("new").unwrap().as_str().unwrap(),
+            "fn main() -> Result<()>"
+        );
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn extract_function_tag_with_surrounding_text() {
+        let content = "Let me read that file.\n<function=read>\n<parameter=file_path>\nCLAUDE.md\n</parameter>\n</function>\nDone.";
+        let known = vec!["read".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(remaining, "Let me read that file.\n\nDone.");
+    }
+
+    #[test]
+    fn extract_function_tag_unknown_tool_ignored() {
+        let content = "<function=unknown_tool>\n<parameter=x>\n1\n</parameter>\n</function>";
+        let known = vec!["read".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, content);
+    }
+
+    #[test]
+    fn extract_json_still_works() {
+        let content = r#"{"name": "read", "arguments": {"file_path": "test.rs"}}"#;
+        let known = vec!["read".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn extract_function_tag_multiple_calls() {
+        let content = "<function=read>\n<parameter=file_path>\na.rs\n</parameter>\n</function>\n<function=read>\n<parameter=file_path>\nb.rs\n</parameter>\n</function>";
+        let known = vec!["read".to_string()];
+        let (calls, _remaining) = extract_tool_calls_from_content(content, &known);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].function.arguments.get("file_path").unwrap().as_str().unwrap(),
+            "a.rs"
+        );
+        assert_eq!(
+            calls[1].function.arguments.get("file_path").unwrap().as_str().unwrap(),
+            "b.rs"
+        );
     }
 }

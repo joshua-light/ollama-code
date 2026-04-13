@@ -233,8 +233,8 @@ impl Session {
             AgentEvent::Cancelled => "CANCELLED".to_string(),
             AgentEvent::MessageLogged(_) => return, // handled separately via log_message
             AgentEvent::Debug(s) => format!("DEBUG {}", s),
-            AgentEvent::SystemPromptInfo { base_prompt_tokens, ref project_docs } => {
-                format!("SYSTEM_PROMPT_INFO base={} docs={:?}", base_prompt_tokens, project_docs)
+            AgentEvent::SystemPromptInfo { base_prompt_tokens, ref project_docs, skills_tokens, tool_defs_tokens } => {
+                format!("SYSTEM_PROMPT_INFO base={} docs={:?} skills={} tools={}", base_prompt_tokens, project_docs, skills_tokens, tool_defs_tokens)
             }
         };
         self.log_debug(&line);
