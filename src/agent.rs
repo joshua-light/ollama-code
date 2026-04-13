@@ -138,6 +138,22 @@ pub struct Agent {
     _mcp_servers: Vec<mcp::McpServer>,
     /// Hook runner for lifecycle hooks.
     hooks: HookRunner,
+
+    // --- Small-model improvement flags ---
+    /// When true, dynamically scope available tools per turn.
+    tool_scoping: bool,
+    /// When true, re-inject the task objective every N turns.
+    task_reinjection: bool,
+    /// How often to re-inject (in agent turns).
+    reinjection_interval: u16,
+    /// Context trim threshold (percentage of context_size).
+    trim_threshold_pct: u8,
+    /// Context trim target (percentage of context_size).
+    trim_target_pct: u8,
+    /// Tracks whether a file-reading tool has been used (for tool scoping).
+    has_explored: bool,
+    /// The original user input for the current run (for task re-injection).
+    current_task: String,
 }
 
 impl Agent {
@@ -292,6 +308,13 @@ impl Agent {
             plugin_confirm_tools,
             _mcp_servers: mcp_servers,
             hooks,
+            tool_scoping: cfg.tool_scoping.unwrap_or(false),
+            task_reinjection: cfg.task_reinjection.unwrap_or(false),
+            reinjection_interval: cfg.effective_reinjection_interval(),
+            trim_threshold_pct: cfg.effective_trim_threshold(),
+            trim_target_pct: cfg.effective_trim_target(),
+            has_explored: false,
+            current_task: String::new(),
         }
     }
 
@@ -350,6 +373,18 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.messages.truncate(1); // keep system prompt
+        self.has_explored = false;
+    }
+
+    /// Return tool definitions, optionally scoped based on conversation state.
+    /// When tool_scoping is enabled, edit/write are hidden until a read/glob/grep
+    /// has been performed — reduces the "Chekhov's gun" problem for small models.
+    fn scoped_tool_definitions(&self) -> Vec<serde_json::Value> {
+        if !self.tool_scoping || self.has_explored {
+            return self.tools.definitions();
+        }
+        // Haven't explored yet — hide mutation tools
+        self.tools.definitions_excluding(&["edit", "write"])
     }
 
     /// Restore conversation from a previously saved session.
@@ -408,13 +443,12 @@ impl Agent {
             return None;
         }
 
-        let threshold = self.context_size * 80 / 100;
+        let threshold = self.context_size * self.trim_threshold_pct as u64 / 100;
         if current_prompt_tokens <= threshold {
             return None;
         }
 
-        // Target: trim down to 60% of context
-        let target = self.context_size * 60 / 100;
+        let target = self.context_size * self.trim_target_pct as u64 / 100;
         let need_to_free = current_prompt_tokens.saturating_sub(target);
 
         let first_non_system = self
@@ -677,6 +711,26 @@ impl Agent {
             }
         }
 
+        // Validate tool arguments against schema before execution.
+        if let Some(Err(validation_err)) = self.tools.validate(name, args) {
+            let msg = format!(
+                "Invalid arguments for '{}': {}",
+                name, validation_err
+            );
+            send_event(
+                events,
+                AgentEvent::ToolResult {
+                    name: name.clone(),
+                    output: msg.clone(),
+                    success: false,
+                },
+            )?;
+            let tool_msg = Message::tool(&msg, tool_call.id.clone());
+            self.messages.push(tool_msg.clone());
+            send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+            return Ok(true);
+        }
+
         // Check cancellation before each tool call
         if cancel.load(Ordering::Relaxed) {
             send_event(events, AgentEvent::Cancelled)?;
@@ -706,6 +760,11 @@ impl Agent {
                 Err(e) => (format!("Error: {}", e), false),
             }
         };
+
+        // Track exploration for dynamic tool scoping
+        if success && matches!(name.as_str(), "read" | "glob" | "grep") {
+            self.has_explored = true;
+        }
 
         // --- post_tool_execute hooks ---
         let (post_result, post_success) = self
@@ -769,6 +828,10 @@ impl Agent {
             self.messages.push(ctx_msg);
         }
 
+        // Store the current task for re-injection
+        self.current_task = user_input.to_string();
+        self.has_explored = false;
+
         let user_msg = Message::user(user_input);
         self.messages.push(user_msg.clone());
         send_event(events, AgentEvent::MessageLogged(user_msg))?;
@@ -776,6 +839,7 @@ impl Agent {
         let mut empty_retries: u32 = 0;
         const MAX_EMPTY_RETRIES: u32 = 10;
         let mut turn: u32 = 0;
+        let mut tool_call_summary: Vec<String> = Vec::new();
         let num_ctx = if self.context_size > 0 { Some(self.context_size) } else { None };
 
         loop {
@@ -794,7 +858,31 @@ impl Agent {
             }
             turn += 1;
 
-            let tool_defs = self.tools.definitions();
+            // Task re-injection: periodically remind the model what it's doing.
+            if self.task_reinjection
+                && turn > 1
+                && self.reinjection_interval > 0
+                && (turn - 1).is_multiple_of(self.reinjection_interval as u32)
+                && !self.current_task.is_empty()
+            {
+                let summary = if tool_call_summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Completed so far: {}", tool_call_summary.join(", "))
+                };
+                let reminder = format!(
+                    "[Task reminder] Your current task: {}.{}",
+                    self.current_task, summary
+                );
+                let reminder_msg = Message::system(&reminder);
+                self.messages.push(reminder_msg);
+                send_event(
+                    events,
+                    AgentEvent::Debug(format!("Task re-injection at turn {}", turn)),
+                )?;
+            }
+
+            let tool_defs = self.scoped_tool_definitions();
             let events_clone = events.clone();
 
             send_event(
@@ -1035,6 +1123,11 @@ impl Agent {
             send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
 
             for tool_call in &tool_calls_with_ids {
+                // Track tool calls for re-injection summary
+                if self.task_reinjection {
+                    tool_call_summary.push(tool_call.function.name.clone());
+                }
+
                 let continue_loop = self
                     .dispatch_tool_call(tool_call, events, confirm_rx, &cancel)
                     .await?;

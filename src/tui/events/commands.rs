@@ -112,6 +112,11 @@ pub(super) fn handle_command(
                             ctx: new_size,
                             extra_args,
                             model_name: app.model.clone(),
+                            sampling: crate::ollama::SamplingParams {
+                                temperature: app.config.temperature,
+                                top_p: app.config.top_p,
+                                top_k: app.config.top_k,
+                            },
                             unload: None,
                         });
                         app.server.stop_llama_server = true;

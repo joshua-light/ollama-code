@@ -76,6 +76,8 @@ pub(crate) struct PendingServerStart {
     pub(crate) ctx: u64,
     pub(crate) extra_args: Vec<String>,
     pub(crate) model_name: String,
+    /// Sampling parameters from config.
+    pub(crate) sampling: crate::ollama::SamplingParams,
     /// If set, unload this Ollama model before starting the server.
     pub(crate) unload: Option<(OllamaBackend, String)>,
 }

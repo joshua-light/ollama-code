@@ -178,6 +178,11 @@ fn handle_model_selection(
                             ctx,
                             extra_args,
                             model_name: hf_repo,
+                            sampling: crate::ollama::SamplingParams {
+                                temperature: app.config.temperature,
+                                top_p: app.config.top_p,
+                                top_k: app.config.top_k,
+                            },
                             unload: Some((app.ollama.clone(), app.model.clone())),
                         });
                         app.server.stop_llama_server = true;
@@ -197,7 +202,14 @@ fn handle_model_selection(
                     } else {
                         // Switch to Ollama backend (stop server in event loop)
                         app.server.stop_llama_server = true;
-                        let backend = OllamaBackend::new(app.config.ollama_url.clone());
+                        let backend = OllamaBackend::with_sampling(
+                            app.config.ollama_url.clone(),
+                            crate::ollama::SamplingParams {
+                                temperature: app.config.temperature,
+                                top_p: app.config.top_p,
+                                top_k: app.config.top_k,
+                            },
+                        );
                         let _ = input_tx.send(AgentInput::SetBackend(Arc::new(backend)));
                         app.model = model_name.clone();
                         let _ = input_tx.send(AgentInput::SetModel(model_name.clone()));
@@ -316,11 +328,12 @@ pub(super) async fn spawn_llama_server_inner(
     ctx: u64,
     extra_args: Vec<String>,
     model_name: String,
+    sampling: crate::ollama::SamplingParams,
     tx: mpsc::UnboundedSender<super::BackendReady>,
 ) {
     // Try to reuse an existing llama-server for the same model.
     if let Some(server) = LlamaServer::connect_existing(&model_source).await {
-        let backend = LlamaCppBackend::new(server.base_url());
+        let backend = LlamaCppBackend::with_sampling(server.base_url(), sampling);
         let _ = tx.send(Ok((Arc::new(backend), model_name, server)));
         return;
     }
@@ -342,7 +355,7 @@ pub(super) async fn spawn_llama_server_inner(
     };
     match LlamaServer::start(&server_binary, &model_source, port, ctx, &extra_args).await {
         Ok(server) => {
-            let backend = LlamaCppBackend::new(server.base_url());
+            let backend = LlamaCppBackend::with_sampling(server.base_url(), sampling);
             let _ = tx.send(Ok((Arc::new(backend), model_name, server)));
         }
         Err(e) => {

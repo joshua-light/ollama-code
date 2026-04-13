@@ -9,6 +9,9 @@ use crate::mcp::McpServerConfig;
 pub const DEFAULT_CONTEXT_SIZE: u64 = 32768;
 pub const DEFAULT_SUBAGENT_MAX_TURNS: u16 = 15;
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_TRIM_THRESHOLD_PCT: u8 = 80;
+pub const DEFAULT_TRIM_TARGET_PCT: u8 = 60;
+pub const DEFAULT_REINJECTION_INTERVAL: u16 = 3;
 
 /// Root data directory for ollama-code (`$XDG_DATA_HOME/ollama-code` or `./ollama-code`).
 pub fn data_dir() -> PathBuf {
@@ -113,6 +116,43 @@ pub struct Config {
     ///   `key = "value"`
     #[serde(default)]
     pub hooks: Option<HashMap<String, toml::Value>>,
+
+    /// Sampling temperature (0.0 = deterministic, higher = more random).
+    /// Recommended: 0.1-0.3 for tool use, 0.5-0.8 for creative/planning.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+
+    /// Top-p (nucleus) sampling. Only tokens with cumulative probability <= top_p are considered.
+    #[serde(default)]
+    pub top_p: Option<f64>,
+
+    /// Top-k sampling. Only the top k tokens are considered.
+    #[serde(default)]
+    pub top_k: Option<u32>,
+
+    /// Enable dynamic tool scoping: only present relevant tools per turn.
+    /// Reduces confusion in small models (the "Chekhov's gun" problem).
+    #[serde(default)]
+    pub tool_scoping: Option<bool>,
+
+    /// Enable periodic task re-injection to fight coherence decay in small models.
+    /// Re-states the current task objective every `reinjection_interval` turns.
+    #[serde(default)]
+    pub task_reinjection: Option<bool>,
+
+    /// How often to re-inject the task objective (in agent turns). Default: 3.
+    #[serde(default)]
+    pub reinjection_interval: Option<u16>,
+
+    /// Context trim threshold as percentage of context_size (default: 80).
+    /// When prompt tokens exceed this, auto-trimming kicks in.
+    #[serde(default)]
+    pub trim_threshold: Option<u8>,
+
+    /// Context trim target as percentage of context_size (default: 60).
+    /// Trimming removes messages until usage drops to this level.
+    #[serde(default)]
+    pub trim_target: Option<u8>,
 
     /// Recently used HuggingFace model repos (most recent first, max 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,6 +277,14 @@ impl Config {
             plugin_dirs: self.plugin_dirs.or_else(|| other.plugin_dirs.clone()),
             mcp_servers: merge_hashmap(self.mcp_servers, &other.mcp_servers),
             hooks: merge_hashmap(self.hooks, &other.hooks),
+            temperature: self.temperature.or(other.temperature),
+            top_p: self.top_p.or(other.top_p),
+            top_k: self.top_k.or(other.top_k),
+            tool_scoping: self.tool_scoping.or(other.tool_scoping),
+            task_reinjection: self.task_reinjection.or(other.task_reinjection),
+            reinjection_interval: self.reinjection_interval.or(other.reinjection_interval),
+            trim_threshold: self.trim_threshold.or(other.trim_threshold),
+            trim_target: self.trim_target.or(other.trim_target),
             // User-scope only: always take from the lower-priority layer (user config).
             recent_hf_models: other.recent_hf_models.clone(),
             project_config_path: None,
@@ -278,6 +326,18 @@ impl Config {
     /// Return the hook-specific config table for `name`, if any.
     pub fn hook_config(&self, name: &str) -> Option<&toml::map::Map<String, toml::Value>> {
         feature_config(&self.hooks, name)
+    }
+
+    pub fn effective_trim_threshold(&self) -> u8 {
+        self.trim_threshold.unwrap_or(DEFAULT_TRIM_THRESHOLD_PCT)
+    }
+
+    pub fn effective_trim_target(&self) -> u8 {
+        self.trim_target.unwrap_or(DEFAULT_TRIM_TARGET_PCT)
+    }
+
+    pub fn effective_reinjection_interval(&self) -> u16 {
+        self.reinjection_interval.unwrap_or(DEFAULT_REINJECTION_INTERVAL)
     }
 
     /// Add a HuggingFace repo to the recent list (most recent first, max 10).

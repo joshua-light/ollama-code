@@ -67,6 +67,74 @@ pub fn format_bash_output(output: &std::process::Output) -> (String, bool) {
     (result, success)
 }
 
+/// Validate tool call arguments against a tool's JSON schema.
+/// Returns `Ok(())` if valid, or an error message describing what's wrong.
+pub fn validate_tool_args(schema: &Value, args: &Value) -> std::result::Result<(), String> {
+    let properties = schema.get("properties").and_then(|p| p.as_object());
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    // Args should be an object
+    let args_obj = match args.as_object() {
+        Some(o) => o,
+        None => return Err("Arguments must be a JSON object".to_string()),
+    };
+
+    // Check required fields
+    for field in &required {
+        if !args_obj.contains_key(*field) {
+            return Err(format!(
+                "Missing required argument '{}'. Required: [{}]",
+                field,
+                required.join(", ")
+            ));
+        }
+    }
+
+    // Type-check provided fields against schema
+    if let Some(props) = properties {
+        for (key, value) in args_obj {
+            if let Some(prop_schema) = props.get(key) {
+                if let Some(expected_type) = prop_schema.get("type").and_then(|t| t.as_str()) {
+                    let type_ok = match expected_type {
+                        "string" => value.is_string(),
+                        "number" => value.is_number(),
+                        "integer" => value.is_i64() || value.is_u64(),
+                        "boolean" => value.is_boolean(),
+                        "object" => value.is_object(),
+                        "array" => value.is_array(),
+                        _ => true,
+                    };
+                    if !type_ok {
+                        return Err(format!(
+                            "Argument '{}' should be {}, got {}",
+                            key,
+                            expected_type,
+                            value_type_name(value),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 // --- Tool registry ---
 
 pub struct ToolRegistry {
@@ -97,6 +165,47 @@ impl ToolRegistry {
 
     pub fn definitions(&self) -> Vec<Value> {
         self.cached_definitions.clone()
+    }
+
+    /// Return definitions for only the named tools (for dynamic scoping).
+    pub fn definitions_filtered(&self, allowed: &[&str]) -> Vec<Value> {
+        self.cached_definitions
+            .iter()
+            .filter(|def| {
+                def.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|name| allowed.contains(&name))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Return definitions excluding the named tools.
+    pub fn definitions_excluding(&self, excluded: &[&str]) -> Vec<Value> {
+        self.cached_definitions
+            .iter()
+            .filter(|def| {
+                def.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|name| !excluded.contains(&name))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Validate arguments for a tool against its schema.
+    /// Returns `None` if the tool is not found (external tools skip validation).
+    pub fn validate(&self, name: &str, args: &Value) -> Option<std::result::Result<(), String>> {
+        let idx = self.tools.iter().position(|t| t.name() == name)?;
+        let schema = &self.cached_definitions[idx];
+        let params = schema
+            .get("function")
+            .and_then(|f| f.get("parameters"))?;
+        Some(validate_tool_args(params, args))
     }
 
     pub fn execute(&self, name: &str, arguments: &Value) -> Result<String> {

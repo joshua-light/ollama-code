@@ -414,6 +414,12 @@ impl LlamaCppBackend {
             inner: OllamaBackend::new(Some(base_url)),
         }
     }
+
+    pub fn with_sampling(base_url: String, sampling: crate::ollama::SamplingParams) -> Self {
+        Self {
+            inner: OllamaBackend::with_sampling(Some(base_url), sampling),
+        }
+    }
 }
 
 impl ModelBackend for LlamaCppBackend {

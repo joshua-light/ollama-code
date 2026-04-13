@@ -12,7 +12,7 @@ use ollama_code::config::{Config, DEFAULT_CONTEXT_SIZE};
 use ollama_code::format;
 use ollama_code::llama_server::{self, LlamaCppBackend, LlamaServer, ModelSource};
 use ollama_code::message;
-use ollama_code::ollama::OllamaBackend;
+use ollama_code::ollama::{OllamaBackend, SamplingParams};
 use ollama_code::session::Session;
 use ollama_code::tui;
 
@@ -174,8 +174,16 @@ async fn run_with_backend(
     }
 }
 
+fn sampling_from_config(config: &Config) -> SamplingParams {
+    SamplingParams {
+        temperature: config.temperature,
+        top_p: config.top_p,
+        top_k: config.top_k,
+    }
+}
+
 async fn run_ollama(prompt: Option<String>, mut config: Config, context_size: u64, resume: Option<String>) -> Result<()> {
-    let ollama = OllamaBackend::new(config.ollama_url.clone());
+    let ollama = OllamaBackend::with_sampling(config.ollama_url.clone(), sampling_from_config(&config));
 
     let model = if let Some(m) = config.model.clone() {
         m
@@ -262,7 +270,7 @@ async fn run_llama_cpp(prompt: Option<String>, config: Config, context_size: u64
     } else {
         unreachable!()
     };
-    let backend = LlamaCppBackend::new(base_url);
+    let backend = LlamaCppBackend::with_sampling(base_url, sampling_from_config(&config));
 
     let agent = Agent::with_config(Arc::new(backend), model_name.to_string(), context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns(), &config);
 
@@ -299,7 +307,7 @@ async fn run_remote_llama_cpp(prompt: Option<String>, mut config: Config, contex
     config.backend = Some("llama-cpp".to_string());
     config.llama_server_url = Some(url.clone());
 
-    let backend = LlamaCppBackend::new(url);
+    let backend = LlamaCppBackend::with_sampling(url, sampling_from_config(&config));
     let agent = Agent::with_config(Arc::new(backend), model_name, context_size, config.bash_timeout_duration(), config.effective_subagent_max_turns(), &config);
 
     run_with_backend(prompt, config, context_size, agent, None, None, resume).await

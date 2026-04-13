@@ -167,7 +167,14 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
 
     let model = agent.model().to_string();
     let skills = agent.skills().to_vec();
-    let ollama = OllamaBackend::new(config.ollama_url.clone());
+    let ollama = OllamaBackend::with_sampling(
+        config.ollama_url.clone(),
+        crate::ollama::SamplingParams {
+            temperature: config.temperature,
+            top_p: config.top_p,
+            top_k: config.top_k,
+        },
+    );
     let no_confirm = config.no_confirm.unwrap_or(false);
     let bypass = config.bypass.unwrap_or(false);
     let mut app = App::new(model.clone(), context_size, ollama, config, skills);
@@ -306,6 +313,7 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                                 pending.ctx,
                                 pending.extra_args,
                                 pending.model_name,
+                                pending.sampling,
                                 tx,
                             ).await;
                         });

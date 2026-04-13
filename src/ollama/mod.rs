@@ -47,6 +47,12 @@ struct ChatOptions {
     /// How many recent tokens to consider for repeat penalty.
     #[serde(skip_serializing_if = "Option::is_none")]
     repeat_last_n: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,10 +65,19 @@ struct ModelsResponse {
     models: Vec<ModelInfo>,
 }
 
+/// Sampling parameters stored in the backend instance.
+#[derive(Clone, Debug, Default)]
+pub struct SamplingParams {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
+}
+
 #[derive(Clone)]
 pub struct OllamaBackend {
     client: Client,
     base_url: String,
+    sampling: SamplingParams,
 }
 
 impl OllamaBackend {
@@ -70,6 +85,15 @@ impl OllamaBackend {
         Self {
             client: Client::new(),
             base_url: base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            sampling: SamplingParams::default(),
+        }
+    }
+
+    pub fn with_sampling(base_url: Option<String>, sampling: SamplingParams) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            sampling,
         }
     }
 
@@ -117,6 +141,9 @@ impl ModelBackend for OllamaBackend {
                     num_ctx: n,
                     repeat_penalty: Some(1.1),
                     repeat_last_n: Some(64),
+                    temperature: self.sampling.temperature,
+                    top_p: self.sampling.top_p,
+                    top_k: self.sampling.top_k,
                 });
 
             // Extract known tool names before `tools` is moved into the request.
