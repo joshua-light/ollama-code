@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,6 +29,19 @@ pub(crate) struct ToolResultData {
 }
 
 #[derive(Clone)]
+pub(crate) struct StatsInfoData {
+    pub(crate) session_duration: std::time::Duration,
+    pub(crate) agent_turns: usize,
+    pub(crate) tool_call_count: usize,
+    pub(crate) failed_tool_call_count: usize,
+    pub(crate) tool_call_breakdown: Vec<(String, usize)>,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) context_trims: usize,
+    pub(crate) model: String,
+}
+
+#[derive(Clone)]
 pub(crate) struct ContextInfoData {
     pub(crate) context_used: u64,
     pub(crate) context_size: u64,
@@ -52,6 +66,7 @@ pub(crate) enum ChatMessage {
     Error(String),
     Info(String),
     ContextInfo(ContextInfoData),
+    StatsInfo(StatsInfoData),
     GenerationSummary { duration: std::time::Duration },
     SubagentToolCall {
         name: String,
@@ -111,6 +126,10 @@ impl GenerationState {
 pub(crate) struct SessionStats {
     pub(crate) session_start: Instant,
     pub(crate) tool_call_count: usize,
+    pub(crate) failed_tool_call_count: usize,
+    pub(crate) tool_call_breakdown: BTreeMap<String, usize>,
+    pub(crate) agent_turns: usize,
+    pub(crate) context_trims: usize,
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) base_prompt_tokens: u64,
@@ -199,6 +218,10 @@ impl App {
             stats: SessionStats {
                 session_start: Instant::now(),
                 tool_call_count: 0,
+                failed_tool_call_count: 0,
+                tool_call_breakdown: BTreeMap::new(),
+                agent_turns: 0,
+                context_trims: 0,
                 input_tokens: 0,
                 output_tokens: 0,
                 base_prompt_tokens: 0,
@@ -303,7 +326,12 @@ impl App {
         self.messages.clear();
         self.current_response.clear();
         self.context_used = 0;
+        self.stats.session_start = Instant::now();
         self.stats.tool_call_count = 0;
+        self.stats.failed_tool_call_count = 0;
+        self.stats.tool_call_breakdown.clear();
+        self.stats.agent_turns = 0;
+        self.stats.context_trims = 0;
         self.stats.input_tokens = 0;
         self.stats.output_tokens = 0;
         self.scroll_offset = 0;

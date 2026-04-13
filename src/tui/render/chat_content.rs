@@ -5,7 +5,7 @@ use ratatui::{
 
 use crate::format;
 
-use super::super::app::{App, ChatMessage, ContextInfoData, PendingConfirm, ServerLoadingState, ToolResultData};
+use super::super::app::{App, ChatMessage, ContextInfoData, PendingConfirm, ServerLoadingState, StatsInfoData, ToolResultData};
 use super::super::markdown::render_markdown;
 use super::super::syntax;
 use super::{
@@ -44,6 +44,9 @@ pub(super) fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             }
             ChatMessage::ContextInfo(data) => {
                 render_chat_context_info(&mut lines, data);
+            }
+            ChatMessage::StatsInfo(data) => {
+                render_chat_stats_info(&mut lines, data);
             }
             ChatMessage::GenerationSummary { duration } => {
                 render_chat_generation_summary(&mut lines, *duration);
@@ -329,6 +332,85 @@ fn render_chat_context_info(lines: &mut Vec<Line<'static>>, data: &ContextInfoDa
     if context_size > 0 {
         push_legend(lines, c_free, "Free", free_tokens, "");
     }
+}
+
+fn render_chat_stats_info(lines: &mut Vec<Line<'static>>, data: &StatsInfoData) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let white = Style::default().fg(Color::White);
+
+    lines.push(Line::from(""));
+
+    // Header
+    lines.push(Line::from(vec![
+        Span::styled(
+            " \u{F16A3} ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Session Stats",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" \u{2014} {}", format_elapsed(data.session_duration)),
+            dim,
+        ),
+    ]));
+
+    lines.push(Line::from(""));
+
+    // Helper closure for label-value rows
+    let push_row = |lines: &mut Vec<Line<'static>>, label: &str, value: String| {
+        lines.push(Line::from(vec![
+            Span::styled(format!("   {:<16}", label), dim),
+            Span::styled(value, white),
+        ]));
+    };
+
+    // General section
+    push_row(lines, "Model", data.model.clone());
+    push_row(lines, "Agent turns", data.agent_turns.to_string());
+    if data.context_trims > 0 {
+        push_row(lines, "Context trims", data.context_trims.to_string());
+    }
+
+    lines.push(Line::from(""));
+
+    // Tool calls section
+    let tool_summary = if data.failed_tool_call_count > 0 {
+        let ok = data.tool_call_count.saturating_sub(data.failed_tool_call_count);
+        format!(
+            "{} ({} ok \u{00B7} {} failed)",
+            data.tool_call_count, ok, data.failed_tool_call_count
+        )
+    } else {
+        data.tool_call_count.to_string()
+    };
+    push_row(lines, "Tool calls", tool_summary);
+
+    // Per-tool breakdown (already sorted by count descending)
+    if !data.tool_call_breakdown.is_empty() {
+        for (name, count) in &data.tool_call_breakdown {
+            lines.push(Line::from(vec![
+                Span::styled(format!("     {:<14}", name), dim),
+                Span::styled(count.to_string(), dim),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    // Token section
+    push_row(lines, "Tokens (in)", format_number(data.input_tokens));
+    push_row(lines, "Tokens (out)", format_number(data.output_tokens));
+    push_row(
+        lines,
+        "Tokens (total)",
+        format_number(data.input_tokens + data.output_tokens),
+    );
 }
 
 fn render_chat_generation_summary(lines: &mut Vec<Line<'static>>, duration: std::time::Duration) {

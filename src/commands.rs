@@ -9,6 +9,7 @@ pub enum SlashCommand {
     Rewind,
     Session,
     Skills,
+    Stats,
     New,
     Unknown(String),
 }
@@ -60,6 +61,10 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "List available skills",
     },
     CommandInfo {
+        name: "/stats",
+        description: "Show session statistics",
+    },
+    CommandInfo {
         name: "/new",
         description: "Start a new conversation (alias for /clear)",
     },
@@ -80,6 +85,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         "/resume" => Some(SlashCommand::Resume),
         "/session" => Some(SlashCommand::Session),
         "/skills" => Some(SlashCommand::Skills),
+        "/stats" => Some(SlashCommand::Stats),
         "/new" => Some(SlashCommand::New),
         "/rewind" => Some(SlashCommand::Rewind),
         cmd => Some(SlashCommand::Unknown(cmd.to_string())),

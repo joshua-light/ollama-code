@@ -20,6 +20,7 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
         AgentEvent::ToolCall { name, args } => {
             app.flush_streaming();
             app.stats.tool_call_count += 1;
+            *app.stats.tool_call_breakdown.entry(name.clone()).or_insert(0) += 1;
             app.generation.has_received_tokens = false;
             app.generation.verb = pick_verb();
             app.messages
@@ -28,6 +29,9 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
         AgentEvent::ToolResult {
             name, output, success,
         } => {
+            if !success {
+                app.stats.failed_tool_call_count += 1;
+            }
             // Merge result into the last pending ToolCall
             let mut found = false;
             for msg in app.messages.iter_mut().rev() {
@@ -49,6 +53,7 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
             app.context_used = prompt_tokens;
         }
         AgentEvent::Done { prompt_tokens, eval_count } => {
+            app.stats.agent_turns += 1;
             app.flush_streaming();
             if prompt_tokens > 0 {
                 app.context_used = prompt_tokens;
@@ -80,6 +85,7 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
             removed_messages,
             estimated_tokens_freed,
         } => {
+            app.stats.context_trims += 1;
             app.messages.push(ChatMessage::Info(format!(
                 "Context trimmed: removed {} oldest messages (~{} tokens freed)",
                 removed_messages, estimated_tokens_freed

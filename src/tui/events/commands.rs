@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use crate::commands::SlashCommand;
 use crate::llama_server::ModelSource;
 
-use super::super::app::{AgentInput, App, ChatMessage, ContextInfoData, PendingServerStart};
+use super::super::app::{AgentInput, App, ChatMessage, ContextInfoData, PendingServerStart, StatsInfoData};
 use super::super::render::{format_number, pick_verb};
 
 pub(super) fn handle_command(
@@ -257,6 +257,24 @@ pub(super) fn handle_command(
                 }
                 app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
             }
+        }
+        SlashCommand::Stats => {
+            let mut breakdown: Vec<(String, usize)> = app.stats.tool_call_breakdown
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+            app.messages.push(ChatMessage::StatsInfo(StatsInfoData {
+                session_duration: app.stats.session_start.elapsed(),
+                agent_turns: app.stats.agent_turns,
+                tool_call_count: app.stats.tool_call_count,
+                failed_tool_call_count: app.stats.failed_tool_call_count,
+                tool_call_breakdown: breakdown,
+                input_tokens: app.stats.input_tokens,
+                output_tokens: app.stats.output_tokens,
+                context_trims: app.stats.context_trims,
+                model: app.model.clone(),
+            }));
         }
         SlashCommand::Unknown(name) => {
             let skill_name = name.trim_start_matches('/');
