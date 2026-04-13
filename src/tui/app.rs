@@ -58,6 +58,9 @@ pub(crate) enum ChatMessage {
         args: String,
         success: Option<bool>,
     },
+    SkillLoad {
+        name: String,
+    },
 }
 
 pub(crate) struct PendingConfirm {

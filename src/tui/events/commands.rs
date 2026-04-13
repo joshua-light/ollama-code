@@ -268,13 +268,10 @@ pub(super) fn handle_command(
                             .unwrap_or("")
                             .trim();
 
-                        // Show the slash command in chat (not the full instructions)
-                        let display = if args.is_empty() {
-                            format!("/{}", skill_name)
-                        } else {
-                            format!("/{} {}", skill_name, args)
-                        };
-                        app.messages.push(ChatMessage::User(display));
+                        // Show skill load indicator
+                        app.messages.push(ChatMessage::SkillLoad {
+                            name: skill_name.to_string(),
+                        });
 
                         // Build the prompt: instructions + optional user args
                         let prompt = if args.is_empty() {

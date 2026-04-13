@@ -51,6 +51,9 @@ pub(super) fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             ChatMessage::SubagentToolCall { name, args, success } => {
                 render_chat_subagent_tool_call(&mut lines, name, args, *success);
             }
+            ChatMessage::SkillLoad { name } => {
+                render_chat_skill_load(&mut lines, name);
+            }
         }
     }
 
@@ -365,6 +368,21 @@ fn render_chat_subagent_tool_call(
             Style::default().fg(Color::DarkGray),
         ),
     ]));
+}
+
+fn render_chat_skill_load(lines: &mut Vec<Line<'static>>, name: &str) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("Skill(/{})", name),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("{}Successfully loaded skill", format::PREFIX_FIRST),
+        Style::default().fg(Color::DarkGray),
+    )));
 }
 
 fn render_chat_streaming(lines: &mut Vec<Line<'static>>, response: &str, width: u16) {
