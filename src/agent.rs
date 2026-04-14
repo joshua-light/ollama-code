@@ -745,7 +745,10 @@ impl Agent {
             return Ok(true);
         }
 
-        // Check cancellation before each tool call
+        // Check cancellation before each tool call.
+        // NOTE: callers rely on no tool result message being pushed when we
+        // return Ok(false), so they can backfill "Cancelled" results for
+        // this tool call and all remaining ones using tool_calls_with_ids[i..].
         if cancel.load(Ordering::Relaxed) {
             send_event(events, AgentEvent::Cancelled)?;
             return Ok(false);
@@ -757,6 +760,9 @@ impl Agent {
             tokio::select! {
                 output = BashTool.execute_async(args, self.bash_timeout) => output,
                 _ = poll_cancel(cancel) => {
+                    // NOTE: callers rely on no tool result message being pushed
+                    // when we return Ok(false), so they can backfill "Cancelled"
+                    // results starting from this tool call's index.
                     send_event(events, AgentEvent::Cancelled)?;
                     return Ok(false);
                 }
@@ -1196,9 +1202,19 @@ impl Agent {
                     // model sees its own tool-call request without a matching
                     // result and retries the same action.
                     if cancel.load(Ordering::Relaxed) {
+                        // Starting from index `i` is correct because
+                        // dispatch_tool_call does NOT push a tool result
+                        // message when returning Ok(false) (cancel path),
+                        // so the current tool call still needs a result.
                         for remaining in &tool_calls_with_ids[i..] {
+                            let cancelled_msg = "Cancelled by user.";
+                            send_event(events, AgentEvent::ToolResult {
+                                name: remaining.function.name.clone(),
+                                output: cancelled_msg.to_string(),
+                                success: false,
+                            })?;
                             let tool_msg = Message::tool(
-                                "Cancelled by user.",
+                                cancelled_msg,
                                 remaining.id.clone(),
                                 false,
                             );
