@@ -1158,7 +1158,7 @@ checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
 name = "ollama-code"
-version = "0.10.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "clap",

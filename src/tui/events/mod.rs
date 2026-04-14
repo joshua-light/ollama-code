@@ -4,7 +4,7 @@ mod commands;
 use std::sync::Arc;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
 use crate::llama_server::{self, LlamaCppBackend, LlamaServer, ModelSource};
@@ -34,6 +34,9 @@ pub(super) fn handle_terminal_event(
     }
 
     if let Event::Key(key) = evt {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if app.pending_confirm.is_some() {
                 app.pending_confirm = None;

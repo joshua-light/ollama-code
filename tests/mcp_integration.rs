@@ -106,7 +106,7 @@ async fn agent_with_mcp_tools_end_to_end() {
     mcp_servers.insert("testmcp".to_string(), test_server_config());
 
     let config = Config {
-        mcp_servers: Some(mcp_servers),
+        mcp: Some(mcp_servers),
         ..Default::default()
     };
 
@@ -143,7 +143,7 @@ async fn agent_mcp_tools_appear_in_definitions() {
     mcp_servers.insert("s".to_string(), test_server_config());
 
     let config = Config {
-        mcp_servers: Some(mcp_servers),
+        mcp: Some(mcp_servers),
         ..Default::default()
     };
 
@@ -187,7 +187,7 @@ async fn agent_mcp_needs_confirm() {
     mcp_servers.insert("guarded".to_string(), confirm_config);
 
     let config = Config {
-        mcp_servers: Some(mcp_servers),
+        mcp: Some(mcp_servers),
         ..Default::default()
     };
 
@@ -227,7 +227,7 @@ async fn agent_mcp_server_disabled_via_config() {
     );
 
     let config = Config {
-        mcp_servers: Some(mcp_servers),
+        mcp: Some(mcp_servers),
         plugins: Some(plugins),
         ..Default::default()
     };

@@ -36,15 +36,15 @@ async fn tool_call_read_file() {
     let backend = Arc::new(MockBackend::new(vec![
         MockResponse::tool_call(
             "read",
-            serde_json::json!({ "file_path": "/etc/hostname" }),
+            serde_json::json!({ "file_path": "/etc/hosts" }),
         ),
-        MockResponse::text("Your hostname file contains the machine name."),
+        MockResponse::text("Your hosts file contains network mappings."),
     ]));
 
-    let result = run_agent(backend.clone(), "Read /etc/hostname", ConfirmStrategy::ApproveAll).await;
+    let result = run_agent(backend.clone(), "Read /etc/hosts", ConfirmStrategy::ApproveAll).await;
 
     assert!(result.is_done());
-    assert_eq!(result.final_content(), "Your hostname file contains the machine name.");
+    assert_eq!(result.final_content(), "Your hosts file contains network mappings.");
 
     let tool_calls = result.tool_calls();
     assert_eq!(tool_calls.len(), 1);
@@ -121,7 +121,7 @@ async fn selective_confirm() {
         // After bash is denied, model tries read instead
         MockResponse::tool_call(
             "read",
-            serde_json::json!({ "file_path": "/etc/hostname" }),
+            serde_json::json!({ "file_path": "/etc/hosts" }),
         ),
         MockResponse::text("Done."),
     ]));

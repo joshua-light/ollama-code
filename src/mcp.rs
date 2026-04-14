@@ -20,12 +20,12 @@ use crate::tools::{Tool, ToolDefinition};
 ///
 /// ```toml
 /// # Stdio transport
-/// [mcp_servers.filesystem]
+/// [mcp.filesystem]
 /// command = "npx"
 /// args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 ///
 /// # Streamable HTTP transport
-/// [mcp_servers.remote]
+/// [mcp.remote]
 /// url = "https://example.com/mcp"
 /// headers = { Authorization = "Bearer tok_..." }
 /// ```

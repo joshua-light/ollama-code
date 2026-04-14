@@ -1,9 +1,98 @@
+use std::ffi::OsStr;
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use serde_json::Value;
 
 use super::{format_bash_output, optional_str, Tool, ToolDefinition};
 
 pub struct BashTool;
+
+/// Resolve the path to a bash executable, cached for the lifetime of the process.
+///
+/// On Unix this simply returns `"bash"` and relies on `$PATH`.
+///
+/// On Windows, `Command::new("bash")` already searches `$PATH`, so we use
+/// that as the default. If well-known Git Bash installation directories
+/// contain `bash.exe`, we return the first match instead — this covers the
+/// common case where Git for Windows is installed but its `bin` directory
+/// is not on `$PATH`.
+///
+/// Probed locations (Windows only):
+///   1. `$GIT_INSTALL_ROOT\bin\bash.exe`
+///   2. `$ProgramFiles\Git\bin\bash.exe`
+///   3. `$ProgramFiles(x86)\Git\bin\bash.exe`
+///   4. `$LOCALAPPDATA\Programs\Git\bin\bash.exe`
+///
+/// Returns a reference to a cached `OsStr` — either one of the probed
+/// paths or the bare string `"bash"` so the caller gets a clear
+/// "program not found" error from the OS.
+fn resolve_bash_path() -> &'static OsStr {
+    static BASH_PATH: OnceLock<std::ffi::OsString> = OnceLock::new();
+    BASH_PATH
+        .get_or_init(|| {
+            #[cfg(not(windows))]
+            {
+                std::ffi::OsString::from("bash")
+            }
+
+            #[cfg(windows)]
+            {
+                use std::path::PathBuf;
+
+                let try_path = |p: PathBuf| -> Option<std::ffi::OsString> {
+                    if p.is_file() {
+                        Some(p.into_os_string())
+                    } else {
+                        None
+                    }
+                };
+
+                // 1. $GIT_INSTALL_ROOT\bin\bash.exe
+                if let Ok(root) = std::env::var("GIT_INSTALL_ROOT") {
+                    if let Some(p) = try_path(PathBuf::from(&root).join("bin").join("bash.exe")) {
+                        return p;
+                    }
+                }
+
+                // 2. $ProgramFiles\Git\bin\bash.exe  (typically C:\Program Files\Git)
+                if let Ok(pf) = std::env::var("ProgramFiles") {
+                    if let Some(p) =
+                        try_path(PathBuf::from(&pf).join("Git").join("bin").join("bash.exe"))
+                    {
+                        return p;
+                    }
+                }
+
+                // 3. $ProgramFiles(x86)\Git\bin\bash.exe
+                if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+                    if let Some(p) =
+                        try_path(PathBuf::from(&pf86).join("Git").join("bin").join("bash.exe"))
+                    {
+                        return p;
+                    }
+                }
+
+                // 4. $LOCALAPPDATA\Programs\Git\bin\bash.exe
+                if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                    if let Some(p) = try_path(
+                        PathBuf::from(&local)
+                            .join("Programs")
+                            .join("Git")
+                            .join("bin")
+                            .join("bash.exe"),
+                    ) {
+                        return p;
+                    }
+                }
+
+                // Fallback — let the OS search PATH and produce "program not found"
+                // if bash is not available at all.
+                std::ffi::OsString::from("bash")
+            }
+        })
+        .as_os_str()
+}
 
 impl BashTool {
     /// Async execution with timeout and kill-on-drop. This is the primary
@@ -14,7 +103,8 @@ impl BashTool {
         timeout: std::time::Duration,
     ) -> (String, bool) {
         let command = optional_str(arguments, "command").unwrap_or("");
-        match tokio::process::Command::new("bash")
+        let bash = resolve_bash_path();
+        match tokio::process::Command::new(bash)
             .arg("-c")
             .arg(command)
             .stdout(std::process::Stdio::piped())
@@ -32,7 +122,10 @@ impl BashTool {
                     ),
                 }
             }
-            Err(e) => (format!("Error: {}", e), false),
+            Err(e) => (
+                format!("Error spawning bash ({}): {}", bash.to_string_lossy(), e),
+                false,
+            ),
         }
     }
 }

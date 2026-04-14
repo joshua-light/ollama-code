@@ -101,11 +101,11 @@ pub struct Config {
     /// MCP (Model Context Protocol) servers.
     ///
     /// Each entry spawns a server process at startup and registers its tools:
-    ///   `[mcp_servers.filesystem]`
+    ///   `[mcp.filesystem]`
     ///   `command = "npx"`
     ///   `args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]`
     #[serde(default)]
-    pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
+    pub mcp: Option<HashMap<String, McpServerConfig>>,
 
     /// Hook feature flags and per-hook configuration.
     ///
@@ -276,7 +276,7 @@ impl Config {
             bypass: self.bypass.or(other.bypass),
             plugins: merge_hashmap(self.plugins, &other.plugins),
             plugin_dirs: self.plugin_dirs.or_else(|| other.plugin_dirs.clone()),
-            mcp_servers: merge_hashmap(self.mcp_servers, &other.mcp_servers),
+            mcp: merge_hashmap(self.mcp, &other.mcp),
             hooks: merge_hashmap(self.hooks, &other.hooks),
             temperature: self.temperature.or(other.temperature),
             top_p: self.top_p.or(other.top_p),
@@ -307,6 +307,120 @@ impl Config {
         }
         std::fs::write(&path, toml::to_string_pretty(self)?)?;
         Ok(())
+    }
+
+    /// If the user config file does not exist, write a commented template so
+    /// the user can discover and edit available options.
+    pub fn ensure_default_config() -> Result<()> {
+        let path = Self::path();
+        if path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, Self::default_template())?;
+        Ok(())
+    }
+
+    fn default_template() -> &'static str {
+        r#"# ollama-code configuration
+# Uncomment and edit the settings you want to change.
+
+# Model to use (e.g. "qwen2.5-coder:7b", "gemma3:12b")
+# model = "qwen2.5-coder:7b"
+
+# Context window size in tokens (default: 32768)
+# context_size = 32768
+
+# Ollama API base URL (default: "http://localhost:11434")
+# ollama_url = "http://localhost:11434"
+
+# Backend: "ollama" (default) or "llama-cpp"
+# backend = "ollama"
+
+# Path to llama-server binary (for llama-cpp backend)
+# llama_server_path = "/path/to/llama-server"
+
+# URL of a remote llama-server (e.g. "http://192.168.1.50:8080")
+# When set, connects directly without spawning a local server.
+# llama_server_url = "http://192.168.1.50:8080"
+
+# Path to a GGUF model file (for llama-cpp backend)
+# model_path = "/path/to/model.gguf"
+
+# HuggingFace repo to download the model from (e.g. "google/gemma-3-27b-it-GGUF")
+# Used by llama-server's -hf flag. Takes precedence over Ollama blob resolution.
+# hf_repo = "google/gemma-3-27b-it-GGUF"
+
+# Extra arguments passed to llama-server (e.g. ["-ngl", "99"])
+# llama_server_args = ["-ngl", "99"]
+
+# Timeout for bash tool commands in seconds (default: 120)
+# bash_timeout = 120
+
+# Maximum number of agent-loop turns a sub-agent is allowed (default: 15)
+# subagent_max_turns = 15
+
+# Show estimated Opus 4.6 cost on the status line (default: false)
+# show_cost_estimate = false
+
+# Auto-approve all tool calls (default: false)
+# no_confirm = false
+
+# Enable bypass mode — auto-approve all tool calls by default (default: false)
+# bypass = false
+
+# Enable verbose/debug output (default: false)
+# verbose = false
+
+# Sampling temperature (0.0 = deterministic, higher = more random)
+# Recommended: 0.1-0.3 for tool use, 0.5-0.8 for creative/planning
+# temperature = 0.2
+
+# Top-p (nucleus) sampling. Only tokens with cumulative probability <= top_p are considered.
+# top_p = 0.9
+
+# Top-k sampling. Only the top k tokens are considered.
+# top_k = 40
+
+# Enable dynamic tool scoping: only present relevant tools per turn (default: false)
+# Reduces confusion in small models.
+# tool_scoping = false
+
+# Enable periodic task re-injection to fight coherence decay (default: false)
+# task_reinjection = false
+
+# How often to re-inject the task objective, in agent turns (default: 3)
+# reinjection_interval = 3
+
+# Context trim threshold as percentage of context_size (default: 80)
+# When prompt tokens exceed this, auto-trimming kicks in.
+# trim_threshold = 80
+
+# Context trim target as percentage of context_size (default: 60)
+# Trimming removes messages until usage drops to this level.
+# trim_target = 60
+
+# Plugin feature flags and configuration
+# Boolean values enable/disable tools by name:
+#   bash = false     # disables the built-in bash tool
+# Table values provide plugin-specific configuration:
+# [plugins.my-plugin]
+# key = "value"
+
+# MCP (Model Context Protocol) servers
+# Each entry spawns a server process at startup and registers its tools.
+# [mcp.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+# Hook feature flags and per-hook configuration
+# Boolean values enable/disable hooks by name:
+#   my-hook = false   # disables the hook
+# [hooks.my-hook]
+# key = "value"
+"#
     }
 
     /// Check whether a tool/plugin is enabled.
@@ -608,7 +722,7 @@ trim_target = 50
 [plugins]
 bash = false
 
-[mcp_servers.test]
+[mcp.test]
 command = "echo"
 args = ["hello"]
 "#;

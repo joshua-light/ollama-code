@@ -46,7 +46,9 @@ pub enum AgentEvent {
         base_prompt_tokens: u64,
         project_docs: Vec<(String, u64)>,
         skills_tokens: u64,
-        tool_defs_tokens: u64,
+        /// Per-category breakdown of tool definition tokens: (label, tokens).
+        /// Labels are "Built-in", "MCP: <server>", or "Plugins".
+        tool_defs_breakdown: Vec<(String, u64)>,
     },
 }
 
@@ -219,7 +221,7 @@ impl Agent {
         // Start MCP servers and register their tools.
         let mut mcp_servers = Vec::new();
         if !is_subagent {
-            if let Some(ref servers) = cfg.mcp_servers {
+            if let Some(ref servers) = cfg.mcp {
                 for server in mcp::start_servers(servers, |name| cfg.is_tool_enabled(name)) {
                     for mcp_tool in server.create_tools() {
                         let tool_name = mcp_tool.name().to_string();
@@ -816,17 +818,53 @@ impl Agent {
             if let Some(sys_msg) = self.messages.first() {
                 send_event(events, AgentEvent::MessageLogged(sys_msg.clone()))?;
             }
-            // Estimate tool definition tokens from their JSON representation.
-            let tool_defs_chars: usize = self.tools.definitions().iter()
-                .map(|d| d.to_string().len())
-                .sum();
+            // Estimate tool definition tokens, broken down by category.
+            const BUILTIN_TOOLS: &[&str] = &[
+                "bash", "read", "edit", "write", "glob", "grep", "subagent",
+            ];
+            let mut builtin_chars: usize = 0;
+            let mut plugin_chars: usize = 0;
+            let mut mcp_chars: Vec<(String, usize)> = Vec::new();
+
+            for def in self.tools.definitions() {
+                let chars = def.to_string().len();
+                let name = def["function"]["name"].as_str().unwrap_or("");
+
+                if name.starts_with("mcp__") {
+                    let server = name
+                        .strip_prefix("mcp__")
+                        .and_then(|rest| rest.split("__").next())
+                        .unwrap_or("unknown");
+                    if let Some(entry) = mcp_chars.iter_mut().find(|(s, _)| s == server) {
+                        entry.1 += chars;
+                    } else {
+                        mcp_chars.push((server.to_string(), chars));
+                    }
+                } else if BUILTIN_TOOLS.contains(&name) {
+                    builtin_chars += chars;
+                } else {
+                    plugin_chars += chars;
+                }
+            }
+
+            let mut tool_defs_breakdown: Vec<(String, u64)> = Vec::new();
+            if builtin_chars > 0 {
+                tool_defs_breakdown.push(("Built-in".to_string(), message::estimate_tokens(builtin_chars)));
+            }
+            for (server, chars) in &mcp_chars {
+                tool_defs_breakdown.push((format!("MCP: {}", server), message::estimate_tokens(*chars)));
+            }
+            if plugin_chars > 0 {
+                tool_defs_breakdown.push(("Plugins".to_string(), message::estimate_tokens(plugin_chars)));
+            }
+
             send_event(events, AgentEvent::SystemPromptInfo {
                 base_prompt_tokens: message::estimate_tokens(self.system_prompt_base_len),
                 project_docs: self.project_docs_info.iter()
                     .map(|(name, len)| (name.clone(), message::estimate_tokens(*len)))
                     .collect(),
                 skills_tokens: message::estimate_tokens(self.skills_summary_len),
-                tool_defs_tokens: message::estimate_tokens(tool_defs_chars),
+                tool_defs_breakdown,
             })?;
             self.system_prompt_logged = true;
         }
