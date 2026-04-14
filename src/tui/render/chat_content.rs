@@ -34,7 +34,7 @@ pub(super) fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 render_chat_assistant(&mut lines, text, width);
             }
             ChatMessage::ToolCall { name, args, result } => {
-                render_chat_tool_call(&mut lines, name, args, result.as_ref(), app.tools_expanded);
+                render_chat_tool_call(&mut lines, name, args, result.as_ref(), app.tools_expanded, app.generation.start);
             }
             ChatMessage::Error(e) => {
                 render_chat_error(&mut lines, e);
@@ -128,15 +128,23 @@ fn render_chat_tool_call(
     args: &str,
     result: Option<&ToolResultData>,
     expanded: bool,
+    generation_start: Option<std::time::Instant>,
 ) {
     lines.push(Line::from(""));
-    let circle_color = match result {
+    let color = match result {
         Some(ToolResultData { success: true, .. }) => Color::Green,
         Some(ToolResultData { success: false, .. }) => Color::Red,
-        None => Color::DarkGray,
+        None => {
+            let elapsed = generation_start
+                .map(|s| s.elapsed())
+                .unwrap_or_default();
+            let highlight = (elapsed.as_millis() / 500).is_multiple_of(2);
+            if highlight { Color::Yellow } else { Color::DarkGray }
+        }
     };
+    let icon = Span::styled(" ● ", Style::default().fg(color));
     lines.push(Line::from(vec![
-        Span::styled(" ● ", Style::default().fg(circle_color)),
+        icon,
         Span::styled(
             format!("{}({})", format::capitalize_first(name), format::truncate_args(args, 77)),
             Style::default().fg(Color::White),
