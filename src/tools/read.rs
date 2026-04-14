@@ -12,7 +12,9 @@ impl Tool for ReadTool {
         ToolDefinition {
             name: "read".to_string(),
             description: "Read a file from the filesystem. Returns file contents with line \
-                          numbers. Use offset and limit to read specific portions of large files."
+                          numbers. Use offset and limit to read specific portions of large files. \
+                          The limit parameter is capped at 2000 lines; use grep to search large \
+                          files instead of reading them entirely."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -27,7 +29,7 @@ impl Tool for ReadTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of lines to read (default: entire file)"
+                        "description": "Maximum number of lines to read (default: 200, max: 2000). Use grep to search large files instead of reading them entirely."
                     }
                 },
                 "required": ["file_path"]
@@ -53,15 +55,18 @@ impl Tool for ReadTool {
         let start = (offset - 1).min(total_lines);
 
         const DEFAULT_LIMIT: usize = 200;
+        const MAX_LIMIT: usize = 2000;
 
-        let limit = arguments
+        let raw_limit = arguments
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(DEFAULT_LIMIT);
+            .map(|v| v as usize);
+
+        let limit_capped = raw_limit.is_some_and(|l| l > MAX_LIMIT);
+        let limit = raw_limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
 
         let end = (start + limit).min(total_lines);
-        let truncated = end < total_lines && arguments.get("limit").is_none();
+        let truncated = end < total_lines && raw_limit.is_none();
 
         let mut result = String::new();
         for (i, line) in lines[start..end].iter().enumerate() {
@@ -71,6 +76,14 @@ impl Tool for ReadTool {
 
         if result.is_empty() {
             result = "(empty file)".to_string();
+        } else if limit_capped && end < total_lines {
+            result.push_str(&format!(
+                "\n... (limit capped to {} lines, {} more lines not shown. \
+                 If you are looking for something specific, use the grep tool instead \
+                 of reading large portions of a file.)\n",
+                MAX_LIMIT,
+                total_lines - end,
+            ));
         } else if truncated {
             result.push_str(&format!(
                 "\n... ({} more lines not shown. Use offset and limit to read more.)\n",
