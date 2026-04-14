@@ -1,6 +1,6 @@
 ---
 name: "self-modify"
-description: "View and modify ollama-code settings, features, and customization"
+description: "View and modify Ollama Code (you) settings, features, and customization"
 trigger: "ollama.code|modify (this|the) (app|tool|agent|cli)|change (this|the) (app|tool|agent|cli)|add.*(mcp|hook|skill|tool plugin)|configure.*(mcp|hook|skill)|mcp server|modify (itself|yourself)|update (itself|yourself)|(edit|change|update|set).*(config|settings)"
 ---
 
