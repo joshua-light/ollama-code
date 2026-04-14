@@ -53,7 +53,7 @@ pub(crate) struct ContextInfoData {
     pub(crate) base_prompt_tokens: u64,
     pub(crate) project_docs_tokens: Vec<(String, u64)>,
     pub(crate) skills_tokens: u64,
-    pub(crate) tool_defs_tokens: u64,
+    pub(crate) tool_defs_breakdown: Vec<(String, u64)>,
 }
 
 #[derive(Clone)]
@@ -137,7 +137,7 @@ pub(crate) struct SessionStats {
     pub(crate) base_prompt_tokens: u64,
     pub(crate) project_docs_tokens: Vec<(String, u64)>,
     pub(crate) skills_tokens: u64,
-    pub(crate) tool_defs_tokens: u64,
+    pub(crate) tool_defs_breakdown: Vec<(String, u64)>,
 }
 
 pub(crate) struct ServerState {
@@ -229,7 +229,7 @@ impl App {
                 base_prompt_tokens: 0,
                 project_docs_tokens: Vec::new(),
                 skills_tokens: 0,
-                tool_defs_tokens: 0,
+                tool_defs_breakdown: Vec::new(),
             },
             server: ServerState {
                 stop_llama_server: false,

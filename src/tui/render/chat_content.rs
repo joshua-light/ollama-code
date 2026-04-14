@@ -208,7 +208,8 @@ fn render_chat_context_info(lines: &mut Vec<Line<'static>>, data: &ContextInfoDa
     let base_prompt_tokens = data.base_prompt_tokens;
     let project_docs_tokens = &data.project_docs_tokens;
     let skills_tokens = data.skills_tokens;
-    let tool_defs_tokens = data.tool_defs_tokens;
+    let tool_defs_breakdown = &data.tool_defs_breakdown;
+    let tool_defs_tokens: u64 = tool_defs_breakdown.iter().map(|(_, t)| *t).sum();
 
     lines.push(Line::from(""));
 
@@ -322,7 +323,23 @@ fn render_chat_context_info(lines: &mut Vec<Line<'static>>, data: &ContextInfoDa
         push_legend(lines, c_skills, "Skills", skills_tokens, "");
     }
     if tool_defs_tokens > 0 {
-        push_legend(lines, c_tools, "Tool schemas", tool_defs_tokens, "");
+        if tool_defs_breakdown.len() > 1 {
+            // Show aggregate header then per-category sub-items.
+            push_legend(lines, c_tools, "Tool schemas", tool_defs_tokens, "");
+            for (label, tokens) in tool_defs_breakdown {
+                lines.push(Line::from(vec![
+                    Span::styled("     · ", Style::default().fg(c_tools)),
+                    Span::styled(format!("{:<12}", label), dim),
+                    Span::styled(format!("~{}", format_number(*tokens)), white),
+                ]));
+            }
+        } else {
+            // Single category — just show the flat line (label from breakdown or fallback).
+            let label = tool_defs_breakdown.first()
+                .map(|(l, _)| l.as_str())
+                .unwrap_or("Tool schemas");
+            push_legend(lines, c_tools, label, tool_defs_tokens, "");
+        }
     }
     let msg_detail = format!(
         "{} user · {} assistant · {} tool",

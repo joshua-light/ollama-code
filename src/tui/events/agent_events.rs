@@ -125,11 +125,11 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
             app.messages.push(ChatMessage::Info("Generation cancelled.".into()));
             app.finish_processing();
         }
-        AgentEvent::SystemPromptInfo { base_prompt_tokens, project_docs, skills_tokens, tool_defs_tokens } => {
+        AgentEvent::SystemPromptInfo { base_prompt_tokens, project_docs, skills_tokens, tool_defs_breakdown } => {
             app.stats.base_prompt_tokens = base_prompt_tokens;
             app.stats.project_docs_tokens = project_docs;
             app.stats.skills_tokens = skills_tokens;
-            app.stats.tool_defs_tokens = tool_defs_tokens;
+            app.stats.tool_defs_breakdown = tool_defs_breakdown;
         }
         // MessageLogged and Debug are handled by the session logger in the event loop,
         // not by the app state.

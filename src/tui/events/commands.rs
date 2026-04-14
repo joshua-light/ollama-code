@@ -157,7 +157,7 @@ pub(super) fn handle_command(
                     base_prompt_tokens: app.stats.base_prompt_tokens,
                     project_docs_tokens: app.stats.project_docs_tokens.clone(),
                     skills_tokens: app.stats.skills_tokens,
-                    tool_defs_tokens: app.stats.tool_defs_tokens,
+                    tool_defs_breakdown: app.stats.tool_defs_breakdown.clone(),
                 }));
             }
         }
@@ -175,7 +175,7 @@ pub(super) fn handle_command(
             app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
         }
         SlashCommand::Mcp => {
-            match &app.config.mcp_servers {
+            match &app.config.mcp {
                 Some(servers) if !servers.is_empty() => {
                     let mut info = String::new();
                     for (name, cfg) in servers {
@@ -202,7 +202,7 @@ pub(super) fn handle_command(
                 }
                 _ => {
                     app.messages.push(ChatMessage::Info(
-                        "No MCP servers configured. Add [mcp_servers.<name>] to your config.".into(),
+                        "No MCP servers configured. Add [mcp.<name>] to your config.".into(),
                     ));
                 }
             }

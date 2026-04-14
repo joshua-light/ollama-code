@@ -51,7 +51,10 @@ ollama-code
 ollama-code -p "list all TODO comments in this directory"
 ```
 
-On first launch, if no model is configured, you'll be prompted to pick from your locally available models. The choice is saved to `~/.config/ollama-code/config.toml`.
+On first launch, a default `config.toml` is created automatically with all available options documented as comments. If no model is configured, you'll be prompted to pick from your locally available models. The config file location is platform-dependent:
+
+- **macOS**: `~/Library/Application Support/ollama-code/config.toml`
+- **Linux**: `~/.config/ollama-code/config.toml`
 
 ## Usage
 
@@ -105,7 +108,7 @@ Bash, edit, and write require user confirmation by default (use `--no-confirm` o
 
 ## Configuration
 
-Settings are stored in `~/.config/ollama-code/config.toml`. You can also place a `.ollama-code.toml` in your project root — its values are layered over the user config.
+Settings are stored in the platform config directory (`~/Library/Application Support/ollama-code/config.toml` on macOS, `~/.config/ollama-code/config.toml` on Linux). You can also place a `.ollama-code.toml` in your project root — its values are layered over the user config.
 
 ```toml
 model = "qwen2.5-coder:7b"
@@ -143,7 +146,7 @@ context_size = 32768
 # llama_server_args = ["-ngl", "99"]
 
 # MCP servers
-# [mcp_servers.filesystem]
+# [mcp.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 
@@ -180,7 +183,7 @@ ollama-code --backend llama-cpp \
 Connect external tools via the [Model Context Protocol](https://modelcontextprotocol.io). Servers are configured in `config.toml` and their tools are discovered at startup:
 
 ```toml
-[mcp_servers.filesystem]
+[mcp.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 ```
@@ -190,7 +193,7 @@ Use `/mcp` in the TUI to see connected servers and their tools.
 ## Plugins
 
 Extend the agent with custom tools via external plugins. Plugins are discovered from:
-- `~/.config/ollama-code/plugins/<name>/PLUGIN.toml`
+- `<CONFIG_DIR>/ollama-code/plugins/<name>/PLUGIN.toml` (user-global)
 - `.agents/plugins/<name>/PLUGIN.toml` (project-local)
 
 Each plugin exposes tools that are executed as subprocesses with JSON on stdin. See [PLUGIN.toml](https://github.com/joshua-light/ollama-code) for the manifest format.
@@ -198,8 +201,10 @@ Each plugin exposes tools that are executed as subprocesses with JSON on stdin. 
 ## Skills
 
 Skills are project-specific slash commands defined as SKILL.md files. They are discovered from:
-- `~/.config/ollama-code/skills/<name>/SKILL.md`
+- `<CONFIG_DIR>/ollama-code/skills/<name>/SKILL.md` (user-global)
 - `.agents/skills/<name>/SKILL.md` (project-local)
+
+> `<CONFIG_DIR>` is `~/Library/Application Support` on macOS and `~/.config` on Linux.
 
 Use `/skills` in the TUI to list available skills. Any skill can be invoked as `/<skill-name>`.
 

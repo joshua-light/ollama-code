@@ -69,6 +69,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = Config::load()?;
 
+    // Ensure a default config file exists so the user can discover and edit it.
+    if let Err(e) = Config::ensure_default_config() {
+        eprintln!("Warning: could not create default config: {}", e);
+    }
+
     // Apply CLI overrides (highest priority layer) — moves, not clones.
     if cli.model.is_some() { config.model = cli.model; }
     if cli.context_size.is_some() { config.context_size = cli.context_size; }
