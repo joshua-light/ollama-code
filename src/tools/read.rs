@@ -12,7 +12,9 @@ impl Tool for ReadTool {
         ToolDefinition {
             name: "read".to_string(),
             description: "Read a file from the filesystem. Returns file contents with line \
-                          numbers. Use offset and limit to read specific portions of large files."
+                          numbers. Use offset and limit to read specific portions of large files. \
+                          The limit parameter is capped at 2000 lines; use grep to search large \
+                          files instead of reading them entirely."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -74,7 +76,7 @@ impl Tool for ReadTool {
 
         if result.is_empty() {
             result = "(empty file)".to_string();
-        } else if limit_capped {
+        } else if limit_capped && end < total_lines {
             result.push_str(&format!(
                 "\n... (limit capped to {} lines, {} more lines not shown. \
                  If you are looking for something specific, use the grep tool instead \
