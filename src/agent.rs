@@ -745,7 +745,10 @@ impl Agent {
             return Ok(true);
         }
 
-        // Check cancellation before each tool call
+        // Check cancellation before each tool call.
+        // NOTE: callers rely on no tool result message being pushed when we
+        // return Ok(false), so they can backfill "Cancelled" results for
+        // this tool call and all remaining ones using tool_calls_with_ids[i..].
         if cancel.load(Ordering::Relaxed) {
             send_event(events, AgentEvent::Cancelled)?;
             return Ok(false);
@@ -757,6 +760,9 @@ impl Agent {
             tokio::select! {
                 output = BashTool.execute_async(args, self.bash_timeout) => output,
                 _ = poll_cancel(cancel) => {
+                    // NOTE: callers rely on no tool result message being pushed
+                    // when we return Ok(false), so they can backfill "Cancelled"
+                    // results starting from this tool call's index.
                     send_event(events, AgentEvent::Cancelled)?;
                     return Ok(false);
                 }
@@ -963,6 +969,14 @@ impl Agent {
                     return Ok(());
                 }
             };
+
+            // If cancellation was requested while the stream was completing
+            // (race between backend.chat finishing and poll_cancel detecting
+            // the flag), honour the cancellation immediately.
+            if cancel.load(Ordering::Relaxed) {
+                send_event(events, AgentEvent::Cancelled)?;
+                return Ok(());
+            }
 
             let ns_to_ms = |ns: u64| -> f64 { ns as f64 / 1_000_000.0 };
             let prompt_tps = if response.prompt_eval_duration > 0 {
@@ -1172,7 +1186,7 @@ impl Agent {
             self.messages.push(assistant_msg.clone());
             send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
 
-            for tool_call in &tool_calls_with_ids {
+            for (i, tool_call) in tool_calls_with_ids.iter().enumerate() {
                 // Track tool calls for re-injection summary
                 if self.task_reinjection {
                     tool_call_summary.push(tool_call.function.name.clone());
@@ -1182,6 +1196,32 @@ impl Agent {
                     .dispatch_tool_call(tool_call, events, confirm_rx, &cancel)
                     .await?;
                 if !continue_loop {
+                    // If cancelled, add "Cancelled" tool results for the
+                    // current (un-executed) tool call and all remaining ones
+                    // so the message history stays consistent — otherwise the
+                    // model sees its own tool-call request without a matching
+                    // result and retries the same action.
+                    if cancel.load(Ordering::Relaxed) {
+                        // Starting from index `i` is correct because
+                        // dispatch_tool_call does NOT push a tool result
+                        // message when returning Ok(false) (cancel path),
+                        // so the current tool call still needs a result.
+                        for remaining in &tool_calls_with_ids[i..] {
+                            let cancelled_msg = "Cancelled by user.";
+                            send_event(events, AgentEvent::ToolResult {
+                                name: remaining.function.name.clone(),
+                                output: cancelled_msg.to_string(),
+                                success: false,
+                            })?;
+                            let tool_msg = Message::tool(
+                                cancelled_msg,
+                                remaining.id.clone(),
+                                false,
+                            );
+                            self.messages.push(tool_msg.clone());
+                            send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+                        }
+                    }
                     return Ok(());
                 }
             }
