@@ -93,6 +93,9 @@ fn render_table(table_lines: &[&str], output: &mut Vec<Line<'static>>, max_width
     if total_content > available_content && available_content > 0 {
         // Minimum width per column: at least the header width (so headers aren't truncated),
         // with an absolute floor of 3 characters.
+        // The `.min(col_widths[j])` cap ensures we don't set a minimum wider than the
+        // column's natural content width (e.g. a column where all values fit in 2 chars
+        // shouldn't get a minimum of 3).
         let min_widths: Vec<usize> = header
             .iter()
             .enumerate()
@@ -883,6 +886,64 @@ mod tests {
         assert!(is_table_separator("|:---:|---:|"));
         assert!(!is_table_separator("| hello | world |"));
         assert!(!is_table_separator("not a table"));
+    }
+
+    #[test]
+    fn table_narrow_width_proportional_distribution() {
+        // Wide-content table rendered at a narrow width (40) to exercise the
+        // proportional distribution branch (total_content > available but
+        // total_min < available).
+        let md = "\
+| Name           | Description                        | Status |
+|----------------|-------------------------------------|--------|
+| Widget Alpha   | A very long description of widget   | Active |
+| Beta Component | Another lengthy description here    | Draft  |";
+        let lines = render_markdown(md, 40);
+        let text = all_text(&lines);
+        // Table should still render with borders and contain data
+        assert!(text.contains('┌'));
+        assert!(text.contains('┘'));
+        assert!(text.contains("Name"));
+        assert!(text.contains("Status"));
+        // Content may be truncated — verify at least the start of data appears
+        assert!(text.contains("Wid"), "first column data should be partially visible");
+        assert!(text.contains("Act") || text.contains("Sta"), "last column data or header should be partially visible");
+    }
+
+    #[test]
+    fn table_very_narrow_width_fallback_to_minimums() {
+        // Many columns at a very narrow width to exercise the
+        // `total_min >= available` fallback where even minimums don't fit
+        // and must be proportionally scaled.
+        let md = "\
+| Col A | Col B | Col C | Col D | Col E | Col F |
+|-------|-------|-------|-------|-------|-------|
+| aaa   | bbb   | ccc   | ddd   | eee   | fff   |";
+        let lines = render_markdown(md, 30);
+        let text = all_text(&lines);
+        // Should still render without panicking and contain borders
+        assert!(text.contains('┌'));
+        assert!(text.contains('┘'));
+    }
+
+    #[test]
+    fn table_short_header_not_crushed_by_wide_column() {
+        // A short header column (like "#") should preserve its header width
+        // and not be crushed to 1 character when a wide column dominates.
+        let md = "\
+| # | Description of the item             |
+|---|--------------------------------------|
+| 1 | This is a very long item description |
+| 2 | Another lengthy description here     |";
+        let lines = render_markdown(md, 60);
+        let text = all_text(&lines);
+        assert!(text.contains('┌'));
+        assert!(text.contains('┘'));
+        // The "#" header should be fully visible, not truncated
+        assert!(text.contains(" # "));
+        // Row numbers should be visible
+        assert!(text.contains(" 1 "));
+        assert!(text.contains(" 2 "));
     }
 
     // ── Horizontal rules ─────────────────────────────────────────────────
