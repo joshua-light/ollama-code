@@ -34,7 +34,7 @@ pub(super) fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 render_chat_assistant(&mut lines, text, width);
             }
             ChatMessage::ToolCall { name, args, result } => {
-                render_chat_tool_call(&mut lines, name, args, result.as_ref(), app.tools_expanded);
+                render_chat_tool_call(&mut lines, name, args, result.as_ref(), app.tools_expanded, app.generation.start);
             }
             ChatMessage::Error(e) => {
                 render_chat_error(&mut lines, e);
@@ -128,25 +128,21 @@ fn render_chat_tool_call(
     args: &str,
     result: Option<&ToolResultData>,
     expanded: bool,
+    generation_start: Option<std::time::Instant>,
 ) {
     lines.push(Line::from(""));
-    let icon = match result {
-        Some(ToolResultData { success: true, .. }) => {
-            Span::styled(" ● ", Style::default().fg(Color::Green))
-        }
-        Some(ToolResultData { success: false, .. }) => {
-            Span::styled(" ● ", Style::default().fg(Color::Red))
-        }
+    let color = match result {
+        Some(ToolResultData { success: true, .. }) => Color::Green,
+        Some(ToolResultData { success: false, .. }) => Color::Red,
         None => {
-            let millis = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let visible = (millis / 500).is_multiple_of(2);
-            let color = if visible { Color::Yellow } else { Color::DarkGray };
-            Span::styled(" ● ", Style::default().fg(color))
+            let elapsed = generation_start
+                .map(|s| s.elapsed())
+                .unwrap_or_default();
+            let highlight = (elapsed.as_millis() / 500).is_multiple_of(2);
+            if highlight { Color::Yellow } else { Color::DarkGray }
         }
     };
+    let icon = Span::styled(" ● ", Style::default().fg(color));
     lines.push(Line::from(vec![
         icon,
         Span::styled(
