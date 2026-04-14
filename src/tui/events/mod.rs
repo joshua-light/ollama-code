@@ -4,7 +4,7 @@ mod commands;
 use std::sync::Arc;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use tokio::sync::mpsc;
 
 use crate::llama_server::{self, LlamaCppBackend, LlamaServer, ModelSource};
@@ -26,9 +26,79 @@ pub(super) fn handle_terminal_event(
     session: &Session,
 ) {
     if let Event::Paste(text) = evt {
-        if !app.is_processing && app.pending_confirm.is_none() && app.picker.is_none() {
+        if app.pending_confirm.is_none() && app.picker.is_none() {
             app.input.insert_str(app.cursor_pos, &text);
             app.cursor_pos += text.len();
+        }
+        return;
+    }
+
+    if let Event::Mouse(mouse) = evt {
+        let chat = app.chat_area;
+        let in_chat = chat.height > 0
+            && mouse.row >= chat.y
+            && mouse.row < chat.y + chat.height
+            && mouse.column >= chat.x
+            && mouse.column < chat.x + chat.width;
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if app.picker.is_none() {
+                    app.scroll_up(5);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if app.picker.is_none() {
+                    app.scroll_down(5);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_chat => {
+                let scroll_top = app.max_scroll.saturating_sub(app.scroll_offset) as usize;
+                let content_line = scroll_top + (mouse.row - chat.y) as usize;
+                let col = mouse.column.saturating_sub(chat.x);
+                app.selection_line_cache.clear();
+                app.selection = Some(super::app::TextSelection {
+                    anchor: (content_line, col),
+                    cursor: (content_line, col),
+                });
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Click outside chat clears selection
+                app.selection = None;
+                app.selection_line_cache.clear();
+            }
+            MouseEventKind::Drag(MouseButton::Left) if app.selection.is_some() => {
+                // Set continuous auto-scroll direction when near edges
+                let edge = 2u16;
+                if mouse.row <= chat.y.saturating_add(edge) {
+                    app.auto_scroll = -1;
+                    app.scroll_up(1);
+                } else if mouse.row >= chat.y + chat.height.saturating_sub(edge) {
+                    app.auto_scroll = 1;
+                    app.scroll_down(1);
+                } else {
+                    app.auto_scroll = 0;
+                }
+
+                let scroll_top = app.max_scroll.saturating_sub(app.scroll_offset) as usize;
+                let row_in_chat = mouse.row.clamp(chat.y, chat.y + chat.height.saturating_sub(1)) - chat.y;
+                let content_line = scroll_top + row_in_chat as usize;
+                let col = mouse.column.saturating_sub(chat.x).min(chat.width.saturating_sub(1));
+                app.selection.as_mut().unwrap().cursor = (content_line, col);
+            }
+            MouseEventKind::Up(MouseButton::Left) if app.selection.is_some() => {
+                app.auto_scroll = 0;
+                let sel = app.selection.as_ref().unwrap();
+                if sel.anchor == sel.cursor {
+                    // Zero-width click — clear
+                    app.selection = None;
+                    app.selection_line_cache.clear();
+                } else {
+                    // Trigger clipboard copy on next render
+                    app.copy_selection = true;
+                }
+            }
+            _ => {}
         }
         return;
     }
@@ -74,24 +144,33 @@ pub(super) fn handle_terminal_event(
             return;
         }
 
-        // Scroll keys work in all states
+        // PageUp/PageDown always scroll
         let half_page = (app.max_scroll.max(10) / 2).max(5);
         match key.code {
-            KeyCode::Up => { app.scroll_up(1); return; }
-            KeyCode::Down => { app.scroll_down(1); return; }
             KeyCode::PageUp => { app.scroll_up(half_page); return; }
             KeyCode::PageDown => { app.scroll_down(half_page); return; }
             _ => {}
         }
 
-        if app.is_processing {
-            if key.code == KeyCode::Esc {
+        // Alt+Up/Down: always scroll
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Up => { app.scroll_up(1); return; }
+                KeyCode::Down => { app.scroll_down(1); return; }
+                _ => {}
+            }
+        }
+
+        // Esc: cancel generation when processing, quit when idle
+        if key.code == KeyCode::Esc {
+            if app.is_processing {
                 if app.server.loading.is_some() {
-                    // Quit during initial server loading (Drop kills the child process)
                     app.should_quit = true;
                 } else {
                     app.server.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+            } else {
+                app.should_quit = true;
             }
             return;
         }
@@ -285,6 +364,37 @@ fn switch_ollama_model(
     app.config = config;
 }
 
+/// Find the byte offset of the previous word boundary (for Ctrl+W, Alt+Left).
+pub(in crate::tui) fn prev_word_boundary(input: &str, pos: usize) -> usize {
+    let before = &input[..pos];
+    // Skip trailing whitespace, then skip word chars
+    let trimmed = before.trim_end();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    // Find last whitespace before the word
+    trimmed
+        .rfind(|c: char| c.is_whitespace())
+        .map(|i| {
+            // i is byte offset of the whitespace char; step past it
+            i + trimmed[i..].chars().next().unwrap().len_utf8()
+        })
+        .unwrap_or(0)
+}
+
+/// Find the byte offset of the next word boundary (for Alt+Right).
+fn next_word_boundary(input: &str, pos: usize) -> usize {
+    let after = &input[pos..];
+    // Skip leading whitespace, then skip word chars
+    let skipped_ws = after.trim_start().len();
+    let ws_bytes = after.len() - skipped_ws;
+    let rest = &after[ws_bytes..];
+    // Find first whitespace in the remaining word
+    rest.find(|c: char| c.is_whitespace())
+        .map(|i| pos + ws_bytes + i)
+        .unwrap_or(input.len())
+}
+
 fn handle_normal_input(
     key: crossterm::event::KeyEvent,
     app: &mut App,
@@ -292,14 +402,75 @@ fn handle_normal_input(
     model_tx: &mpsc::UnboundedSender<Result<Vec<String>>>,
     session: &Session,
 ) {
+    // Ctrl key combos
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            // Ctrl+A — beginning of line
+            KeyCode::Char('a') => { app.cursor_pos = 0; return; }
+            // Ctrl+E — end of line
+            KeyCode::Char('e') => { app.cursor_pos = app.input.len(); return; }
+            // Ctrl+W — delete word backward
+            KeyCode::Char('w') => {
+                app.delete_word_backward();
+                return;
+            }
+            // Ctrl+K — kill to end of line
+            KeyCode::Char('k') => {
+                app.input.truncate(app.cursor_pos);
+                return;
+            }
+            // Ctrl+U — kill to beginning of line
+            KeyCode::Char('u') => {
+                app.input.drain(..app.cursor_pos);
+                app.cursor_pos = 0;
+                return;
+            }
+            // Ctrl+D — delete char forward (or quit if empty)
+            KeyCode::Char('d') => {
+                if app.input.is_empty() {
+                    app.should_quit = true;
+                } else {
+                    app.delete_forward();
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Alt key combos
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            // Alt+Left — word backward
+            KeyCode::Left => {
+                app.cursor_pos = prev_word_boundary(&app.input, app.cursor_pos);
+                return;
+            }
+            // Alt+Right — word forward
+            KeyCode::Right => {
+                app.cursor_pos = next_word_boundary(&app.input, app.cursor_pos);
+                return;
+            }
+            // Alt+Backspace — delete word backward
+            KeyCode::Backspace => {
+                app.delete_word_backward();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Enter => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 app.input.insert(app.cursor_pos, '\n');
                 app.cursor_pos += 1;
             } else if let Some(cmd) = crate::commands::parse(&app.input) {
-                let raw_input = app.input.clone();
-                commands::handle_command(cmd, &raw_input, app, input_tx, model_tx, session);
+                // Commands are only executed when idle
+                if !app.is_processing {
+                    let raw_input = app.input.clone();
+                    commands::handle_command(cmd, &raw_input, app, input_tx, model_tx, session);
+                }
             } else if let Some(msg) = app.submit() {
                 let _ = input_tx.send(AgentInput::Message(msg));
             }
@@ -320,12 +491,59 @@ fn handle_normal_input(
                 }
             }
         }
-        KeyCode::Char(c) => {
+        // Up — input history (previous)
+        KeyCode::Up => {
+            if app.input_history.is_empty() {
+                app.scroll_up(1);
+                return;
+            }
+            match app.history_index {
+                None => {
+                    // Save current input as draft, jump to last history entry
+                    app.history_draft = app.input.clone();
+                    let idx = app.input_history.len() - 1;
+                    app.history_index = Some(idx);
+                    app.input = app.input_history[idx].clone();
+                    app.cursor_pos = app.input.len();
+                }
+                Some(idx) if idx > 0 => {
+                    let new_idx = idx - 1;
+                    app.history_index = Some(new_idx);
+                    app.input = app.input_history[new_idx].clone();
+                    app.cursor_pos = app.input.len();
+                }
+                _ => {} // already at oldest entry
+            }
+        }
+        // Down — input history (next)
+        KeyCode::Down => {
+            match app.history_index {
+                Some(idx) if idx + 1 < app.input_history.len() => {
+                    let new_idx = idx + 1;
+                    app.history_index = Some(new_idx);
+                    app.input = app.input_history[new_idx].clone();
+                    app.cursor_pos = app.input.len();
+                }
+                Some(_) => {
+                    // Past last entry — restore draft
+                    app.history_index = None;
+                    app.input = std::mem::take(&mut app.history_draft);
+                    app.cursor_pos = app.input.len();
+                }
+                None => {
+                    app.scroll_down(1);
+                }
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
             app.input.insert(app.cursor_pos, c);
             app.cursor_pos += c.len_utf8();
         }
         KeyCode::Backspace => {
             app.backspace();
+        }
+        KeyCode::Delete => {
+            app.delete_forward();
         }
         KeyCode::Left => {
             if app.cursor_pos > 0 {
@@ -350,9 +568,6 @@ fn handle_normal_input(
         }
         KeyCode::End => {
             app.cursor_pos = app.input.len();
-        }
-        KeyCode::Esc => {
-            app.should_quit = true;
         }
         _ => {}
     }

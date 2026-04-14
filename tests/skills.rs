@@ -49,6 +49,7 @@ fn skill_load_instructions() {
     let meta = skills::SkillMeta {
         name: "test-skill".to_string(),
         description: "A test".to_string(),
+        trigger: None,
         dir: skill_dir,
     };
     let body = meta.load_instructions().unwrap();
@@ -69,6 +70,7 @@ fn skill_load_instructions_no_body() {
     let meta = skills::SkillMeta {
         name: "empty-skill".to_string(),
         description: "Empty".to_string(),
+        trigger: None,
         dir: skill_dir,
     };
     let body = meta.load_instructions().unwrap();
@@ -144,18 +146,20 @@ fn format_skill_summaries_output() {
         skills::SkillMeta {
             name: "deploy".to_string(),
             description: "Deploy to production".to_string(),
+            trigger: None,
             dir: std::path::PathBuf::from("/tmp"),
         },
         skills::SkillMeta {
             name: "test".to_string(),
             description: "Run tests".to_string(),
+            trigger: None,
             dir: std::path::PathBuf::from("/tmp"),
         },
     ];
     let summary = skills::format_skill_summaries(&skills);
     assert!(summary.contains("## Available Skills"));
-    assert!(summary.contains("- /deploy \u{2014} Deploy to production"));
-    assert!(summary.contains("- /test \u{2014} Run tests"));
+    assert!(summary.contains("- deploy \u{2014} Deploy to production"));
+    assert!(summary.contains("- test \u{2014} Run tests"));
 }
 
 #[test]
@@ -163,7 +167,7 @@ fn format_skill_summaries_empty() {
     let summary = skills::format_skill_summaries(&[]);
     assert!(summary.contains("## Available Skills"));
     // No individual entries
-    assert!(!summary.contains("- /"));
+    assert!(!summary.contains("\u{2014}"));
 }
 
 #[test]

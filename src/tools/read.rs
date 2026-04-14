@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 
-use super::{required_str, Tool, ToolDefinition};
+use super::{expand_tilde, required_str, Tool, ToolDefinition};
 
 pub struct ReadTool;
 
@@ -38,9 +38,10 @@ impl Tool for ReadTool {
     }
 
     fn execute(&self, arguments: &Value) -> Result<String> {
-        let file_path = required_str(arguments, "file_path")?;
+        let raw_path = required_str(arguments, "file_path")?;
+        let file_path = expand_tilde(raw_path);
 
-        let content = fs::read_to_string(file_path)
+        let content = fs::read_to_string(file_path.as_ref())
             .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", file_path, e))?;
 
         let lines: Vec<&str> = content.lines().collect();

@@ -264,6 +264,13 @@ pub(super) fn handle_command(
                 app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
             }
         }
+        SlashCommand::SystemPrompt => {
+            app.messages.push(ChatMessage::Info(format!(
+                "System prompt ({} chars):\n\n{}",
+                app.system_prompt.len(),
+                app.system_prompt
+            )));
+        }
         SlashCommand::Stats => {
             let mut breakdown: Vec<(String, usize)> = app.stats.tool_call_breakdown
                 .iter()

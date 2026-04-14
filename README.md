@@ -11,7 +11,7 @@ A terminal-based AI coding agent that runs locally via [Ollama](https://ollama.c
 - **Runtime model switching** via the `/model` command (supports both Ollama and HuggingFace models)
 - **MCP support** — connect external tools via the [Model Context Protocol](https://modelcontextprotocol.io)
 - **Plugin system** — extend with custom tools via PLUGIN.toml manifests
-- **Skills** — project-specific slash commands via SKILL.md files
+- **Skills** — reusable prompt templates via SKILL.md files, activatable by user or model
 - **Session management** — conversations saved as JSONL, with resume (`--resume`) and rewind (`/rewind`)
 - **Project config** — per-project `.ollama-code.toml` layered over user config
 - **Context window tracking** — segmented context bar with auto-trimming
@@ -103,6 +103,7 @@ Options:
 | `glob`     | Find files by pattern                                    |
 | `grep`     | Search file contents with regex                          |
 | `subagent` | Spawn a sub-agent for a scoped task                      |
+| `skill`    | Activate a skill by name (loads its instructions)        |
 
 Bash, edit, and write require user confirmation by default (use `--no-confirm` or `/bypass` to skip).
 
@@ -200,13 +201,17 @@ Each plugin exposes tools that are executed as subprocesses with JSON on stdin. 
 
 ## Skills
 
-Skills are project-specific slash commands defined as SKILL.md files. They are discovered from:
+Skills are reusable prompt templates defined as SKILL.md files. They are discovered from:
 - `<CONFIG_DIR>/ollama-code/skills/<name>/SKILL.md` (user-global)
 - `.agents/skills/<name>/SKILL.md` (project-local)
 
 > `<CONFIG_DIR>` is `~/Library/Application Support` on macOS and `~/.config` on Linux.
 
-Use `/skills` in the TUI to list available skills. Any skill can be invoked as `/<skill-name>`.
+Skills can be activated in two ways:
+- **By the user**: type `/<skill-name>` as a slash command in the TUI
+- **By the model**: the agent can call the `skill` tool autonomously when a task matches an available skill
+
+Use `/skills` in the TUI to list available skills.
 
 ## Session logs
 

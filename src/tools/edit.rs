@@ -2,8 +2,9 @@ use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 
-use super::{required_str, Tool, ToolDefinition};
+use super::{expand_tilde, required_str, Tool, ToolDefinition};
 
 enum FindResult {
     None,
@@ -100,6 +101,23 @@ fn replace_normalized(content: &str, needle: &str, replacement: &str, _pos: usiz
     result
 }
 
+/// Write `data` to `path` atomically via a temp file + rename.
+/// This prevents data loss if the process crashes mid-write.
+fn atomic_write(path: &str, data: &[u8]) -> Result<()> {
+    let target = Path::new(path);
+    let dir = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory for '{}'", path))?;
+
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create temp file in '{}': {}", dir.display(), e))?;
+    tmp.write_all(data)
+        .map_err(|e| anyhow::anyhow!("Failed to write temp file for '{}': {}", path, e))?;
+    tmp.persist(target)
+        .map_err(|e| anyhow::anyhow!("Failed to rename temp file to '{}': {}", path, e))?;
+    Ok(())
+}
+
 pub struct EditTool;
 
 impl Tool for EditTool {
@@ -133,7 +151,9 @@ impl Tool for EditTool {
     }
 
     fn execute(&self, arguments: &Value) -> Result<String> {
-        let file_path = required_str(arguments, "file_path")?;
+        let raw_path = required_str(arguments, "file_path")?;
+        let file_path = expand_tilde(raw_path);
+        let file_path = file_path.as_ref();
         let old_string = required_str(arguments, "old_string")?;
         let new_string = required_str(arguments, "new_string")?;
 
@@ -185,10 +205,7 @@ impl Tool for EditTool {
             }
         };
 
-        let mut file = fs::File::create(file_path)
-            .map_err(|e| anyhow::anyhow!("Failed to write '{}': {}", file_path, e))?;
-        file.write_all(new_content.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Failed to write '{}': {}", file_path, e))?;
+        atomic_write(file_path, new_content.as_bytes())?;
 
         // Build contextual diff with line numbers
         let file_lines: Vec<&str> = content.lines().collect();

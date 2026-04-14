@@ -11,6 +11,7 @@ pub enum SlashCommand {
     Session,
     Skills,
     Stats,
+    SystemPrompt,
     New,
     Unknown(String),
 }
@@ -66,6 +67,10 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Show session statistics",
     },
     CommandInfo {
+        name: "/system-prompt",
+        description: "Show the full system prompt sent to the model",
+    },
+    CommandInfo {
         name: "/new",
         description: "Start a new conversation (alias for /clear)",
     },
@@ -87,6 +92,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         "/session" => Some(SlashCommand::Session),
         "/skills" => Some(SlashCommand::Skills),
         "/stats" => Some(SlashCommand::Stats),
+        "/system-prompt" => Some(SlashCommand::SystemPrompt),
         "/new" => Some(SlashCommand::New),
         "/rewind" => Some(SlashCommand::Rewind),
         cmd => Some(SlashCommand::Unknown(cmd.to_string())),
@@ -124,6 +130,7 @@ mod tests {
             ("/session", "Session"),
             ("/skills", "Skills"),
             ("/stats", "Stats"),
+            ("/system-prompt", "SystemPrompt"),
             ("/new", "New"),
         ];
         for (input, expected_name) in cases {
@@ -178,9 +185,9 @@ mod tests {
 
     #[test]
     fn completions_multiple_matches() {
-        // /s matches /session, /skills, /stats
+        // /s matches /session, /skills, /stats, /system-prompt
         let results = completions("/s");
-        assert!(results.len() >= 3);
+        assert!(results.len() >= 4);
         let names: Vec<&str> = results.iter().map(|c| c.name).collect();
         assert!(names.contains(&"/session"));
         assert!(names.contains(&"/skills"));

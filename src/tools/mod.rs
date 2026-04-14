@@ -3,6 +3,7 @@ mod edit;
 mod glob;
 mod grep;
 mod read;
+mod skill;
 mod subagent;
 mod write;
 
@@ -11,11 +12,26 @@ pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
+pub use skill::SkillTool;
 pub use subagent::SubagentToolDef;
 pub use write::WriteTool;
 
 use anyhow::Result;
 use serde_json::Value;
+use std::borrow::Cow;
+
+/// Expand a leading `~` or `~/` to the user's home directory.
+/// Returns the original string unchanged if there is no leading tilde
+/// or if the home directory cannot be determined.
+pub(crate) fn expand_tilde(path: &str) -> Cow<'_, str> {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            let home = home.to_string_lossy();
+            return Cow::Owned(format!("{}{}", home, &path[1..]));
+        }
+    }
+    Cow::Borrowed(path)
+}
 
 pub struct ToolDefinition {
     pub name: String,
@@ -151,6 +167,11 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
+        let name = tool.name().to_string();
+        if self.tools.iter().any(|t| t.name() == name) {
+            eprintln!("Warning: duplicate tool name '{}', skipping registration", name);
+            return;
+        }
         let def = tool.definition();
         self.cached_definitions.push(serde_json::json!({
             "type": "function",

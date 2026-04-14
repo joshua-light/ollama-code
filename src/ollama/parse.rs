@@ -344,6 +344,333 @@ fn extract_function_tag_calls(
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------
+    // strip_special_tokens
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn strip_special_tokens_no_tokens() {
+        assert_eq!(strip_special_tokens("Hello, world!"), "Hello, world!");
+    }
+
+    #[test]
+    fn strip_special_tokens_empty() {
+        assert_eq!(strip_special_tokens(""), "");
+    }
+
+    #[test]
+    fn strip_pipe_open_close_pattern() {
+        // <|something|> pattern
+        assert_eq!(strip_special_tokens("<|think|>hello"), "hello");
+        assert_eq!(strip_special_tokens("hello<|end|>"), "hello");
+        assert_eq!(strip_special_tokens("a<|turn|>b"), "ab");
+    }
+
+    #[test]
+    fn strip_pipe_open_pattern() {
+        // <|something> pattern (no trailing pipe)
+        assert_eq!(strip_special_tokens("<|channel>hello"), "hello");
+        assert_eq!(strip_special_tokens("hello<|eos>"), "hello");
+    }
+
+    #[test]
+    fn strip_close_pipe_pattern() {
+        // <something|> pattern
+        assert_eq!(strip_special_tokens("<endoftext|>hello"), "hello");
+        assert_eq!(strip_special_tokens("hello<pad|>"), "hello");
+    }
+
+    #[test]
+    fn strip_multiple_tokens() {
+        assert_eq!(
+            strip_special_tokens("<|think|>Hello<|turn|> world<|end|>"),
+            "Hello world"
+        );
+    }
+
+    #[test]
+    fn strip_preserves_normal_angle_brackets() {
+        // Normal HTML-like content should pass through
+        assert_eq!(strip_special_tokens("<div>hello</div>"), "<div>hello</div>");
+        assert_eq!(strip_special_tokens("a < b > c"), "a < b > c");
+    }
+
+    #[test]
+    fn strip_long_token_not_stripped() {
+        // <something|> pattern but longer than 30 chars should NOT be stripped
+        let long = "<abcdefghijklmnopqrstuvwxyz1234|>";
+        assert_eq!(strip_special_tokens(long), long);
+    }
+
+    #[test]
+    fn strip_token_with_space_not_stripped() {
+        // <something with space|> should not be stripped
+        assert_eq!(strip_special_tokens("<hello world|>"), "<hello world|>");
+    }
+
+    // ---------------------------------------------------------------
+    // detect_repetition
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn detect_repetition_short_text() {
+        // Text under 100 chars should never trigger
+        assert!(!detect_repetition("abc"));
+        assert!(!detect_repetition(""));
+        assert!(!detect_repetition(&"x".repeat(99)));
+    }
+
+    #[test]
+    fn detect_repetition_no_repetition() {
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(5);
+        // This is repeated but the pattern is too long (>40 chars) to detect
+        // with the 3..=40 window. Also only 5 repetitions < 8.
+        assert!(!detect_repetition(&text));
+    }
+
+    #[test]
+    fn detect_repetition_obvious_loop() {
+        // "abc" repeated many times at the end of a sufficiently long text
+        let prefix = "x".repeat(80);
+        let text = prefix + &"abc".repeat(20);
+        assert!(detect_repetition(&text));
+    }
+
+    #[test]
+    fn detect_repetition_approach_loop() {
+        // Real-world failure mode: model repeating "approach-"
+        let text =
+            "Let me think about this problem. ".to_string() + &"approach-".repeat(15);
+        assert!(detect_repetition(&text));
+    }
+
+    #[test]
+    fn detect_repetition_barely_enough() {
+        // Exactly 8 repetitions of a 5-char pattern at the end
+        let prefix = "x".repeat(100);
+        let text = prefix + &"hello".repeat(8);
+        assert!(detect_repetition(&text));
+    }
+
+    #[test]
+    fn detect_repetition_just_below_threshold() {
+        // 7 repetitions should NOT trigger (min is 8)
+        let prefix = "x".repeat(100);
+        let text = prefix + &"hello".repeat(7);
+        assert!(!detect_repetition(&text));
+    }
+
+    // ---------------------------------------------------------------
+    // find_json_objects
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn find_json_objects_empty_string() {
+        assert!(find_json_objects("").is_empty());
+    }
+
+    #[test]
+    fn find_json_objects_no_json() {
+        assert!(find_json_objects("hello world").is_empty());
+    }
+
+    #[test]
+    fn find_json_objects_simple_object() {
+        let results = find_json_objects(r#"{"key": "value"}"#);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, r#"{"key": "value"}"#);
+        assert_eq!(results[0].1, 0);
+        assert_eq!(results[0].2, 16);
+    }
+
+    #[test]
+    fn find_json_objects_nested() {
+        let text = r#"{"outer": {"inner": 42}}"#;
+        let results = find_json_objects(text);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, text);
+    }
+
+    #[test]
+    fn find_json_objects_multiple() {
+        let text = r#"before {"a": 1} middle {"b": 2} after"#;
+        let results = find_json_objects(text);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, r#"{"a": 1}"#);
+        assert_eq!(results[1].0, r#"{"b": 2}"#);
+    }
+
+    #[test]
+    fn find_json_objects_braces_in_strings() {
+        // Braces inside JSON strings should not confuse the parser
+        let text = r#"{"key": "value with { and } inside"}"#;
+        let results = find_json_objects(text);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, text);
+    }
+
+    #[test]
+    fn find_json_objects_escaped_quotes() {
+        let text = r#"{"key": "value with \" escaped"}"#;
+        let results = find_json_objects(text);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, text);
+    }
+
+    #[test]
+    fn find_json_objects_unclosed_brace() {
+        // Unclosed brace should be skipped
+        let text = r#"{"key": "value"#;
+        let results = find_json_objects(text);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn find_json_objects_offsets_correct() {
+        let text = r#"abc{"x":1}def"#;
+        let results = find_json_objects(text);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, 3); // start
+        assert_eq!(results[0].2, 10); // end
+    }
+
+    // ---------------------------------------------------------------
+    // parse_api_error
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_api_error_ollama_string() {
+        let body = r#"{"error": "model not found"}"#;
+        assert_eq!(parse_api_error(body), Some("model not found".to_string()));
+    }
+
+    #[test]
+    fn parse_api_error_openai_nested() {
+        let body = r#"{"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}}"#;
+        assert_eq!(
+            parse_api_error(body),
+            Some("Rate limit exceeded".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_api_error_context_exceeded() {
+        let body = r#"{"error": {"type": "exceed_context_size_error", "n_prompt_tokens": 5000, "n_ctx": 4096}}"#;
+        let msg = parse_api_error(body).unwrap();
+        assert!(msg.contains("5000"));
+        assert!(msg.contains("4096"));
+        assert!(msg.contains("Context window exceeded"));
+    }
+
+    #[test]
+    fn parse_api_error_context_exceeded_missing_fields() {
+        // If n_prompt/n_ctx are missing, fall through to message or None
+        let body = r#"{"error": {"type": "exceed_context_size_error"}}"#;
+        // No message field and no string tokens => None
+        assert_eq!(parse_api_error(body), None);
+    }
+
+    #[test]
+    fn parse_api_error_invalid_json() {
+        assert_eq!(parse_api_error("not json"), None);
+    }
+
+    #[test]
+    fn parse_api_error_no_error_field() {
+        assert_eq!(parse_api_error(r#"{"status": "ok"}"#), None);
+    }
+
+    #[test]
+    fn parse_api_error_empty() {
+        assert_eq!(parse_api_error(""), None);
+    }
+
+    // ---------------------------------------------------------------
+    // extract_tool_calls_from_content
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_no_tools_empty_content() {
+        let (calls, remaining) = extract_tool_calls_from_content("", &[]);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, "");
+    }
+
+    #[test]
+    fn extract_no_known_tools() {
+        let content = r#"{"name": "read", "arguments": {"file_path": "test.rs"}}"#;
+        let (calls, remaining) = extract_tool_calls_from_content(content, &[]);
+        assert!(calls.is_empty());
+        // With no known_tool_names, the caller passes empty slice,
+        // but the function is only called when known_tool_names is non-empty
+        // in postprocess_response. Still, the function itself should return unchanged.
+        assert_eq!(remaining, content);
+    }
+
+    #[test]
+    fn extract_json_with_tool_call_tags() {
+        // Some models wrap JSON in <tool_call> tags
+        let content = r#"<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>"#;
+        let known = vec!["bash".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(
+            calls[0].function.arguments.get("command").unwrap().as_str().unwrap(),
+            "ls"
+        );
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn extract_json_multiple_tool_calls() {
+        let content = r#"{"name": "read", "arguments": {"file_path": "a.rs"}} {"name": "read", "arguments": {"file_path": "b.rs"}}"#;
+        let known = vec!["read".to_string()];
+        let (calls, _) = extract_tool_calls_from_content(content, &known);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].function.arguments.get("file_path").unwrap().as_str().unwrap(),
+            "a.rs"
+        );
+        assert_eq!(
+            calls[1].function.arguments.get("file_path").unwrap().as_str().unwrap(),
+            "b.rs"
+        );
+    }
+
+    #[test]
+    fn extract_json_wrong_tool_name_ignored() {
+        let content = r#"{"name": "delete_everything", "arguments": {"path": "/"}}"#;
+        let known = vec!["read".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, content);
+    }
+
+    #[test]
+    fn extract_json_missing_arguments_field() {
+        // JSON has name but no arguments object
+        let content = r#"{"name": "read", "other": "field"}"#;
+        let known = vec!["read".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, content);
+    }
+
+    #[test]
+    fn extract_json_arguments_not_object() {
+        // arguments is a string, not object
+        let content = r#"{"name": "read", "arguments": "not an object"}"#;
+        let known = vec!["read".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, content);
+    }
+
+    // ---------------------------------------------------------------
+    // Existing extract_function_tag tests
+    // ---------------------------------------------------------------
+
     #[test]
     fn extract_function_tag_single_param() {
         let content = "<function=read>\n<parameter=file_path>\nCLAUDE.md\n</parameter>\n</function>\n</tool_call>";

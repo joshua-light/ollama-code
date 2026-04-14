@@ -1,7 +1,7 @@
 mod chat_content;
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Position},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -136,6 +136,29 @@ pub(crate) fn get_git_info_sync() -> (Option<String>, bool) {
     (branch, dirty)
 }
 
+pub(crate) async fn get_git_info_async() -> (Option<String>, bool) {
+    let (branch_out, dirty_out) = tokio::join!(
+        tokio::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .output(),
+        tokio::process::Command::new("git")
+            .args(["diff-index", "--quiet", "HEAD", "--"])
+            .output(),
+    );
+
+    let branch = branch_out
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let dirty = dirty_out
+        .map(|o| !o.status.success())
+        .unwrap_or(false);
+
+    (branch, dirty)
+}
+
 // ── Input wrapping helpers ────────────────────────────────────────────────
 
 /// Content width available for input text (accounting for " ❯ " / "   " prefix).
@@ -150,8 +173,8 @@ fn wrapped_line_count(char_count: usize, content_width: usize) -> usize {
 
 // ── Rendering ──────────────────────────────────────────────────────────────
 
-pub(super) fn compute_input_height(input: &str, term_width: u16, term_height: u16, is_processing: bool) -> u16 {
-    if is_processing || input.is_empty() {
+pub(super) fn compute_input_height(input: &str, term_width: u16, term_height: u16) -> u16 {
+    if input.is_empty() {
         return 3; // border + 1 line + border
     }
     let content_width = input_content_width(term_width);
@@ -167,7 +190,7 @@ pub(super) fn compute_input_height(input: &str, term_width: u16, term_height: u1
 
 pub(super) fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let input_height = compute_input_height(&app.input, area.width, area.height, app.is_processing);
+    let input_height = compute_input_height(&app.input, area.width, area.height);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -179,6 +202,7 @@ pub(super) fn render(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
+    app.chat_area = chunks[1];
     render_header(f, app, chunks[0]);
     render_chat(f, app, chunks[1]);
     render_input(f, app, chunks[2]);
@@ -233,22 +257,74 @@ fn render_chat(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 
     let paragraph = paragraph.scroll((scroll, 0));
     f.render_widget(paragraph, area);
+
+    // ── Selection highlight + text extraction ──
+    if app.selection.is_none() {
+        return;
+    }
+    let sel = app.selection.as_ref().unwrap();
+    let (start, end) = sel.ordered();
+    let scroll_usize = scroll as usize;
+
+    let buf = f.buffer_mut();
+
+    // Cache visible line texts (accumulates across frames while selecting)
+    for row_off in 0..area.height as usize {
+        let y = area.y + row_off as u16;
+        let content_line = scroll_usize + row_off;
+        let mut line_text = String::new();
+        for col in 0..area.width {
+            if let Some(cell) = buf.cell(Position { x: area.x + col, y }) {
+                line_text.push_str(cell.symbol());
+            }
+        }
+        app.selection_line_cache.insert(content_line, line_text.trim_end().to_string());
+    }
+
+    // Highlight selected cells
+    for content_line in start.0..=end.0 {
+        if content_line < scroll_usize || content_line >= scroll_usize + area.height as usize {
+            continue;
+        }
+        let screen_row = (content_line - scroll_usize) as u16 + area.y;
+        let col_start = if content_line == start.0 { start.1 } else { 0 };
+        let col_end = if content_line == end.0 { end.1 } else { area.width.saturating_sub(1) };
+
+        for col in col_start..=col_end {
+            let x = area.x + col;
+            if x >= area.x + area.width { break; }
+            if let Some(cell) = buf.cell_mut(Position { x, y: screen_row }) {
+                cell.set_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+            }
+        }
+    }
+
+    // Extract selected text for clipboard when mouse was released
+    if app.copy_selection {
+        app.copy_selection = false;
+        let mut result = String::new();
+        for content_line in start.0..=end.0 {
+            if content_line > start.0 { result.push('\n'); }
+            if let Some(line) = app.selection_line_cache.get(&content_line) {
+                let chars: Vec<char> = line.chars().collect();
+                let cs = if content_line == start.0 { start.1 as usize } else { 0 };
+                let ce = if content_line == end.0 { (end.1 as usize + 1).min(chars.len()) } else { chars.len() };
+                let cs = cs.min(chars.len());
+                let selected: String = chars[cs..ce].iter().collect();
+                result.push_str(selected.trim_end());
+            }
+        }
+        let trimmed = result.trim_end().to_string();
+        if !trimmed.is_empty() {
+            app.clipboard_text = Some(trimmed);
+        }
+    }
 }
 
 fn render_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let input_block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(Color::DarkGray));
-
-    if app.is_processing {
-        let input_line = Line::from(Span::styled(
-            " …",
-            Style::default().fg(Color::DarkGray),
-        ));
-        let input = Paragraph::new(input_line).block(input_block);
-        f.render_widget(input, area);
-        return;
-    }
 
     let prompt = " ❯ ";
     let content_width = input_content_width(area.width);
@@ -421,12 +497,15 @@ fn render_status_line(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ));
     }
 
-    // Estimated Opus 4.6 cost
+    // Estimated cost (Anthropic Opus 4.6 pricing: $5/$25 per 1M tokens).
+    // Only meaningful when proxying to a paid API; local Ollama models are free.
     if app.config.show_cost_estimate.unwrap_or(false)
         && (app.stats.input_tokens > 0 || app.stats.output_tokens > 0)
     {
-        let cost = app.stats.input_tokens as f64 * 5.0 / 1_000_000.0
-                 + app.stats.output_tokens as f64 * 25.0 / 1_000_000.0;
+        let (input_rate, output_rate) = app.config.cost_per_million_tokens
+            .unwrap_or((5.0, 25.0));
+        let cost = app.stats.input_tokens as f64 * input_rate / 1_000_000.0
+                 + app.stats.output_tokens as f64 * output_rate / 1_000_000.0;
         spans.push(sep_span());
         spans.push(Span::styled(
             format!("${:.4}", cost),

@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::Write;
 
-use super::{required_str, Tool, ToolDefinition};
+use super::{expand_tilde, required_str, Tool, ToolDefinition};
 
 pub struct WriteTool;
 
@@ -34,7 +34,9 @@ impl Tool for WriteTool {
     }
 
     fn execute(&self, arguments: &Value) -> Result<String> {
-        let file_path = required_str(arguments, "file_path")?;
+        let raw_path = required_str(arguments, "file_path")?;
+        let file_path = expand_tilde(raw_path);
+        let file_path = file_path.as_ref();
         let content = required_str(arguments, "content")?;
 
         let path = std::path::Path::new(file_path);

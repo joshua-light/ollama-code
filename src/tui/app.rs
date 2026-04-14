@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,6 +13,28 @@ use crate::ollama::OllamaBackend;
 use crate::skills::SkillMeta;
 
 use super::picker::Picker;
+
+/// Active text selection in the chat area, tracked in content-space coordinates
+/// so the selection stays anchored to the content as the user scrolls.
+pub(crate) struct TextSelection {
+    /// Anchor point: (content visual line index, column)
+    pub anchor: (usize, u16),
+    /// Current end: (content visual line index, column)
+    pub cursor: (usize, u16),
+}
+
+impl TextSelection {
+    /// Return (start, end) ordered so start <= end.
+    pub fn ordered(&self) -> ((usize, u16), (usize, u16)) {
+        if self.anchor.0 < self.cursor.0
+            || (self.anchor.0 == self.cursor.0 && self.anchor.1 <= self.cursor.1)
+        {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+}
 
 pub(crate) enum AgentInput {
     Message(String),
@@ -179,10 +201,36 @@ pub(crate) struct App {
     pub(crate) generation: GenerationState,
     pub(crate) stats: SessionStats,
     pub(crate) server: ServerState,
+    /// Flag to trigger async git status refresh after agent finishes.
+    pub(crate) refresh_git_pending: bool,
+    /// Input history (most recent last).
+    pub(crate) input_history: Vec<String>,
+    /// Current position in history when navigating (None = editing new input).
+    pub(crate) history_index: Option<usize>,
+    /// Saved draft input when browsing history.
+    pub(crate) history_draft: String,
+    /// Message queued while the model is processing, sent when the turn finishes.
+    pub(crate) queued_message: Option<String>,
+    /// Full system prompt sent to the model (for /system-prompt command).
+    pub(crate) system_prompt: String,
+    // ── Text selection (mouse capture) ──
+    pub(crate) selection: Option<TextSelection>,
+    /// Chat area rect from last render (for mouse coordinate mapping).
+    pub(crate) chat_area: ratatui::layout::Rect,
+    /// Visible-line text cache, keyed by content visual line index.
+    /// Accumulated across frames during an active selection so that
+    /// text scrolled off-screen can still be copied.
+    pub(crate) selection_line_cache: HashMap<usize, String>,
+    /// Pending text to copy to system clipboard (set during render, consumed by main loop).
+    pub(crate) clipboard_text: Option<String>,
+    /// Set on mouse-up to trigger text extraction on the next render frame.
+    pub(crate) copy_selection: bool,
+    /// Continuous auto-scroll while mouse is held near edge: -1 = up, 1 = down, 0 = none.
+    pub(crate) auto_scroll: i8,
 }
 
 impl App {
-    pub(crate) fn new(model: String, context_size: u64, ollama: OllamaBackend, config: Config, skills: Vec<SkillMeta>) -> Self {
+    pub(crate) fn new(model: String, context_size: u64, ollama: OllamaBackend, config: Config, skills: Vec<SkillMeta>, system_prompt: String) -> Self {
         let (git_branch, git_dirty) = super::render::get_git_info_sync();
         let dir_name = std::env::current_dir()
             .ok()
@@ -237,6 +285,18 @@ impl App {
                 loading: None,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
             },
+            refresh_git_pending: false,
+            input_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            queued_message: None,
+            system_prompt,
+            selection: None,
+            chat_area: ratatui::layout::Rect::default(),
+            selection_line_cache: HashMap::new(),
+            clipboard_text: None,
+            copy_selection: false,
+            auto_scroll: 0,
         }
     }
 
@@ -251,15 +311,44 @@ impl App {
     }
 
     pub(crate) fn submit(&mut self) -> Option<String> {
-        if self.input.trim().is_empty() || self.is_processing {
+        if self.input.trim().is_empty() {
+            return None;
+        }
+        // Only allow one queued message at a time
+        if self.is_processing && self.queued_message.is_some() {
             return None;
         }
         let msg = self.input.clone();
+        // Save to history (dedup consecutive identical entries)
+        if self.input_history.last() != Some(&msg) {
+            self.input_history.push(msg.clone());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
         self.input.clear();
         self.cursor_pos = 0;
         self.messages.push(ChatMessage::User(msg.clone()));
+
+        if self.is_processing {
+            // Queue for delivery when the current turn finishes
+            self.queued_message = Some(msg);
+            return None;
+        }
+
         self.begin_processing(super::render::pick_verb());
         Some(msg)
+    }
+
+    /// If processing just finished and there is a queued message, start a new
+    /// turn immediately and return the message to send to the agent.
+    pub(crate) fn drain_queued(&mut self) -> Option<String> {
+        if !self.is_processing {
+            if let Some(msg) = self.queued_message.take() {
+                self.begin_processing(super::render::pick_verb());
+                return Some(msg);
+            }
+        }
+        None
     }
 
     pub(crate) fn flush_streaming(&mut self) {
@@ -292,6 +381,23 @@ impl App {
             self.input.remove(prev);
             self.cursor_pos = prev;
         }
+    }
+
+    pub(crate) fn delete_forward(&mut self) {
+        if self.cursor_pos < self.input.len() {
+            let next = self.input[self.cursor_pos..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(0);
+            self.input.drain(self.cursor_pos..self.cursor_pos + next);
+        }
+    }
+
+    pub(crate) fn delete_word_backward(&mut self) {
+        let boundary = super::events::prev_word_boundary(&self.input, self.cursor_pos);
+        self.input.drain(boundary..self.cursor_pos);
+        self.cursor_pos = boundary;
     }
 
     pub(crate) fn dismiss_picker(&mut self) {

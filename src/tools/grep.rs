@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{optional_str, required_str, Tool, ToolDefinition};
+use super::{expand_tilde, optional_str, required_str, Tool, ToolDefinition};
 
 /// Cache `rg` availability — checked once per process.
 fn has_ripgrep() -> bool {
@@ -50,7 +50,8 @@ impl Tool for GrepTool {
 
     fn execute(&self, arguments: &Value) -> Result<String> {
         let pattern = required_str(arguments, "pattern")?;
-        let path = optional_str(arguments, "path").unwrap_or(".");
+        let raw_path = optional_str(arguments, "path").unwrap_or(".");
+        let path: &str = &expand_tilde(raw_path);
         let include = optional_str(arguments, "include");
 
         let use_rg = has_ripgrep();

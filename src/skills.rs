@@ -9,6 +9,8 @@ pub struct SkillMeta {
     pub name: String,
     /// One-line description (from frontmatter).
     pub description: String,
+    /// Optional trigger hint — explains when the model should activate this skill.
+    pub trigger: Option<String>,
     /// Path to the skill directory containing SKILL.md.
     pub dir: PathBuf,
 }
@@ -147,6 +149,7 @@ fn parse_frontmatter(path: &Path, dir: &Path) -> Result<SkillMeta> {
 
     let mut name = None;
     let mut description = None;
+    let mut trigger = None;
 
     for line in frontmatter.lines() {
         let line = line.trim();
@@ -166,12 +169,18 @@ fn parse_frontmatter(path: &Path, dir: &Path) -> Result<SkillMeta> {
                     .trim_matches('\'')
                     .to_string(),
             );
+        } else if let Some(value) = line.strip_prefix("trigger:") {
+            let v = value.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !v.is_empty() {
+                trigger = Some(v);
+            }
         }
     }
 
     Ok(SkillMeta {
         name: name.ok_or_else(|| anyhow::anyhow!("missing 'name'"))?,
         description: description.ok_or_else(|| anyhow::anyhow!("missing 'description'"))?,
+        trigger,
         dir: dir.to_path_buf(),
     })
 }
@@ -193,9 +202,16 @@ fn extract_body(content: &str) -> String {
 /// Format skill summaries for inclusion in the system prompt (discovery layer).
 pub fn format_skill_summaries(skills: &[SkillMeta]) -> String {
     let mut s = String::from("\n\n## Available Skills\n\n");
-    s.push_str("The following skills can be activated by the user with slash commands:\n\n");
+    s.push_str(
+        "The following skills are available. The user can activate them with slash commands, \
+         and you can activate them with the skill(name, args?) tool when a task matches.\n\n",
+    );
     for skill in skills {
-        s.push_str(&format!("- /{} \u{2014} {}\n", skill.name, skill.description));
+        s.push_str(&format!("- {} \u{2014} {}", skill.name, skill.description));
+        if let Some(trigger) = &skill.trigger {
+            s.push_str(&format!("\n  Trigger: {}", trigger));
+        }
+        s.push('\n');
     }
     s
 }

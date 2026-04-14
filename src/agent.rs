@@ -13,7 +13,7 @@ use crate::mcp;
 use crate::message::{self, Message};
 use crate::plugin::{self, ExternalTool};
 use crate::skills::{self, SkillMeta};
-use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SubagentToolDef, Tool, WriteTool, ToolRegistry};
+use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SkillTool, SubagentToolDef, Tool, WriteTool, ToolRegistry};
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -92,6 +92,12 @@ fn send_event(
         .map_err(|_| anyhow::anyhow!("Event channel closed"))
 }
 
+/// Exponential backoff delay: 500ms * 2^retries, capped at 2^5 = 32x.
+fn retry_backoff_delay(retries: u32) -> std::time::Duration {
+    const RETRY_BASE_MS: u64 = 500;
+    std::time::Duration::from_millis(RETRY_BASE_MS * (1 << retries.min(5)))
+}
+
 /// Discover `CLAUDE.md` and `AGENTS.md` files by walking up from `cwd`.
 /// Stops at the first directory that contains either file.
 fn discover_project_docs(cwd: &str) -> Vec<(String, String)> {
@@ -140,6 +146,8 @@ pub struct Agent {
     _mcp_servers: Vec<mcp::McpServer>,
     /// Hook runner for lifecycle hooks.
     hooks: HookRunner,
+    /// Stored config for propagation to sub-agents.
+    config: Option<Config>,
 
     // --- Small-model improvement flags ---
     /// When true, dynamically scope available tools per turn.
@@ -238,6 +246,14 @@ impl Agent {
             }
         }
 
+        // Discover skills (.agents/skills/*/SKILL.md) for top-level agents only.
+        // Done early so we can include the skill tool in the system prompt template.
+        let discovered_skills = if !is_subagent {
+            skills::discover_skills(&cwd)
+        } else {
+            Vec::new()
+        };
+
         let subagent_desc = if is_subagent {
             ""
         } else {
@@ -247,11 +263,29 @@ impl Agent {
              or any task that would benefit from a clean context window"
         };
 
+        let skill_desc = if !discovered_skills.is_empty() {
+            "- skill(name, args?): Activate a skill by name. Use when a task matches an available skill"
+        } else {
+            ""
+        };
+
         let mut system_prompt = include_str!("../SYSTEM_PROMPT.md")
             .replace("{cwd}", &cwd)
-            .replace("{subagent_tool}", subagent_desc);
+            .replace("{subagent_tool}", subagent_desc)
+            .replace("{skill_tool}", skill_desc);
 
         let system_prompt_base_len = system_prompt.len();
+
+        // Append skill summaries right after the tools section, and register the skill tool.
+        let skills_summary_len = if !discovered_skills.is_empty() {
+            let summary = skills::format_skill_summaries(&discovered_skills);
+            let l = summary.len();
+            system_prompt.push_str(&summary);
+            tools.register(Box::new(SkillTool::new(discovered_skills.clone())));
+            l
+        } else {
+            0
+        };
 
         // Load project docs (CLAUDE.md / AGENTS.md) so all agents follow conventions.
         let project_docs_info = {
@@ -267,29 +301,30 @@ impl Agent {
             info
         };
 
-        // Discover skills (.agents/skills/*/SKILL.md) for top-level agents only.
-        // Only name + description are injected into the system prompt (discovery layer).
-        let (discovered_skills, skills_summary_len) = if !is_subagent {
-            let found = skills::discover_skills(&cwd);
-            let len = if !found.is_empty() {
-                let summary = skills::format_skill_summaries(&found);
-                let l = summary.len();
-                system_prompt.push_str(&summary);
-                l
-            } else {
-                0
-            };
-            (found, len)
-        } else {
-            (Vec::new(), 0)
-        };
-
         // Discover hooks (top-level agents only).
         let hooks = if !is_subagent {
             HookRunner::discover(&cwd, config)
         } else {
             HookRunner::empty()
         };
+
+        // Normalize: collapse 3+ consecutive newlines to 2 (one blank line max).
+        {
+            let mut result = String::with_capacity(system_prompt.len());
+            let mut newline_count = 0u32;
+            for ch in system_prompt.chars() {
+                if ch == '\n' {
+                    newline_count += 1;
+                    if newline_count <= 2 {
+                        result.push(ch);
+                    }
+                } else {
+                    newline_count = 0;
+                    result.push(ch);
+                }
+            }
+            system_prompt = result;
+        }
 
         let messages = vec![Message::system(&system_prompt)];
 
@@ -310,6 +345,7 @@ impl Agent {
             plugin_confirm_tools,
             _mcp_servers: mcp_servers,
             hooks,
+            config: config.cloned(),
             tool_scoping: cfg.tool_scoping.unwrap_or(false),
             task_reinjection: cfg.task_reinjection.unwrap_or(false),
             reinjection_interval: cfg.effective_reinjection_interval(),
@@ -343,14 +379,16 @@ impl Agent {
     }
 
     /// Create a sub-agent with fresh context and no subagent tool (prevents recursion).
+    /// Inherits the parent's config so tool enable/disable settings are respected.
     fn new_subagent(
         backend: Arc<dyn ModelBackend>,
         model: String,
         context_size: u64,
         bash_timeout: std::time::Duration,
         max_turns: u16,
+        config: Option<&Config>,
     ) -> Self {
-        Self::build(backend, model, context_size, bash_timeout, 0, Some(max_turns), None)
+        Self::build(backend, model, context_size, bash_timeout, 0, Some(max_turns), config)
     }
 
     pub fn model(&self) -> &str {
@@ -359,6 +397,14 @@ impl Agent {
 
     pub fn skills(&self) -> &[SkillMeta] {
         &self.skills
+    }
+
+    /// Return the full system prompt (first message content).
+    pub fn system_prompt(&self) -> &str {
+        self.messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or("")
     }
 
     pub fn set_model(&mut self, model: String) {
@@ -541,6 +587,7 @@ impl Agent {
             self.context_size,
             self.bash_timeout,
             self.subagent_max_turns,
+            self.config.as_ref(),
         );
 
         // Channels for the sub-agent
@@ -826,7 +873,7 @@ impl Agent {
             }
             // Estimate tool definition tokens, broken down by category.
             const BUILTIN_TOOLS: &[&str] = &[
-                "bash", "read", "edit", "write", "glob", "grep", "subagent",
+                "bash", "read", "edit", "write", "glob", "grep", "subagent", "skill",
             ];
             let mut builtin_chars: usize = 0;
             let mut plugin_chars: usize = 0;
@@ -1045,6 +1092,7 @@ impl Agent {
                             empty_retries, MAX_EMPTY_RETRIES
                         )),
                     )?;
+                    tokio::time::sleep(retry_backoff_delay(empty_retries)).await;
                     continue;
                 }
                 send_event(
@@ -1075,6 +1123,7 @@ impl Agent {
                         )?;
                         // Clear the streamed garbage from the TUI
                         send_event(events, AgentEvent::ContentReplaced(String::new()))?;
+                        tokio::time::sleep(retry_backoff_delay(empty_retries)).await;
                         continue;
                     }
                 } else {
@@ -1131,6 +1180,7 @@ impl Agent {
                             empty_retries, MAX_EMPTY_RETRIES
                         )),
                     )?;
+                    tokio::time::sleep(retry_backoff_delay(empty_retries)).await;
                     continue;
                 }
 

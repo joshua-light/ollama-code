@@ -1,7 +1,7 @@
 use crate::agent::AgentEvent;
 
 use super::super::app::{App, ChatMessage, PendingConfirm, ToolResultData};
-use super::super::render::{get_git_info_sync, pick_verb};
+use super::super::render::pick_verb;
 
 pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
     let was_at_bottom = app.is_at_bottom();
@@ -68,10 +68,9 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
                 }
             }
             app.finish_processing();
-            // Refresh git status after agent finishes (bash tool may have changed things)
-            let (branch, dirty) = get_git_info_sync();
-            app.git_branch = branch;
-            app.git_dirty = dirty;
+            // Refresh git status after agent finishes (bash tool may have changed things).
+            // Spawned as an async task to avoid blocking the event loop.
+            app.refresh_git_pending = true;
         }
         AgentEvent::Error(e) => {
             app.flush_streaming();

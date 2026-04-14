@@ -122,6 +122,21 @@ fn render_chat_assistant(lines: &mut Vec<Line<'static>>, text: &str, width: u16)
     lines.extend(md_lines);
 }
 
+fn format_tool_call_header(name: &str, args: &str) -> String {
+    if name == "skill" {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+            if let Some(skill_name) = v.get("name").and_then(|n| n.as_str()) {
+                return format!("Skill(/{})", skill_name);
+            }
+        }
+    }
+    format!(
+        "{}({})",
+        format::format_tool_name(name),
+        format::truncate_args(args, 77),
+    )
+}
+
 fn render_chat_tool_call(
     lines: &mut Vec<Line<'static>>,
     name: &str,
@@ -143,12 +158,10 @@ fn render_chat_tool_call(
         }
     };
     let icon = Span::styled(" ● ", Style::default().fg(color));
+    let header = format_tool_call_header(name, args);
     lines.push(Line::from(vec![
         icon,
-        Span::styled(
-            format!("{}({})", format::format_tool_name(name), format::truncate_args(args, 77)),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled(header, Style::default().fg(Color::White)),
     ]));
     if let Some(result_data) = result {
         match name {
@@ -198,6 +211,10 @@ fn render_chat_info(lines: &mut Vec<Line<'static>>, text: &str) {
                     Style::default().fg(Color::Cyan),
                 ),
             ]));
+        } else if line.is_empty() {
+            // Use truly empty Line for blank lines — Paragraph's Wrap { trim: false }
+            // turns "   " (space-only content) into 2 visual lines, doubling blanks.
+            lines.push(Line::from(""));
         } else {
             lines.push(Line::from(Span::styled(
                 format!("   {}", line),
@@ -787,5 +804,30 @@ fn render_default_result(lines: &mut Vec<Line<'static>>, result: &ToolResultData
             format!("{}{}", format::PREFIX_FIRST, summary),
             Style::default().fg(Color::DarkGray),
         )));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::widgets::{Paragraph, Wrap};
+
+    #[test]
+    fn info_blank_lines_not_doubled() {
+        // Regression: Paragraph with Wrap { trim: false } turns space-only Lines
+        // ("   ") into 2 visual lines, doubling every blank line in info messages.
+        // The fix: use Line::from("") for blank lines instead of Line("   ").
+        let text = "Header\n\nLine A\n\nLine B\n\nLine C";
+        let mut lines: Vec<Line> = Vec::new();
+        render_chat_info(&mut lines, text);
+
+        let source_count = lines.len();
+        let text_widget = ratatui::text::Text::from(lines);
+        let p = Paragraph::new(text_widget).wrap(Wrap { trim: false });
+
+        assert_eq!(
+            source_count, p.line_count(80) as usize,
+            "blank lines in info messages should not be doubled by Paragraph wrapping"
+        );
     }
 }

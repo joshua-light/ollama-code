@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
 
-use super::{optional_str, required_str, Tool, ToolDefinition};
+use super::{expand_tilde, optional_str, required_str, Tool, ToolDefinition};
 
 pub struct GlobTool;
 
@@ -34,7 +34,8 @@ impl Tool for GlobTool {
 
     fn execute(&self, arguments: &Value) -> Result<String> {
         let pattern = required_str(arguments, "pattern")?;
-        let path = optional_str(arguments, "path").unwrap_or(".");
+        let raw_path = optional_str(arguments, "path").unwrap_or(".");
+        let path: &str = &expand_tilde(raw_path);
 
         let glob = globset::GlobBuilder::new(pattern)
             .literal_separator(false)

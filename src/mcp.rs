@@ -190,7 +190,7 @@ impl StdioConnection {
 
 /// JSON-RPC over HTTP POST with JSON or SSE responses.
 struct HttpConnection {
-    agent: ureq::Agent,
+    client: reqwest::blocking::Client,
     endpoint: String,
     session_id: Option<String>,
     headers: HashMap<String, String>,
@@ -199,13 +199,12 @@ struct HttpConnection {
 
 impl HttpConnection {
     fn new(endpoint: &str, headers: &HashMap<String, String>) -> Self {
-        let agent = ureq::Agent::new_with_config(
-            ureq::config::Config::builder()
-                .timeout_global(Some(std::time::Duration::from_secs(120)))
-                .build(),
-        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("Failed to build HTTP client");
         Self {
-            agent,
+            client,
             endpoint: endpoint.to_string(),
             session_id: None,
             headers: headers.clone(),
@@ -248,7 +247,7 @@ impl HttpConnection {
         let expected_id = body["id"].as_u64().unwrap_or(0);
 
         let mut req = self
-            .agent
+            .client
             .post(&self.endpoint)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
@@ -261,8 +260,14 @@ impl HttpConnection {
         }
 
         let resp = req
-            .send_json(body)
+            .json(body)
+            .send()
             .map_err(|e| anyhow::anyhow!("MCP HTTP request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() && status.as_u16() != 202 {
+            anyhow::bail!("MCP HTTP request failed with status {status}");
+        }
 
         // Capture session id from response.
         if let Some(sid) = resp.headers().get("mcp-session-id") {
@@ -279,12 +284,11 @@ impl HttpConnection {
             .contains("text/event-stream");
 
         if is_sse {
-            parse_sse_response(resp.into_body().into_reader(), expected_id)
+            parse_sse_response(resp, expected_id)
         } else {
             // Default: parse as JSON.
-            let mut body = resp.into_body();
-            let text = body
-                .read_to_string()
+            let text = resp
+                .text()
                 .map_err(|e| anyhow::anyhow!("Failed to read MCP HTTP response: {e}"))?;
             let resp_val: Value = serde_json::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("Invalid JSON from MCP HTTP server: {e}"))?;
@@ -300,7 +304,7 @@ impl HttpConnection {
         });
 
         let mut req = self
-            .agent
+            .client
             .post(&self.endpoint)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
@@ -314,7 +318,8 @@ impl HttpConnection {
 
         // Notifications may get 202 Accepted (no body) or 200.
         let _resp = req
-            .send_json(&body)
+            .json(&body)
+            .send()
             .map_err(|e| anyhow::anyhow!("MCP HTTP notify failed: {e}"))?;
         Ok(())
     }
@@ -346,17 +351,26 @@ impl HttpConnection {
         if self.session_id.is_none() {
             return;
         }
-        let mut req = self.agent.delete(&self.endpoint);
+        let mut req = self.client.delete(&self.endpoint);
         if let Some(ref sid) = self.session_id {
             req = req.header("Mcp-Session-Id", sid);
         }
-        let _ = req.call();
+        let _ = req.send();
     }
 }
 
 fn is_session_expired(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     msg.contains("404") || msg.contains("Not Found")
+}
+
+/// Check if an error indicates a dead stdio transport (EOF or broken pipe).
+fn is_transport_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("EOF")
+        || msg.contains("Broken pipe")
+        || msg.contains("broken pipe")
+        || msg.contains("closed stdout")
 }
 
 // ---------------------------------------------------------------------------
@@ -437,10 +451,12 @@ pub struct McpToolInfo {
 /// A running MCP server (stdio child process or HTTP endpoint).
 pub struct McpServer {
     pub name: String,
-    child: Option<Child>,
+    child: Arc<Mutex<Option<Child>>>,
     connection: Arc<Mutex<McpConnection>>,
     pub tools: Vec<McpToolInfo>,
     pub needs_confirm: bool,
+    /// Stored config for reconnection on child death.
+    config: McpServerConfig,
 }
 
 /// Start all configured MCP servers, returning those that succeeded.
@@ -474,6 +490,20 @@ impl McpServer {
     }
 
     fn start_stdio(name: &str, config: &McpServerConfig, command: &str) -> Result<Self> {
+        let (child, connection, tools) = Self::spawn_stdio(name, config, command)?;
+
+        Ok(Self {
+            name: name.to_string(),
+            child: Arc::new(Mutex::new(Some(child))),
+            connection: Arc::new(Mutex::new(connection)),
+            tools,
+            needs_confirm: config.needs_confirm,
+            config: config.clone(),
+        })
+    }
+
+    /// Spawn the stdio child process and perform the MCP handshake.
+    fn spawn_stdio(name: &str, config: &McpServerConfig, command: &str) -> Result<(Child, McpConnection, Vec<McpToolInfo>)> {
         let mut cmd = Command::new(command);
         cmd.args(&config.args)
             .stdin(Stdio::piped())
@@ -500,13 +530,7 @@ impl McpServer {
         let mut connection = McpConnection::Stdio(conn);
         let tools = connection.init_and_discover("2024-11-05")?;
 
-        Ok(Self {
-            name: name.to_string(),
-            child: Some(child),
-            connection: Arc::new(Mutex::new(connection)),
-            tools,
-            needs_confirm: config.needs_confirm,
-        })
+        Ok((child, connection, tools))
     }
 
     fn start_http(name: &str, config: &McpServerConfig, url: &str) -> Result<Self> {
@@ -517,11 +541,38 @@ impl McpServer {
 
         Ok(Self {
             name: name.to_string(),
-            child: None,
+            child: Arc::new(Mutex::new(None)),
             connection: Arc::new(Mutex::new(connection)),
             tools,
             needs_confirm: config.needs_confirm,
+            config: config.clone(),
         })
+    }
+
+    /// Attempt to reconnect a stdio MCP server after the child process dies.
+    /// Can be called from McpTool via the shared Arc<Mutex> references.
+    fn reconnect_stdio_shared(
+        name: &str,
+        config: &McpServerConfig,
+        child: &Mutex<Option<Child>>,
+        connection: &Mutex<McpConnection>,
+    ) -> Result<()> {
+        let command = config.command.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Cannot reconnect: not a stdio transport"))?;
+
+        // Kill old child if it's still around
+        if let Ok(mut child_opt) = child.lock() {
+            if let Some(ref mut c) = *child_opt {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            *child_opt = None;
+        }
+
+        let (new_child, new_conn, _tools) = Self::spawn_stdio(name, config, command)?;
+        *child.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))? = Some(new_child);
+        *connection.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))? = new_conn;
+        Ok(())
     }
 
     /// Create `McpTool` instances (implementing `Tool`) for each tool this
@@ -533,13 +584,16 @@ impl McpServer {
                 qualified_name: format!("mcp__{}__{}", self.name, info.name),
                 tool_info: info.clone(),
                 connection: Arc::clone(&self.connection),
+                server_name: self.name.clone(),
+                config: self.config.clone(),
+                child: Arc::clone(&self.child),
             })
             .collect()
     }
 
     /// A short label for the transport type shown by `/mcp`.
     pub fn transport_label(&self) -> &'static str {
-        if self.child.is_some() {
+        if self.config.command.is_some() {
             "stdio"
         } else {
             "http"
@@ -556,9 +610,11 @@ impl Drop for McpServer {
             }
         }
         // Stdio: kill child process.
-        if let Some(ref mut child) = self.child {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Ok(mut child_opt) = self.child.lock() {
+            if let Some(ref mut child) = *child_opt {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -600,6 +656,10 @@ pub struct McpTool {
     qualified_name: String,
     tool_info: McpToolInfo,
     connection: Arc<Mutex<McpConnection>>,
+    /// Stored for stdio reconnection on child death.
+    server_name: String,
+    config: McpServerConfig,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 impl Tool for McpTool {
@@ -616,20 +676,45 @@ impl Tool for McpTool {
     }
 
     fn execute(&self, arguments: &Value) -> Result<String> {
-        let mut conn = self
-            .connection
-            .lock()
-            .map_err(|e| anyhow::anyhow!("MCP connection lock poisoned: {e}"))?;
+        let call_params = serde_json::json!({
+            "name": self.tool_info.name,
+            "arguments": arguments,
+        });
 
-        let result = conn.request(
-            "tools/call",
-            serde_json::json!({
-                "name": self.tool_info.name,
-                "arguments": arguments,
-            }),
-        )?;
+        // First attempt
+        let result = {
+            let mut conn = self
+                .connection
+                .lock()
+                .map_err(|e| anyhow::anyhow!("MCP connection lock poisoned: {e}"))?;
+            conn.request("tools/call", call_params.clone())
+        };
 
-        format_tool_result(&result)
+        match result {
+            Ok(val) => return format_tool_result(&val),
+            Err(e) if self.config.command.is_some() && is_transport_error(&e) => {
+                // Stdio transport error (EOF, broken pipe) — attempt reconnection
+                eprintln!(
+                    "MCP server '{}' transport error: {}. Attempting reconnection...",
+                    self.server_name, e
+                );
+                McpServer::reconnect_stdio_shared(
+                    &self.server_name,
+                    &self.config,
+                    &self.child,
+                    &self.connection,
+                )?;
+
+                // Retry the call on the fresh connection
+                let mut conn = self
+                    .connection
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("MCP connection lock poisoned: {e}"))?;
+                let result = conn.request("tools/call", call_params)?;
+                format_tool_result(&result)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use crossterm::{
     execute,
-    event::{EnableBracketedPaste, DisableBracketedPaste},
+    event::{EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::{FutureExt, StreamExt};
@@ -145,18 +145,19 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen);
         original_hook(info);
     }));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let model = agent.model().to_string();
     let skills = agent.skills().to_vec();
+    let system_prompt = agent.system_prompt().to_string();
     let ollama = OllamaBackend::with_sampling(
         config.ollama_url.clone(),
         crate::ollama::SamplingParams {
@@ -167,7 +168,7 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
     );
     let no_confirm = config.no_confirm.unwrap_or(false);
     let bypass = config.bypass.unwrap_or(false);
-    let mut app = App::new(model.clone(), context_size, ollama, config, skills);
+    let mut app = App::new(model.clone(), context_size, ollama, config, skills, system_prompt);
     if no_confirm || bypass {
         app.auto_approve = true;
     }
@@ -277,10 +278,29 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
             terminal.draw(|f| render::render(f, &mut app))?;
             needs_redraw = false;
         }
+        // Copy selected text to system clipboard (staged during render)
+        if let Some(text) = app.clipboard_text.take() {
+            copy_to_clipboard(&text);
+        }
 
         tokio::select! {
             _ = tick.tick() => {
-                // Only redraw on tick when processing (spinner/progress needs animation)
+                // Continuous auto-scroll while mouse is held at edge
+                if app.auto_scroll != 0 {
+                    if app.auto_scroll < 0 {
+                        app.scroll_up(3);
+                    } else {
+                        app.scroll_down(3);
+                    }
+                    // Extend selection cursor to follow the scroll
+                    if let Some(ref mut sel) = app.selection {
+                        let chat = app.chat_area;
+                        let scroll_top = app.max_scroll.saturating_sub(app.scroll_offset) as usize;
+                        let row_in_chat = if app.auto_scroll < 0 { 0 } else { chat.height.saturating_sub(1) };
+                        sel.cursor.0 = scroll_top + row_in_chat as usize;
+                    }
+                    needs_redraw = true;
+                }
             }
             Some(Ok(evt)) = reader.next() => {
                 events::handle_terminal_event(evt, &mut app, &input_tx, &confirm_tx, &model_tx, &session);
@@ -378,13 +398,27 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
             }
         }
 
+        // If processing just finished and a message was queued, send it now
+        if let Some(msg) = app.drain_queued() {
+            let _ = input_tx.send(AgentInput::Message(msg));
+        }
+
+        // Async git status refresh (non-blocking)
+        if app.refresh_git_pending {
+            app.refresh_git_pending = false;
+            let (branch, dirty) = render::get_git_info_async().await;
+            app.git_branch = branch;
+            app.git_dirty = dirty;
+            needs_redraw = true;
+        }
+
         if app.should_quit {
             break;
         }
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     // Stop any running llama-server
@@ -395,4 +429,37 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
     eprintln!("Session: {}", session_path);
 
     Ok(())
+}
+
+/// Copy text to the system clipboard via platform-native commands.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+
+    let candidates: &[(&str, &[&str])] = if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+        ]
+    } else {
+        &[
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+
+    for (cmd, args) in candidates {
+        if let Ok(mut child) = std::process::Command::new(cmd)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return;
+        }
+    }
 }

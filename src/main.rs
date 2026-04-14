@@ -8,7 +8,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 
 use ollama_code::agent::{Agent, AgentEvent};
-use ollama_code::config::{Config, DEFAULT_CONTEXT_SIZE};
+use ollama_code::config::{Config, DEFAULT_CONTEXT_SIZE, DEFAULT_OLLAMA_URL};
 use ollama_code::format;
 use ollama_code::llama_server::{self, LlamaCppBackend, LlamaServer, ModelSource};
 use ollama_code::message;
@@ -187,7 +187,80 @@ fn sampling_from_config(config: &Config) -> SamplingParams {
     }
 }
 
+/// Check if Ollama is reachable; if not, try to start it automatically.
+///
+/// Only attempts auto-start for localhost URLs — remote servers require the
+/// user to start Ollama themselves.
+async fn ensure_ollama_running(url: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+
+    // Quick check — is Ollama already running?
+    if client.get(format!("{}/api/tags", url)).send().await.is_ok() {
+        return Ok(());
+    }
+
+    // Only attempt auto-start for localhost URLs.
+    let lower = url.to_lowercase();
+    let is_local = lower.contains("://localhost")
+        || lower.contains("://127.0.0.1")
+        || lower.contains("://[::1]");
+    if !is_local {
+        anyhow::bail!(
+            "Cannot connect to Ollama at {url}.\n\n\
+             Make sure the Ollama server is running at that address."
+        );
+    }
+
+    // Try to start Ollama.
+    eprintln!("Ollama is not running. Starting it...");
+
+    let child = std::process::Command::new("ollama")
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    match child {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "Ollama is not installed.\n\n\
+                 Install it from: https://ollama.com/download"
+            );
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "Failed to start Ollama: {e}\n\n\
+                 Try starting it manually:\n  ollama serve"
+            );
+        }
+        Ok(_) => {
+            // Poll until ready (up to 10 seconds).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if client.get(format!("{}/api/tags", url)).send().await.is_ok() {
+                    eprintln!("Ollama started.");
+                    return Ok(());
+                }
+            }
+            anyhow::bail!(
+                "Started Ollama but it did not become ready in time.\n\n\
+                 Possible causes:\n  \
+                 • Insufficient memory or VRAM\n  \
+                 • Port already in use\n  \
+                 • GPU driver issues\n\n\
+                 Check the output of: ollama serve"
+            );
+        }
+    }
+}
+
 async fn run_ollama(prompt: Option<String>, mut config: Config, context_size: u64, resume: Option<String>) -> Result<()> {
+    let ollama_url = config.ollama_url.as_deref().unwrap_or(DEFAULT_OLLAMA_URL);
+    ensure_ollama_running(ollama_url).await?;
+
     let ollama = OllamaBackend::with_sampling(config.ollama_url.clone(), sampling_from_config(&config));
 
     let model = if let Some(m) = config.model.clone() {

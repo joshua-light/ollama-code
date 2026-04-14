@@ -62,9 +62,15 @@ pub struct Config {
     #[serde(default)]
     pub subagent_max_turns: Option<u16>,
 
-    /// Show estimated Opus 4.6 cost on the status line (default: false).
+    /// Show estimated cost on the status line (default: false).
     #[serde(default)]
     pub show_cost_estimate: Option<bool>,
+
+    /// Cost rates as (input, output) dollars per million tokens.
+    /// Default: (5.0, 25.0) matching Anthropic Opus 4.6 pricing.
+    /// Set to (0.0, 0.0) for local Ollama models.
+    #[serde(default)]
+    pub cost_per_million_tokens: Option<(f64, f64)>,
 
     /// Ollama API base URL (default: "http://localhost:11434").
     #[serde(default)]
@@ -270,6 +276,7 @@ impl Config {
             bash_timeout: self.bash_timeout.or(other.bash_timeout),
             subagent_max_turns: self.subagent_max_turns.or(other.subagent_max_turns),
             show_cost_estimate: self.show_cost_estimate.or(other.show_cost_estimate),
+            cost_per_million_tokens: self.cost_per_million_tokens.or(other.cost_per_million_tokens),
             ollama_url: self.ollama_url.or_else(|| other.ollama_url.clone()),
             no_confirm: self.no_confirm.or(other.no_confirm),
             verbose: self.verbose.or(other.verbose),
@@ -362,8 +369,12 @@ impl Config {
 # Maximum number of agent-loop turns a sub-agent is allowed (default: 15)
 # subagent_max_turns = 15
 
-# Show estimated Opus 4.6 cost on the status line (default: false)
+# Show estimated cost on the status line (default: false)
 # show_cost_estimate = false
+
+# Cost rates as [input, output] dollars per million tokens (default: [5.0, 25.0])
+# Set to [0.0, 0.0] for local Ollama models.
+# cost_per_million_tokens = [5.0, 25.0]
 
 # Auto-approve all tool calls (default: false)
 # no_confirm = false
@@ -444,11 +455,11 @@ impl Config {
     }
 
     pub fn effective_trim_threshold(&self) -> u8 {
-        self.trim_threshold.unwrap_or(DEFAULT_TRIM_THRESHOLD_PCT)
+        self.trim_threshold.unwrap_or(DEFAULT_TRIM_THRESHOLD_PCT).min(100)
     }
 
     pub fn effective_trim_target(&self) -> u8 {
-        self.trim_target.unwrap_or(DEFAULT_TRIM_TARGET_PCT)
+        self.trim_target.unwrap_or(DEFAULT_TRIM_TARGET_PCT).min(100)
     }
 
     pub fn effective_reinjection_interval(&self) -> u16 {
