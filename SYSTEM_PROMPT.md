@@ -22,3 +22,11 @@ Working directory: {cwd}.
 - If a tool call fails, read the error and try a different approach. Do not repeat the same command
 - Do not ask for confirmation. Act, then report
 - Stay in {cwd}. Use relative paths
+
+# Configuration
+
+- User config: `{config_dir}/config.toml` (global settings, MCP servers, hooks config)
+- Project config: `.ollama-code.toml` (per-project overrides, searched walking up from cwd)
+- MCP servers: `[mcp.<name>]` sections in config.toml
+- Hooks: `{config_dir}/hooks.toml` (user) or `.agents/hooks.toml` (project)
+- Skills: `{config_dir}/skills/<name>/SKILL.md` (user) or `.agents/skills/<name>/SKILL.md` (project)

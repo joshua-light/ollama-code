@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use regex::{Regex, RegexBuilder};
+
+use crate::config::config_dir;
 
 /// Metadata from SKILL.md frontmatter -- kept in memory for discovery.
 #[derive(Clone, Debug)]
@@ -9,26 +12,27 @@ pub struct SkillMeta {
     pub name: String,
     /// One-line description (from frontmatter).
     pub description: String,
-    /// Optional trigger hint — explains when the model should activate this skill.
+    /// Optional trigger pattern (raw string from frontmatter).
     pub trigger: Option<String>,
+    /// Pre-compiled trigger regex (case-insensitive). Populated during discovery.
+    pub compiled_trigger: Option<Regex>,
     /// Path to the skill directory containing SKILL.md.
     pub dir: PathBuf,
 }
 
 impl SkillMeta {
     /// Load the full instructions (SKILL.md body after frontmatter).
+    /// Substitutes `{config_dir}` with the platform-specific config directory.
     pub fn load_instructions(&self) -> Result<String> {
         let content = std::fs::read_to_string(self.dir.join("SKILL.md"))?;
-        Ok(extract_body(&content))
+        let body = extract_body(&content);
+        Ok(body.replace("{config_dir}", &config_dir().to_string_lossy()))
     }
 }
 
 /// User-scoped skills directory (`~/.config/ollama-code/skills/`).
 pub fn user_skills_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ollama-code")
-        .join("skills")
+    config_dir().join("skills")
 }
 
 /// Discover skills from both project-scoped and user-scoped directories.
@@ -177,10 +181,15 @@ fn parse_frontmatter(path: &Path, dir: &Path) -> Result<SkillMeta> {
         }
     }
 
+    let compiled_trigger = trigger.as_ref().and_then(|p| {
+        RegexBuilder::new(p).case_insensitive(true).build().ok()
+    });
+
     Ok(SkillMeta {
         name: name.ok_or_else(|| anyhow::anyhow!("missing 'name'"))?,
         description: description.ok_or_else(|| anyhow::anyhow!("missing 'description'"))?,
         trigger,
+        compiled_trigger,
         dir: dir.to_path_buf(),
     })
 }
@@ -197,6 +206,21 @@ fn extract_body(content: &str) -> String {
     } else {
         content.to_string()
     }
+}
+
+/// Check if a user message triggers any skill. Returns the first matching
+/// skill's name and loaded instructions. Uses pre-compiled regexes.
+pub fn check_triggers(skills: &[SkillMeta], user_input: &str) -> Option<(String, String)> {
+    for skill in skills {
+        if let Some(re) = &skill.compiled_trigger {
+            if re.is_match(user_input) {
+                if let Ok(instructions) = skill.load_instructions() {
+                    return Some((skill.name.clone(), instructions));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Format skill summaries for inclusion in the system prompt (discovery layer).

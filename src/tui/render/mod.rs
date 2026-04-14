@@ -410,11 +410,30 @@ fn render_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_status_line(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    // Show command completions when input starts with /
-    let matches = commands::completions(&app.input);
-    if !matches.is_empty() && !app.is_processing {
-        render_command_completions(f, area, &app.input, &matches);
-        return;
+    // Show command + skill completions when input starts with /
+    if !app.is_processing {
+        let builtin_matches = commands::completions(&app.input);
+        let prefix = app.input.trim();
+        let skill_prefix = prefix.strip_prefix('/').unwrap_or("");
+        let skill_matches: Vec<(&str, &str)> = if !skill_prefix.is_empty() {
+            app.skills
+                .iter()
+                .filter(|s| s.name.starts_with(skill_prefix))
+                .map(|s| (s.name.as_str(), s.description.as_str()))
+                .collect()
+        } else if prefix == "/" {
+            app.skills
+                .iter()
+                .map(|s| (s.name.as_str(), s.description.as_str()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if !builtin_matches.is_empty() || !skill_matches.is_empty() {
+            render_command_completions(f, area, &app.input, &builtin_matches, &skill_matches);
+            return;
+        }
     }
 
     let mut spans: Vec<Span> = Vec::new();
@@ -518,40 +537,54 @@ fn render_status_line(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(paragraph, area);
 }
 
+fn push_completion_item(
+    spans: &mut Vec<Span>,
+    item_idx: &mut usize,
+    input: &str,
+    display_name: &str,
+    description: &str,
+    color: Color,
+) {
+    if *item_idx > 0 {
+        spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
+    }
+    let prefix_len = input.len().min(display_name.len());
+    let matched = &display_name[..prefix_len];
+    let rest = &display_name[prefix_len..];
+    spans.push(Span::styled(" ", Style::default()));
+    spans.push(Span::styled(
+        matched.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        rest.to_string(),
+        Style::default().fg(color),
+    ));
+    spans.push(Span::styled(
+        format!(" {}", description),
+        Style::default().fg(Color::DarkGray),
+    ));
+    *item_idx += 1;
+}
+
 fn render_command_completions(
     f: &mut Frame,
     area: ratatui::layout::Rect,
     input: &str,
-    matches: &[&commands::CommandInfo],
+    builtin_matches: &[&commands::CommandInfo],
+    skill_matches: &[(&str, &str)],
 ) {
     let input = input.trim();
     let mut spans: Vec<Span> = Vec::new();
+    let mut item_idx = 0;
 
-    for (i, cmd) in matches.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
-        }
+    for cmd in builtin_matches {
+        push_completion_item(&mut spans, &mut item_idx, input, cmd.name, cmd.description, Color::Yellow);
+    }
 
-        // Highlight the matching prefix of the command name
-        let prefix_len = input.len().min(cmd.name.len());
-        let matched = &cmd.name[..prefix_len];
-        let rest = &cmd.name[prefix_len..];
-
-        spans.push(Span::styled(" ", Style::default()));
-        spans.push(Span::styled(
-            matched.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            rest.to_string(),
-            Style::default().fg(Color::Yellow),
-        ));
-        spans.push(Span::styled(
-            format!(" {}", cmd.description),
-            Style::default().fg(Color::DarkGray),
-        ));
+    for (name, description) in skill_matches {
+        let full_name = format!("/{}", name);
+        push_completion_item(&mut spans, &mut item_idx, input, &full_name, description, Color::Cyan);
     }
 
     // Tab hint on the right side

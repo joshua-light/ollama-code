@@ -1,6 +1,7 @@
 ---
 name: "self-modify"
 description: "View and modify ollama-code settings, features, and customization"
+trigger: "ollama.code|modify (this|the) (app|tool|agent|cli)|change (this|the) (app|tool|agent|cli)|add.*(mcp|hook|skill|tool plugin)|configure.*(mcp|hook|skill)|mcp server|modify (itself|yourself)|update (itself|yourself)|(edit|change|update|set).*(config|settings)"
 ---
 
 # Self-Configuration
@@ -9,7 +10,7 @@ The user is asking about ollama-code configuration, settings, features, or custo
 
 ## Config Files
 
-### User config: `~/.config/ollama-code/config.toml`
+### User config: `{config_dir}/config.toml`
 
 Global settings. Read it with `read` and modify with `edit`. All fields are optional:
 
@@ -83,13 +84,77 @@ The agent has these built-in tools:
 
 Tools that modify state (`bash`, `edit`, `write`, `subagent`) require user confirmation unless bypass mode is on.
 
+## MCP Servers
+
+MCP (Model Context Protocol) servers extend the agent with external tools. Configure in `{config_dir}/config.toml` or `.ollama-code.toml`.
+
+### Stdio Transport (spawn a local process)
+
+```toml
+[mcp.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+env = { "NODE_ENV" = "production" }
+needs_confirm = true   # Require user confirmation for tool calls (default: true)
+```
+
+### Streamable HTTP Transport (connect to a remote server)
+
+```toml
+[mcp.remote-api]
+url = "https://example.com/mcp"
+headers = { "Authorization" = "Bearer tok_..." }
+needs_confirm = false
+```
+
+### Configuration Fields
+
+| Field | Transport | Description |
+|-------|-----------|-------------|
+| `command` | stdio | Command to spawn (mutually exclusive with `url`) |
+| `args` | stdio | Arguments for the command |
+| `env` | stdio | Environment variables for the process |
+| `url` | HTTP | Server endpoint URL (mutually exclusive with `command`) |
+| `headers` | HTTP | Extra HTTP headers (e.g., Authorization) |
+| `needs_confirm` | both | Whether tool calls require user confirmation (default: true) |
+
+### Runtime Behavior
+
+- MCP servers connect at startup; tools are auto-discovered via the MCP protocol
+- Tools are namespaced as `mcp__<server>__<tool>` (e.g., `mcp__filesystem__read_file`)
+- `/mcp` slash command shows connected servers and their tools
+- Disable a server: set `plugins.<server_name> = false` in config
+- Disable a specific tool: set `plugins.mcp__<server>__<tool> = false` in config
+- Stdio servers are managed as child processes; HTTP servers reconnect automatically
+
+### Common MCP Servers
+
+```toml
+# Filesystem access
+[mcp.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allow"]
+
+# GitHub
+[mcp.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { "GITHUB_PERSONAL_ACCESS_TOKEN" = "<token>" }
+
+# Brave Search
+[mcp.brave-search]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-brave-search"]
+env = { "BRAVE_API_KEY" = "<key>" }
+```
+
 ## Hooks
 
 Hooks are external scripts that run at specific lifecycle events in the agent loop. They can inspect, modify, or block tool calls and agent responses.
 
 ### Hook Files
 
-- **User hooks**: `~/.config/ollama-code/hooks.toml`
+- **User hooks**: `{config_dir}/hooks.toml`
 - **Project hooks**: `.agents/hooks.toml` (searched walking up from cwd)
 
 Project hooks override user hooks with the same name.
@@ -187,7 +252,7 @@ These are appended to the system prompt and count toward context usage.
 Skills are slash-command extensions loaded from `SKILL.md` files:
 
 - **Project skills**: `.agents/skills/<name>/SKILL.md` (searched walking up from cwd)
-- **User skills**: `~/.config/ollama-code/skills/<name>/SKILL.md` (always available)
+- **User skills**: `{config_dir}/skills/<name>/SKILL.md` (always available)
 
 Project skills override user skills with the same name. Each `SKILL.md` has YAML frontmatter (`name`, `description`) and a body that becomes the prompt when invoked.
 
@@ -196,4 +261,4 @@ Project skills override user skills with the same name. Each `SKILL.md` has YAML
 - **Config file changes**: Read the file, edit the relevant field, and tell the user. Changes take effect on next startup (or immediately for some fields like `context_size` via `/context`).
 - **Runtime changes**: Use slash commands for immediate effect (model, context, bypass).
 - **Project-specific overrides**: Create/edit `.ollama-code.toml` in the project root.
-- **Custom skills**: Create a new directory under `~/.config/ollama-code/skills/<name>/` with a `SKILL.md` file containing frontmatter and instructions.
+- **Custom skills**: Create a new directory under `{config_dir}/skills/<name>/` with a `SKILL.md` file containing frontmatter and instructions.

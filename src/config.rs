@@ -14,6 +14,13 @@ pub const DEFAULT_TRIM_THRESHOLD_PCT: u8 = 80;
 pub const DEFAULT_TRIM_TARGET_PCT: u8 = 60;
 pub const DEFAULT_REINJECTION_INTERVAL: u16 = 3;
 
+/// Root config directory for ollama-code (`$XDG_CONFIG_HOME/ollama-code` or `./ollama-code`).
+pub fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("ollama-code")
+}
+
 /// Root data directory for ollama-code (`$XDG_DATA_HOME/ollama-code` or `./ollama-code`).
 pub fn data_dir() -> PathBuf {
     dirs::data_dir()

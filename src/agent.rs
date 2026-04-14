@@ -269,8 +269,11 @@ impl Agent {
             ""
         };
 
+        let config_dir = crate::config::config_dir();
+
         let mut system_prompt = include_str!("../SYSTEM_PROMPT.md")
             .replace("{cwd}", &cwd)
+            .replace("{config_dir}", &config_dir.to_string_lossy())
             .replace("{subagent_tool}", subagent_desc)
             .replace("{skill_tool}", skill_desc);
 
@@ -929,6 +932,21 @@ impl Agent {
                 extra_context
             ));
             self.messages.push(ctx_msg);
+        }
+
+        // --- skill trigger auto-injection ---
+        if let Some((skill_name, instructions)) =
+            skills::check_triggers(&self.skills, user_input)
+        {
+            let ctx_msg = Message::system(format!(
+                "[Auto-triggered skill: /{}]\n{}",
+                skill_name, instructions
+            ));
+            self.messages.push(ctx_msg);
+            send_event(
+                events,
+                AgentEvent::Debug(format!("Auto-triggered skill: /{}", skill_name)),
+            )?;
         }
 
         // Store the current task for re-injection
