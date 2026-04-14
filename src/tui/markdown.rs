@@ -91,9 +91,40 @@ fn render_table(table_lines: &[&str], output: &mut Vec<Line<'static>>, max_width
     let available_content = max_width.saturating_sub(3 + border_chars + padding_chars);
     let total_content: usize = col_widths.iter().sum();
     if total_content > available_content && available_content > 0 {
-        let scale = available_content as f64 / total_content as f64;
-        for w in &mut col_widths {
-            *w = ((*w as f64 * scale) as usize).max(1);
+        // Minimum width per column: at least the header width (so headers aren't truncated),
+        // with an absolute floor of 3 characters.
+        let min_widths: Vec<usize> = header
+            .iter()
+            .enumerate()
+            .map(|(j, h)| h.chars().count().max(3).min(col_widths[j]))
+            .collect();
+        let total_min: usize = min_widths.iter().sum();
+
+        if total_min >= available_content {
+            // Not enough room even for minimums — proportionally scale the minimums
+            let scale = available_content as f64 / total_min as f64;
+            for (j, w) in col_widths.iter_mut().enumerate() {
+                *w = ((min_widths[j] as f64 * scale) as usize).max(1);
+            }
+        } else {
+            // Give every column its minimum, then distribute the remaining space
+            // proportionally based on how much extra each column wants.
+            let remaining = available_content - total_min;
+            let extras: Vec<usize> = col_widths
+                .iter()
+                .zip(min_widths.iter())
+                .map(|(natural, min)| natural.saturating_sub(*min))
+                .collect();
+            let total_extra: usize = extras.iter().sum();
+
+            if total_extra == 0 {
+                col_widths = min_widths;
+            } else {
+                for (j, w) in col_widths.iter_mut().enumerate() {
+                    let bonus = (extras[j] as f64 / total_extra as f64 * remaining as f64) as usize;
+                    *w = min_widths[j] + bonus;
+                }
+            }
         }
     }
 
