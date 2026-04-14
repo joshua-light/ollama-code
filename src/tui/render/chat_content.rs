@@ -130,13 +130,27 @@ fn render_chat_tool_call(
     expanded: bool,
 ) {
     lines.push(Line::from(""));
-    let circle_color = match result {
-        Some(ToolResultData { success: true, .. }) => Color::Green,
-        Some(ToolResultData { success: false, .. }) => Color::Red,
-        None => Color::DarkGray,
+    let icon = match result {
+        Some(ToolResultData { success: true, .. }) => {
+            Span::styled(" ● ", Style::default().fg(Color::Green))
+        }
+        Some(ToolResultData { success: false, .. }) => {
+            Span::styled(" ● ", Style::default().fg(Color::Red))
+        }
+        None => {
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let idx = (millis / 80) as usize % SPINNER.len();
+            Span::styled(
+                format!(" {} ", SPINNER[idx]),
+                Style::default().fg(Color::Yellow),
+            )
+        }
     };
     lines.push(Line::from(vec![
-        Span::styled(" ● ", Style::default().fg(circle_color)),
+        icon,
         Span::styled(
             format!("{}({})", format::capitalize_first(name), format::truncate_args(args, 77)),
             Style::default().fg(Color::White),
