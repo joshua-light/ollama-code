@@ -142,11 +142,9 @@ fn render_chat_tool_call(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            let idx = (millis / 80) as usize % SPINNER.len();
-            Span::styled(
-                format!(" {} ", SPINNER[idx]),
-                Style::default().fg(Color::Yellow),
-            )
+            let visible = (millis / 500).is_multiple_of(2);
+            let color = if visible { Color::Yellow } else { Color::DarkGray };
+            Span::styled(" ● ", Style::default().fg(color))
         }
     };
     lines.push(Line::from(vec![
