@@ -964,6 +964,14 @@ impl Agent {
                 }
             };
 
+            // If cancellation was requested while the stream was completing
+            // (race between backend.chat finishing and poll_cancel detecting
+            // the flag), honour the cancellation immediately.
+            if cancel.load(Ordering::Relaxed) {
+                send_event(events, AgentEvent::Cancelled)?;
+                return Ok(());
+            }
+
             let ns_to_ms = |ns: u64| -> f64 { ns as f64 / 1_000_000.0 };
             let prompt_tps = if response.prompt_eval_duration > 0 {
                 response.prompt_eval_count as f64 / (response.prompt_eval_duration as f64 / 1e9)
@@ -1172,7 +1180,7 @@ impl Agent {
             self.messages.push(assistant_msg.clone());
             send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
 
-            for tool_call in &tool_calls_with_ids {
+            for (i, tool_call) in tool_calls_with_ids.iter().enumerate() {
                 // Track tool calls for re-injection summary
                 if self.task_reinjection {
                     tool_call_summary.push(tool_call.function.name.clone());
@@ -1182,6 +1190,22 @@ impl Agent {
                     .dispatch_tool_call(tool_call, events, confirm_rx, &cancel)
                     .await?;
                 if !continue_loop {
+                    // If cancelled, add "Cancelled" tool results for the
+                    // current (un-executed) tool call and all remaining ones
+                    // so the message history stays consistent — otherwise the
+                    // model sees its own tool-call request without a matching
+                    // result and retries the same action.
+                    if cancel.load(Ordering::Relaxed) {
+                        for remaining in &tool_calls_with_ids[i..] {
+                            let tool_msg = Message::tool(
+                                "Cancelled by user.",
+                                remaining.id.clone(),
+                                false,
+                            );
+                            self.messages.push(tool_msg.clone());
+                            send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+                        }
+                    }
                     return Ok(());
                 }
             }
