@@ -7,6 +7,30 @@ pub fn capitalize_first(s: &str) -> String {
     }
 }
 
+/// Convert an underscore-separated string to Title Case.
+/// e.g. "get_report" -> "Get Report", "firebasecrashlytics" -> "Firebasecrashlytics"
+fn title_case(s: &str) -> String {
+    s.split('_')
+        .filter(|part| !part.is_empty())
+        .map(capitalize_first)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Format a tool name for display. MCP tools (pattern `mcp__<server>__<tool>`)
+/// are shown as "Server | Tool Name", e.g. "Firebase | Get Report".
+/// Non-MCP tools just get their first character capitalized.
+pub fn format_tool_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        if let Some((server, tool)) = rest.split_once("__") {
+            let server_display = title_case(server);
+            let tool_display = title_case(tool);
+            return format!("{} | {}", server_display, tool_display);
+        }
+    }
+    capitalize_first(name)
+}
+
 /// Truncate a string, appending "..." if longer than `max` chars.
 pub fn truncate_args(s: &str, max: usize) -> String {
     let mut iter = s.chars();
@@ -278,5 +302,46 @@ mod tests {
             format_tool_args_display("custom_tool", &args),
             args.to_string()
         );
+    }
+
+    // ── format_tool_name ───────────────────────────────────────────
+
+    #[test]
+    fn format_tool_name_mcp() {
+        assert_eq!(
+            format_tool_name("mcp__firebase__get_report"),
+            "Firebase | Get Report"
+        );
+    }
+
+    #[test]
+    fn format_tool_name_mcp_multi_word_server() {
+        assert_eq!(
+            format_tool_name("mcp__firebase_crashlytics__get_report"),
+            "Firebase Crashlytics | Get Report"
+        );
+    }
+
+    #[test]
+    fn format_tool_name_non_mcp() {
+        assert_eq!(format_tool_name("read"), "Read");
+    }
+
+    #[test]
+    fn format_tool_name_non_mcp_underscore() {
+        assert_eq!(format_tool_name("custom_tool"), "Custom_tool");
+    }
+
+    #[test]
+    fn format_tool_name_mcp_single_word_tool() {
+        assert_eq!(
+            format_tool_name("mcp__github__search"),
+            "Github | Search"
+        );
+    }
+
+    #[test]
+    fn format_tool_name_empty() {
+        assert_eq!(format_tool_name(""), "");
     }
 }

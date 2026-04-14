@@ -146,7 +146,7 @@ fn render_chat_tool_call(
     lines.push(Line::from(vec![
         icon,
         Span::styled(
-            format!("{}({})", format::capitalize_first(name), format::truncate_args(args, 77)),
+            format!("{}({})", format::format_tool_name(name), format::truncate_args(args, 77)),
             Style::default().fg(Color::White),
         ),
     ]));
@@ -418,9 +418,13 @@ fn render_chat_stats_info(lines: &mut Vec<Line<'static>>, data: &StatsInfoData) 
 
     // Per-tool breakdown (already sorted by count descending)
     if !data.tool_call_breakdown.is_empty() {
-        for (name, count) in &data.tool_call_breakdown {
+        let display_names: Vec<(String, &usize)> = data.tool_call_breakdown.iter()
+            .map(|(name, count)| (format::format_tool_name(name), count))
+            .collect();
+        let col_width = display_names.iter().map(|(n, _)| n.len()).max().unwrap_or(14).max(14) + 2;
+        for (display_name, count) in &display_names {
             lines.push(Line::from(vec![
-                Span::styled(format!("     {:<14}", name), dim),
+                Span::styled(format!("     {:<width$}", display_name, width = col_width), dim),
                 Span::styled(count.to_string(), dim),
             ]));
         }
@@ -469,7 +473,7 @@ fn render_chat_subagent_tool_call(
         Span::styled(
             format!(
                 " {}({})",
-                format::capitalize_first(name),
+                format::format_tool_name(name),
                 format::truncate_args(args, 60),
             ),
             Style::default().fg(Color::DarkGray),
@@ -508,7 +512,7 @@ fn render_chat_confirm_prompt(lines: &mut Vec<Line<'static>>, confirm: &PendingC
         Span::styled(
             format!(
                 "Allow {}({})? ",
-                format::capitalize_first(&confirm.name),
+                format::format_tool_name(&confirm.name),
                 format::truncate_args(&confirm.args, 60),
             ),
             Style::default().fg(Color::Yellow),

@@ -390,7 +390,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
                 }
                 eprintln!(
                     "\n ● {}({})",
-                    format::capitalize_first(&name),
+                    format::format_tool_name(&name),
                     format::truncate_args(&args, 77),
                 );
             }
@@ -431,7 +431,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
             AgentEvent::SubagentToolCall { name, args } => {
                 eprintln!(
                     "   ↳ {}({})",
-                    format::capitalize_first(&name),
+                    format::format_tool_name(&name),
                     format::truncate_args(&args, 60),
                 );
             }
