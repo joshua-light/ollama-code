@@ -138,7 +138,7 @@ fn render_chat_tool_call(
     lines.push(Line::from(vec![
         Span::styled(" ● ", Style::default().fg(circle_color)),
         Span::styled(
-            format!("{}({})", format::capitalize_first(name), format::truncate_args(args, 77)),
+            format!("{}({})", format::format_tool_name(name), format::truncate_args(args, 77)),
             Style::default().fg(Color::White),
         ),
     ]));
@@ -411,8 +411,9 @@ fn render_chat_stats_info(lines: &mut Vec<Line<'static>>, data: &StatsInfoData) 
     // Per-tool breakdown (already sorted by count descending)
     if !data.tool_call_breakdown.is_empty() {
         for (name, count) in &data.tool_call_breakdown {
+            let display_name = format::format_tool_name(name);
             lines.push(Line::from(vec![
-                Span::styled(format!("     {:<14}", name), dim),
+                Span::styled(format!("     {:<14}", display_name), dim),
                 Span::styled(count.to_string(), dim),
             ]));
         }
