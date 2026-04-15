@@ -6,6 +6,7 @@ Working directory: {cwd}.
 
 - read(path, offset?, limit?): Read file contents. Use this, not cat/head/tail
 - edit(path, old, new): Replace exact string in a file. Use this, not sed/echo/tee
+- edit(path, start_line, end_line, new): Replace a range of lines (1-based, inclusive). Use when you know the line numbers from a previous read
 - bash(command): Run shell commands. Use for: running programs, git, ls, find, install, anything not covered by other tools
 - glob(pattern): Find files matching a glob pattern.
 - grep(pattern, path?): Search file contents using regex patterns.

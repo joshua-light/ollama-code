@@ -51,10 +51,7 @@ ollama-code
 ollama-code -p "list all TODO comments in this directory"
 ```
 
-On first launch, a default `config.toml` is created automatically with all available options documented as comments. If no model is configured, you'll be prompted to pick from your locally available models. The config file location is platform-dependent:
-
-- **macOS**: `~/Library/Application Support/ollama-code/config.toml`
-- **Linux**: `~/.config/ollama-code/config.toml`
+On first launch, a default `config.toml` is created automatically with all available options documented as comments. If no model is configured, you'll be prompted to pick from your locally available models. The config file location is `~/.config/ollama-code/config.toml` (or `$XDG_CONFIG_HOME/ollama-code/config.toml` if set).
 
 ## Usage
 
@@ -109,7 +106,7 @@ Bash, edit, and write require user confirmation by default (use `--no-confirm` o
 
 ## Configuration
 
-Settings are stored in the platform config directory (`~/Library/Application Support/ollama-code/config.toml` on macOS, `~/.config/ollama-code/config.toml` on Linux). You can also place a `.ollama-code.toml` in your project root — its values are layered over the user config.
+Settings are stored in `~/.config/ollama-code/config.toml` (or `$XDG_CONFIG_HOME/ollama-code/config.toml` if set). You can also place a `.ollama-code.toml` in your project root — its values are layered over the user config.
 
 ```toml
 model = "qwen2.5-coder:7b"
@@ -205,7 +202,7 @@ Skills are reusable prompt templates defined as SKILL.md files. They are discove
 - `<CONFIG_DIR>/ollama-code/skills/<name>/SKILL.md` (user-global)
 - `.agents/skills/<name>/SKILL.md` (project-local)
 
-> `<CONFIG_DIR>` is `~/Library/Application Support` on macOS and `~/.config` on Linux.
+> `<CONFIG_DIR>` is `~/.config` (or `$XDG_CONFIG_HOME` if set).
 
 Skills can be activated in two ways:
 - **By the user**: type `/<skill-name>` as a slash command in the TUI

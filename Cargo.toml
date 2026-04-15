@@ -1,6 +1,6 @@
 [package]
 name = "ollama-code"
-version = "0.14.1"
+version = "0.14.2"
 edition = "2021"
 description = "A CLI agent built on Ollama"
 

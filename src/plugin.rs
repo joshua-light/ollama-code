@@ -89,10 +89,7 @@ pub fn discover_plugins(
 
 /// Default user plugins directory: `~/.config/ollama-code/plugins/`.
 fn default_user_plugins_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ollama-code")
-        .join("plugins")
+    crate::config::config_dir().join("plugins")
 }
 
 /// Walk up from `cwd` looking for `.agents/plugins/*/PLUGIN.toml`.

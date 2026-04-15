@@ -15,15 +15,23 @@ pub const DEFAULT_TRIM_TARGET_PCT: u8 = 60;
 pub const DEFAULT_REINJECTION_INTERVAL: u16 = 3;
 
 /// Root config directory for ollama-code (`$XDG_CONFIG_HOME/ollama-code` or `./ollama-code`).
+/// On macOS, `dirs::config_dir()` returns `~/Library/Application Support` which doesn't
+/// match the documented `~/.config/ollama-code` path, so we use XDG paths directly.
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ollama-code")
 }
 
 /// Root data directory for ollama-code (`$XDG_DATA_HOME/ollama-code` or `./ollama-code`).
+/// On macOS, `dirs::data_dir()` returns `~/Library/Application Support` which doesn't
+/// match the documented `~/.local/share/ollama-code` path, so we use XDG paths directly.
 pub fn data_dir() -> PathBuf {
-    dirs::data_dir()
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ollama-code")
 }
@@ -215,10 +223,7 @@ fn feature_config<'a>(
 
 impl Config {
     pub fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("ollama-code")
-            .join("config.toml")
+        config_dir().join("config.toml")
     }
 
     /// Load config from a specific file path. Returns default if file doesn't exist.

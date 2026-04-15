@@ -164,6 +164,11 @@ pub struct Agent {
     has_explored: bool,
     /// The original user input for the current run (for task re-injection).
     current_task: String,
+    /// Files read during this agent's lifetime: (path, start_line_0, end_line_0).
+    /// Used to inject file context into subagent prompts.
+    read_file_ranges: Vec<(String, usize, usize)>,
+    /// Whether any edit/write tool succeeded during the current `run()`.
+    had_edits_this_run: bool,
 }
 
 impl Agent {
@@ -192,11 +197,11 @@ impl Agent {
             };
         }
         register_if_enabled!("bash", BashTool);
-        register_if_enabled!("read", ReadTool);
+        register_if_enabled!("read", ReadTool::new());
         register_if_enabled!("edit", EditTool);
         register_if_enabled!("write", WriteTool);
         register_if_enabled!("glob", GlobTool);
-        register_if_enabled!("grep", GrepTool);
+        register_if_enabled!("grep", GrepTool::new(context_size));
         if !is_subagent {
             register_if_enabled!("subagent", SubagentToolDef);
         }
@@ -356,6 +361,8 @@ impl Agent {
             trim_target_pct: cfg.effective_trim_target(),
             has_explored: false,
             current_task: String::new(),
+            read_file_ranges: Vec::new(),
+            had_edits_this_run: false,
         }
     }
 
@@ -574,7 +581,98 @@ impl Agent {
     /// Execute a sub-agent for the given `task`, forwarding its events and
     /// tool-confirmation requests to the parent's channels.
     /// Returns `(result_text, success)`.
+    /// Build a file-context preamble from the parent's read history.
+    fn build_file_context_preamble(&self) -> String {
+        if self.read_file_ranges.is_empty() {
+            return String::new();
+        }
+
+        // Deduplicate: keep only unique paths with their widest range.
+        let mut file_ranges: std::collections::HashMap<&str, (usize, usize)> =
+            std::collections::HashMap::new();
+        for (path, start, end) in &self.read_file_ranges {
+            let entry = file_ranges.entry(path.as_str()).or_insert((*start, *end));
+            entry.0 = entry.0.min(*start);
+            entry.1 = entry.1.max(*end);
+        }
+
+        let mut preamble = String::from(
+            "\n\n--- Parent agent file context ---\n\
+             The parent agent has already read these files. You may reference this \
+             information without re-reading:\n",
+        );
+        for (path, (start, end)) in &file_ranges {
+            preamble.push_str(&format!("  - {} (lines {}-{})\n", path, start + 1, end));
+        }
+        preamble.push_str("---\n");
+        preamble
+    }
+
+    /// Check if a task description contains action verbs that imply code changes.
+    fn task_expects_edits(task: &str) -> bool {
+        let lower = task.to_lowercase();
+        // Look for action verbs that imply code changes
+        ["implement", "edit", "modify", "update", "change", "fix", "add", "remove", "replace",
+         "refactor", "rewrite", "write"]
+            .iter()
+            .any(|verb| lower.contains(verb))
+    }
+
     async fn execute_subagent(
+        &self,
+        task: &str,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
+        cancel: &Arc<AtomicBool>,
+    ) -> (String, bool) {
+        // Build enriched task with parent file context
+        let preamble = self.build_file_context_preamble();
+        let enriched_task = if preamble.is_empty() {
+            task.to_string()
+        } else {
+            format!("{}{}", task, preamble)
+        };
+
+        let result = self
+            .run_subagent_once(&enriched_task, events, confirm_rx, cancel)
+            .await;
+
+        // Task enforcement: if the task expected edits but the subagent made none, retry once
+        if result.1 && Self::task_expects_edits(task) {
+            // Check if the subagent's response suggests it only explored
+            // We detect this by checking if the subagent made any edits
+            // The subagent itself tracks had_edits_this_run, but we can't access it
+            // from here. Instead, check if the result mentions code changes or
+            // contains typical "exploration-only" patterns.
+            let response = &result.0;
+            let likely_no_edits = !response.is_empty()
+                && !response.contains("edit")
+                && !response.contains("modified")
+                && !response.contains("updated")
+                && !response.contains("changed")
+                && !response.contains("wrote")
+                && !response.contains("replaced");
+
+            if likely_no_edits {
+                let retry_task = format!(
+                    "{}\n\n\
+                     IMPORTANT: You were asked to make code changes but your previous attempt \
+                     completed without editing any files. Please re-read the task above and \
+                     make the requested edits using the edit or write tool. Do not just \
+                     explore or summarize — actually make the changes.",
+                    enriched_task
+                );
+                return self
+                    .run_subagent_once(&retry_task, events, confirm_rx, cancel)
+                    .await;
+            }
+        }
+
+        result
+    }
+
+    /// Run a single subagent instance and return its result.
+    async fn run_subagent_once(
         &self,
         task: &str,
         events: &mpsc::UnboundedSender<AgentEvent>,
@@ -836,6 +934,21 @@ impl Agent {
             self.has_explored = true;
         }
 
+        // Track file reads for subagent context injection
+        if success && name == "read" {
+            if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
+                let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                let start = offset.max(1) - 1;
+                self.read_file_ranges.push((path.to_string(), start, start + limit));
+            }
+        }
+
+        // Track edits for post-edit compilation and subagent enforcement
+        if success && matches!(name.as_str(), "edit" | "write") {
+            self.had_edits_this_run = true;
+        }
+
         // --- post_tool_execute hooks ---
         let (post_result, post_success) = self
             .hooks
@@ -952,6 +1065,7 @@ impl Agent {
         // Store the current task for re-injection
         self.current_task = user_input.to_string();
         self.has_explored = false;
+        self.had_edits_this_run = false;
 
         let user_msg = Message::user(user_input);
         self.messages.push(user_msg.clone());
@@ -1291,6 +1405,36 @@ impl Agent {
                         }
                     }
                     return Ok(());
+                }
+            }
+
+            // Post-edit compilation check: if any edits were made this turn,
+            // run `cargo check` (if Cargo.toml exists) and inject diagnostics.
+            if self.had_edits_this_run && std::path::Path::new("Cargo.toml").exists() {
+                self.had_edits_this_run = false;
+                if let Ok(output) = tokio::process::Command::new("cargo")
+                    .args(["check", "--message-format=short"])
+                    .output()
+                    .await
+                {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    // Only inject if there are actual errors or warnings
+                    let has_errors = stderr.contains("error[");
+                    let has_warnings = stderr.contains("warning:");
+                    if has_errors || has_warnings {
+                        let label = if has_errors { "errors" } else { "warnings" };
+                        let check_msg = format!(
+                            "[Auto cargo check detected {}]\n{}",
+                            label,
+                            stderr.lines()
+                                .filter(|l| l.contains("error") || l.contains("warning"))
+                                .take(20)
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        );
+                        let system_hint = Message::system(&check_msg);
+                        self.messages.push(system_hint);
+                    }
                 }
             }
 

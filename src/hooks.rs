@@ -224,10 +224,7 @@ fn load_hooks_file(path: &Path) -> Vec<(String, HookEntry)> {
 
 /// Default user hooks file: `~/.config/ollama-code/hooks.toml`.
 fn user_hooks_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ollama-code")
-        .join("hooks.toml")
+    crate::config::config_dir().join("hooks.toml")
 }
 
 /// Walk up from `cwd` looking for `.agents/hooks.toml`.

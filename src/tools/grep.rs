@@ -16,7 +16,24 @@ fn has_ripgrep() -> bool {
     })
 }
 
-pub struct GrepTool;
+pub struct GrepTool {
+    /// Maximum matches to return before truncating. Scaled by context_size.
+    pub max_matches: usize,
+}
+
+impl GrepTool {
+    /// Create a GrepTool with match limit scaled to context size.
+    pub fn new(context_size: u64) -> Self {
+        let max_matches = if context_size < 16_000 {
+            20
+        } else if context_size < 65_000 {
+            50
+        } else {
+            100
+        };
+        Self { max_matches }
+    }
+}
 
 impl Tool for GrepTool {
     fn name(&self) -> &str { "grep" }
@@ -99,11 +116,11 @@ impl Tool for GrepTool {
 
         let lines: Vec<&str> = result.lines().collect();
         let count = lines.len();
-        if count > 100 {
-            let truncated: String = lines[..100].join("\n");
+        if count > self.max_matches {
+            let truncated: String = lines[..self.max_matches].join("\n");
             Ok(format!(
-                "{}\n\n... ({} total matches, showing first 100. Refine your pattern.)",
-                truncated, count
+                "{}\n\n... ({} total matches, showing first {}. Refine your pattern.)",
+                truncated, count, self.max_matches
             ))
         } else {
             Ok(format!("{}\n\n({} matches)", result.trim(), count))
