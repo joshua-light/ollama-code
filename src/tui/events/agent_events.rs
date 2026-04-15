@@ -148,6 +148,10 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
             app.stats.skills_tokens = skills_tokens;
             app.stats.tool_defs_breakdown = tool_defs_breakdown;
         }
+        AgentEvent::ReloadComplete { summary, system_prompt } => {
+            app.system_prompt = system_prompt;
+            app.messages.push(ChatMessage::Info(summary));
+        }
         // MessageLogged and Debug are handled by the session logger in the event loop,
         // not by the app state.
         AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) => {}

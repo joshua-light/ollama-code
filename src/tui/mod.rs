@@ -226,6 +226,10 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                     AgentInput::RestoreMessages(msgs) => {
                         agent.restore_messages(msgs);
                     }
+                    AgentInput::Reload(config) => {
+                        let (summary, system_prompt) = agent.reload(*config);
+                        let _ = event_tx.send(AgentEvent::ReloadComplete { summary, system_prompt });
+                    }
                 }
             }
         })

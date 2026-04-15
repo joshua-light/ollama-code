@@ -409,6 +409,9 @@ impl Session {
             AgentEvent::SystemPromptInfo { base_prompt_tokens, ref project_docs, skills_tokens, ref tool_defs_breakdown } => {
                 format!("SYSTEM_PROMPT_INFO base={} docs={:?} skills={} tools={:?}", base_prompt_tokens, project_docs, skills_tokens, tool_defs_breakdown)
             }
+            AgentEvent::ReloadComplete { ref summary, .. } => {
+                format!("RELOAD_COMPLETE {}", summary)
+            }
         };
         self.log_debug(&line);
     }

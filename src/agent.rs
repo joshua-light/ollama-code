@@ -49,6 +49,11 @@ pub enum AgentEvent {
     SubagentToolCall { name: String, args: String },
     SubagentToolResult { name: String, success: bool },
     SubagentEnd { result: String },
+    /// Hot-reload completed — carries a summary and the new system prompt.
+    ReloadComplete {
+        summary: String,
+        system_prompt: String,
+    },
     /// System prompt composition info (emitted once at first run).
     SystemPromptInfo {
         base_prompt_tokens: u64,
@@ -179,6 +184,151 @@ fn discover_project_docs(cwd: &str) -> Vec<(String, String)> {
     Vec::new()
 }
 
+/// Collapse 3+ consecutive newlines to 2 (one blank line max).
+fn normalize_newlines(text: String) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut newline_count = 0u32;
+    for ch in text.chars() {
+        if ch == '\n' {
+            newline_count += 1;
+            if newline_count <= 2 {
+                result.push(ch);
+            }
+        } else {
+            newline_count = 0;
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Build the tool registry, discover plugins, and start MCP servers.
+/// When `include_extensions` is false (sub-agents), omits subagent tool, plugins, and MCP.
+fn build_tools_and_servers(
+    cfg: &Config,
+    context_size: u64,
+    cwd: &str,
+    include_extensions: bool,
+) -> (ToolRegistry, HashSet<String>, Vec<mcp::McpServer>) {
+    let mut tools = ToolRegistry::new();
+    macro_rules! register_if_enabled {
+        ($name:expr, $tool:expr) => {
+            if cfg.is_tool_enabled($name) {
+                tools.register(Box::new($tool));
+            }
+        };
+    }
+    register_if_enabled!("bash", BashTool);
+    register_if_enabled!("read", ReadTool::new());
+    register_if_enabled!("edit", EditTool);
+    register_if_enabled!("write", WriteTool);
+    register_if_enabled!("glob", GlobTool);
+    register_if_enabled!("grep", GrepTool::new(context_size));
+
+    let mut plugin_confirm_tools = HashSet::new();
+    let mut mcp_servers = Vec::new();
+
+    if include_extensions {
+        register_if_enabled!("subagent", SubagentToolDef);
+
+        let plugin_dirs: Vec<std::path::PathBuf> = cfg
+            .plugin_dirs
+            .as_ref()
+            .map(|dirs| dirs.iter().map(std::path::PathBuf::from).collect())
+            .unwrap_or_default();
+        let discovered = plugin::discover_plugins(cwd, &plugin_dirs, Some(cfg));
+        for dp in &discovered {
+            for tool_def in &dp.manifest.tools {
+                if !cfg.is_tool_enabled(&tool_def.name) {
+                    continue;
+                }
+                let plugin_cfg = cfg.plugin_config(&dp.manifest.name).cloned();
+                let ext_tool = ExternalTool::from_plugin(dp, tool_def, plugin_cfg);
+                if ext_tool.needs_confirm() {
+                    plugin_confirm_tools.insert(tool_def.name.clone());
+                }
+                tools.register(Box::new(ext_tool));
+            }
+        }
+
+        if let Some(ref servers) = cfg.mcp {
+            for server in mcp::start_servers(servers, |name| cfg.is_tool_enabled(name)) {
+                for mcp_tool in server.create_tools() {
+                    let tool_name = mcp_tool.name().to_string();
+                    if !cfg.is_tool_enabled(&tool_name) {
+                        continue;
+                    }
+                    if server.needs_confirm {
+                        plugin_confirm_tools.insert(tool_name);
+                    }
+                    tools.register(Box::new(mcp_tool));
+                }
+                mcp_servers.push(server);
+            }
+        }
+    }
+
+    (tools, plugin_confirm_tools, mcp_servers)
+}
+
+/// Build the system prompt from template, skills, and project docs.
+fn build_system_prompt(
+    cwd: &str,
+    include_extensions: bool,
+    discovered_skills: &[SkillMeta],
+) -> (String, usize, usize, Vec<(String, usize)>) {
+    let subagent_desc = if include_extensions {
+        "- subagent(task): Spawn a sub-agent with a fresh context to handle a focused task. \
+         The sub-agent cannot see this conversation, so include all necessary context in the \
+         task description. Use for: research across many files, complex multi-step operations, \
+         or any task that would benefit from a clean context window"
+    } else {
+        ""
+    };
+
+    let skill_desc = if !discovered_skills.is_empty() {
+        "- skill(name, args?): Activate a skill by name. Use when a task matches an available skill"
+    } else {
+        ""
+    };
+
+    let config_dir = crate::config::config_dir();
+
+    let mut prompt = include_str!("../SYSTEM_PROMPT.md")
+        .replace("{cwd}", cwd)
+        .replace("{config_dir}", &config_dir.to_string_lossy())
+        .replace("{subagent_tool}", subagent_desc)
+        .replace("{skill_tool}", skill_desc);
+
+    let base_len = prompt.len();
+
+    let skills_summary_len = if !discovered_skills.is_empty() {
+        let summary = skills::format_skill_summaries(discovered_skills);
+        let l = summary.len();
+        prompt.push_str(&summary);
+        l
+    } else {
+        0
+    };
+
+    let project_docs_info = {
+        let docs = discover_project_docs(cwd);
+        let mut info = Vec::new();
+        for (name, content) in &docs {
+            prompt.push_str(&format!(
+                "\n\n---\n\n# Project Instructions ({})\n\n{}",
+                name, content
+            ));
+            info.push((name.clone(), content.len()));
+        }
+        info
+    };
+
+    let prompt = normalize_newlines(prompt);
+
+    (prompt, base_len, skills_summary_len, project_docs_info)
+}
+
 pub struct Agent {
     backend: Arc<dyn ModelBackend>,
     tools: ToolRegistry,
@@ -246,154 +396,33 @@ impl Agent {
     ) -> Self {
         let default_config = Config::default();
         let cfg = config.unwrap_or(&default_config);
-
-        let mut tools = ToolRegistry::new();
         let is_subagent = max_turns.is_some();
+        let include_extensions = !is_subagent;
 
-        macro_rules! register_if_enabled {
-            ($name:expr, $tool:expr) => {
-                if cfg.is_tool_enabled($name) {
-                    tools.register(Box::new($tool));
-                }
-            };
-        }
-        register_if_enabled!("bash", BashTool);
-        register_if_enabled!("read", ReadTool::new());
-        register_if_enabled!("edit", EditTool);
-        register_if_enabled!("write", WriteTool);
-        register_if_enabled!("glob", GlobTool);
-        register_if_enabled!("grep", GrepTool::new(context_size));
-        if !is_subagent {
-            register_if_enabled!("subagent", SubagentToolDef);
-        }
-
-        let mut plugin_confirm_tools = HashSet::new();
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
-        if !is_subagent {
-            let plugin_dirs: Vec<std::path::PathBuf> = cfg.plugin_dirs.as_ref()
-                .map(|dirs| dirs.iter().map(std::path::PathBuf::from).collect())
-                .unwrap_or_default();
-            let discovered = plugin::discover_plugins(&cwd, &plugin_dirs, Some(cfg));
-            for dp in &discovered {
-                for tool_def in &dp.manifest.tools {
-                    if !cfg.is_tool_enabled(&tool_def.name) {
-                        continue;
-                    }
-                    let plugin_cfg = cfg.plugin_config(&dp.manifest.name).cloned();
-                    let ext_tool = ExternalTool::from_plugin(dp, tool_def, plugin_cfg);
-                    if ext_tool.needs_confirm() {
-                        plugin_confirm_tools.insert(tool_def.name.clone());
-                    }
-                    tools.register(Box::new(ext_tool));
-                }
-            }
-        }
+        let (mut tools, plugin_confirm_tools, mcp_servers) =
+            build_tools_and_servers(cfg, context_size, &cwd, include_extensions);
 
-        // Start MCP servers and register their tools.
-        let mut mcp_servers = Vec::new();
-        if !is_subagent {
-            if let Some(ref servers) = cfg.mcp {
-                for server in mcp::start_servers(servers, |name| cfg.is_tool_enabled(name)) {
-                    for mcp_tool in server.create_tools() {
-                        let tool_name = mcp_tool.name().to_string();
-                        if !cfg.is_tool_enabled(&tool_name) {
-                            continue;
-                        }
-                        if server.needs_confirm {
-                            plugin_confirm_tools.insert(tool_name);
-                        }
-                        tools.register(Box::new(mcp_tool));
-                    }
-                    mcp_servers.push(server);
-                }
-            }
-        }
-
-        // Discover skills (.agents/skills/*/SKILL.md) for top-level agents only.
-        // Done early so we can include the skill tool in the system prompt template.
-        let discovered_skills = if !is_subagent {
+        let discovered_skills = if include_extensions {
             skills::discover_skills(&cwd)
         } else {
             Vec::new()
         };
-
-        let subagent_desc = if is_subagent {
-            ""
-        } else {
-            "- subagent(task): Spawn a sub-agent with a fresh context to handle a focused task. \
-             The sub-agent cannot see this conversation, so include all necessary context in the \
-             task description. Use for: research across many files, complex multi-step operations, \
-             or any task that would benefit from a clean context window"
-        };
-
-        let skill_desc = if !discovered_skills.is_empty() {
-            "- skill(name, args?): Activate a skill by name. Use when a task matches an available skill"
-        } else {
-            ""
-        };
-
-        let config_dir = crate::config::config_dir();
-
-        let mut system_prompt = include_str!("../SYSTEM_PROMPT.md")
-            .replace("{cwd}", &cwd)
-            .replace("{config_dir}", &config_dir.to_string_lossy())
-            .replace("{subagent_tool}", subagent_desc)
-            .replace("{skill_tool}", skill_desc);
-
-        let system_prompt_base_len = system_prompt.len();
-
-        // Append skill summaries right after the tools section, and register the skill tool.
-        let skills_summary_len = if !discovered_skills.is_empty() {
-            let summary = skills::format_skill_summaries(&discovered_skills);
-            let l = summary.len();
-            system_prompt.push_str(&summary);
+        if !discovered_skills.is_empty() {
             tools.register(Box::new(SkillTool::new(discovered_skills.clone())));
-            l
-        } else {
-            0
-        };
+        }
 
-        // Load project docs (CLAUDE.md / AGENTS.md) so all agents follow conventions.
-        let project_docs_info = {
-            let docs = discover_project_docs(&cwd);
-            let mut info = Vec::new();
-            for (name, content) in &docs {
-                system_prompt.push_str(&format!(
-                    "\n\n---\n\n# Project Instructions ({})\n\n{}",
-                    name, content
-                ));
-                info.push((name.clone(), content.len()));
-            }
-            info
-        };
+        let (system_prompt, system_prompt_base_len, skills_summary_len, project_docs_info) =
+            build_system_prompt(&cwd, include_extensions, &discovered_skills);
 
-        // Discover hooks (top-level agents only).
-        let hooks = if !is_subagent {
+        let hooks = if include_extensions {
             HookRunner::discover(&cwd, config)
         } else {
             HookRunner::empty()
         };
-
-        // Normalize: collapse 3+ consecutive newlines to 2 (one blank line max).
-        {
-            let mut result = String::with_capacity(system_prompt.len());
-            let mut newline_count = 0u32;
-            for ch in system_prompt.chars() {
-                if ch == '\n' {
-                    newline_count += 1;
-                    if newline_count <= 2 {
-                        result.push(ch);
-                    }
-                } else {
-                    newline_count = 0;
-                    result.push(ch);
-                }
-            }
-            system_prompt = result;
-        }
 
         let messages = vec![Message::system(&system_prompt)];
 
@@ -489,6 +518,75 @@ impl Agent {
 
     pub fn set_context_size(&mut self, size: u64) {
         self.context_size = size;
+    }
+
+    /// Hot-reload config, skills, hooks, plugins, MCP servers, and system prompt.
+    /// Preserves conversation history (messages[1..]).
+    /// Returns (summary_string, new_system_prompt).
+    pub fn reload(&mut self, config: Config) -> (String, String) {
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let old_skill_names: HashSet<String> = self.skills.iter().map(|s| s.name.clone()).collect();
+        let old_mcp_count = self._mcp_servers.len();
+
+        // Drop old MCP servers before rebuilding (triggers cleanup).
+        self._mcp_servers.clear();
+        let (mut tools, plugin_confirm_tools, mcp_servers) =
+            build_tools_and_servers(&config, self.context_size, &cwd, true);
+
+        let discovered_skills = skills::discover_skills(&cwd);
+        if !discovered_skills.is_empty() {
+            tools.register(Box::new(SkillTool::new(discovered_skills.clone())));
+        }
+
+        let (system_prompt, system_prompt_base_len, skills_summary_len, project_docs_info) =
+            build_system_prompt(&cwd, true, &discovered_skills);
+
+        if !self.messages.is_empty() {
+            self.messages[0] = Message::system(&system_prompt);
+        }
+
+        self.hooks = HookRunner::discover(&cwd, Some(&config));
+        self.bash_timeout = config.bash_timeout_duration();
+        self.subagent_max_turns = config.effective_subagent_max_turns();
+        self.tool_scoping = config.tool_scoping.unwrap_or(false);
+        self.task_reinjection = config.task_reinjection.unwrap_or(false);
+        self.reinjection_interval = config.effective_reinjection_interval();
+        self.trim_threshold_pct = config.effective_trim_threshold();
+        self.trim_target_pct = config.effective_trim_target();
+        self.context_compaction = config.effective_context_compaction();
+
+        self.tools = tools;
+        self.plugin_confirm_tools = plugin_confirm_tools;
+        self._mcp_servers = mcp_servers;
+        self.system_prompt_base_len = system_prompt_base_len;
+        self.skills_summary_len = skills_summary_len;
+        self.project_docs_info = project_docs_info;
+        self.skills = discovered_skills;
+        self.config = Some(config);
+
+        let new_skill_names: HashSet<String> = self.skills.iter().map(|s| s.name.clone()).collect();
+        let added: Vec<String> = new_skill_names.difference(&old_skill_names).cloned().collect();
+        let removed: Vec<String> = old_skill_names.difference(&new_skill_names).cloned().collect();
+        let mut parts = Vec::new();
+        parts.push(format!("{} skills", self.skills.len()));
+        if !added.is_empty() {
+            parts.push(format!("+{}", added.join(", +")));
+        }
+        if !removed.is_empty() {
+            parts.push(format!("-{}", removed.join(", -")));
+        }
+        parts.push(format!("{} MCP servers", self._mcp_servers.len()));
+        if old_mcp_count != self._mcp_servers.len() {
+            parts.push(format!("(was {})", old_mcp_count));
+        }
+        parts.push("hooks reloaded".to_string());
+        parts.push("plugins reloaded".to_string());
+
+        let summary = format!("Reloaded: {}", parts.join(", "));
+        (summary, system_prompt)
     }
 
     pub fn clear_history(&mut self) {

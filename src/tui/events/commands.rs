@@ -341,6 +341,40 @@ pub(super) fn handle_command(
                 }
             }
         }
+        SlashCommand::Reload => {
+            if app.is_processing {
+                app.messages.push(ChatMessage::Info(
+                    "Cannot reload while the model is processing.".into(),
+                ));
+            } else {
+                match crate::config::Config::load() {
+                    Ok(new_config) => {
+                        // Update TUI-side state
+                        let cwd = std::env::current_dir()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| ".".to_string());
+                        app.skills = crate::skills::discover_skills(&cwd);
+
+                        // Propagate bypass/no_confirm changes
+                        let no_confirm = new_config.no_confirm.unwrap_or(false);
+                        let bypass = new_config.bypass.unwrap_or(false);
+                        app.auto_approve = no_confirm || bypass;
+
+                        // Re-discover prompt templates
+                        app.prompts = crate::prompts::discover_prompts(&cwd);
+
+                        app.config = new_config.clone();
+                        let _ = input_tx.send(AgentInput::Reload(Box::new(new_config)));
+                        app.messages.push(ChatMessage::Info("Reloading...".into()));
+                    }
+                    Err(e) => {
+                        app.messages.push(ChatMessage::Error(format!(
+                            "Failed to reload config: {}", e
+                        )));
+                    }
+                }
+            }
+        }
         SlashCommand::Unknown(name) => {
             let skill_name = name.trim_start_matches('/');
             if let Some(skill) = app.skills.iter().find(|s| s.name == skill_name) {

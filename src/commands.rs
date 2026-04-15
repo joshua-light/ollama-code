@@ -7,6 +7,7 @@ pub enum SlashCommand {
     Mcp,
     Model,
     Prompts,
+    Reload,
     Resume,
     Rewind,
     Session,
@@ -52,6 +53,10 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "/prompts",
         description: "List available prompt templates",
+    },
+    CommandInfo {
+        name: "/reload",
+        description: "Reload config, skills, hooks, and plugins",
     },
     CommandInfo {
         name: "/resume",
@@ -104,6 +109,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         "/mcp" => Some(SlashCommand::Mcp),
         "/model" => Some(SlashCommand::Model),
         "/prompts" => Some(SlashCommand::Prompts),
+        "/reload" => Some(SlashCommand::Reload),
         "/resume" => Some(SlashCommand::Resume),
         "/session" => Some(SlashCommand::Session),
         "/settings" => Some(SlashCommand::Settings),
@@ -144,6 +150,7 @@ mod tests {
             ("/mcp", "Mcp"),
             ("/model", "Model"),
             ("/prompts", "Prompts"),
+            ("/reload", "Reload"),
             ("/resume", "Resume"),
             ("/rewind", "Rewind"),
             ("/session", "Session"),

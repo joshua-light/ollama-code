@@ -47,6 +47,7 @@ pub(crate) enum AgentInput {
     SetContextSize(u64),
     SetBackend(Arc<dyn ModelBackend>),
     RestoreMessages(Vec<Message>),
+    Reload(Box<Config>),
 }
 
 #[derive(Clone)]
