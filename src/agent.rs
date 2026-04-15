@@ -27,6 +27,8 @@ pub enum AgentEvent {
     /// The agent blocks waiting on the confirm channel.
     ToolConfirmRequest { name: String, args: String },
     ToolResult { name: String, output: String, success: bool },
+    /// Partial output from a running tool (e.g. bash streaming stdout).
+    ToolOutput { output: String },
     ContextUpdate { prompt_tokens: u64 },
     /// Context was auto-trimmed to stay within the window.
     ContextTrimmed { removed_messages: usize, estimated_tokens_freed: u64 },
@@ -1164,11 +1166,32 @@ impl Agent {
         }
 
         let (mut result, mut success) = if name == "bash" {
+            // Set up a channel for streaming partial output from the bash
+            // process so the TUI can show live progress.
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let events_clone = events.clone();
+            let forward_task = tokio::spawn(async move {
+                while let Some(line) = output_rx.recv().await {
+                    let _ = send_event(&events_clone, AgentEvent::ToolOutput { output: line });
+                }
+            });
+
             // Race tool execution against the cancel flag so ESC kills
             // long-running bash commands immediately.
-            tokio::select! {
-                output = BashTool.execute_async(args, self.bash_timeout) => output,
-                _ = poll_cancel(cancel) => {
+            let output = tokio::select! {
+                output = BashTool.execute_async(args, self.bash_timeout, Some(&output_tx)) => {
+                    Some(output)
+                },
+                _ = poll_cancel(cancel) => None,
+            };
+
+            // Clean up forwarding on both paths.
+            drop(output_tx);
+            let _ = forward_task.await;
+
+            match output {
+                Some(o) => o,
+                None => {
                     // NOTE: callers rely on no tool result message being pushed
                     // when we return Ok(false), so they can backfill "Cancelled"
                     // results starting from this tool call's index.

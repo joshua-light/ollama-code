@@ -3,8 +3,9 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
-use super::{format_bash_output, optional_str, Tool, ToolDefinition};
+use super::{optional_str, Tool, ToolDefinition};
 
 pub struct BashTool;
 
@@ -94,13 +95,43 @@ fn resolve_bash_path() -> &'static OsStr {
         .as_os_str()
 }
 
+/// Read all lines from an async reader, accumulating into a String.
+/// If `tx` is provided, each line is also forwarded for live display.
+async fn drain_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: Option<R>,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> String {
+    let mut output = String::new();
+    let Some(r) = reader else { return output };
+    let mut reader = BufReader::new(r);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {
+                if let Some(ref tx) = tx {
+                    let _ = tx.send(buf.clone());
+                }
+                output.push_str(&buf);
+            }
+            Err(_) => break,
+        }
+    }
+    output
+}
+
 impl BashTool {
     /// Async execution with timeout and kill-on-drop. This is the primary
     /// execution path — the sync `Tool::execute()` should never be called.
+    ///
+    /// If `output_tx` is provided, partial output lines are sent as they arrive
+    /// so the TUI can show live progress while the command runs.
     pub async fn execute_async(
         &self,
         arguments: &Value,
         timeout: std::time::Duration,
+        output_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> (String, bool) {
         let command = optional_str(arguments, "command").unwrap_or("");
         let bash = resolve_bash_path();
@@ -112,10 +143,49 @@ impl BashTool {
             .kill_on_drop(true)
             .spawn()
         {
-            Ok(child) => {
-                match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                    Ok(Ok(output)) => format_bash_output(&output),
-                    Ok(Err(e)) => (format!("Error: {}", e), false),
+            Ok(mut child) => {
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+
+                let read_lines = async {
+                    let tx = output_tx.cloned();
+                    let stdout_task = drain_lines(stdout, tx);
+                    let stderr_task = drain_lines(stderr, None);
+
+                    let (stdout_output, stderr_output) = tokio::join!(stdout_task, stderr_task);
+                    let status = child.wait().await;
+
+                    match status {
+                        Ok(exit) => {
+                            let mut result = String::new();
+                            if !stdout_output.is_empty() {
+                                result.push_str(&stdout_output);
+                            }
+                            if !stderr_output.is_empty() {
+                                if !result.is_empty() {
+                                    result.push('\n');
+                                }
+                                result.push_str(&stderr_output);
+                            }
+                            if result.is_empty() {
+                                result.push_str("(no output)");
+                            }
+                            let success = exit.success();
+                            if !success {
+                                let code = exit.code().unwrap_or(-1);
+                                result.push_str(&format!(
+                                    "\n(exit code: {})",
+                                    code
+                                ));
+                            }
+                            (result, success)
+                        }
+                        Err(e) => (format!("Error: {}", e), false),
+                    }
+                };
+
+                match tokio::time::timeout(timeout, read_lines).await {
+                    Ok(output) => output,
                     Err(_) => (
                         format!("Error: command timed out after {}s", timeout.as_secs()),
                         false,

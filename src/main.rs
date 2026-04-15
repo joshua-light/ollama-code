@@ -530,7 +530,7 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
             AgentEvent::Debug(ref msg) if verbose => {
                 eprintln!("[debug] {}", msg);
             }
-            AgentEvent::ReloadComplete { .. } | AgentEvent::ContextUpdate { .. } | AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) | AgentEvent::SystemPromptInfo { .. } => {}
+            AgentEvent::ReloadComplete { .. } | AgentEvent::ContextUpdate { .. } | AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) | AgentEvent::SystemPromptInfo { .. } | AgentEvent::ToolOutput { .. } => {}
         }
     }
 

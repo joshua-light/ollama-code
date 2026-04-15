@@ -35,6 +35,16 @@ cargo build --release
 # Binary is at target/release/ollama-code
 ```
 
+## Testing
+
+```bash
+cargo test               # run all tests (unit + integration)
+cargo test --lib         # unit tests only
+cargo test --test <name> # run a specific integration test
+```
+
+Integration tests use a mock backend and don't require Ollama to be running.
+
 ## Quick start
 
 ```bash

@@ -412,6 +412,7 @@ impl Session {
             AgentEvent::ReloadComplete { ref summary, .. } => {
                 format!("RELOAD_COMPLETE {}", summary)
             }
+            AgentEvent::ToolOutput { .. } => return, // high-frequency, not logged
         };
         self.log_debug(&line);
     }

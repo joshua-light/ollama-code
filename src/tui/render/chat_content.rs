@@ -33,8 +33,8 @@ pub(super) fn build_chat_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             ChatMessage::Assistant(text) => {
                 render_chat_assistant(&mut lines, text, width);
             }
-            ChatMessage::ToolCall { name, args, result } => {
-                render_chat_tool_call(&mut lines, name, args, result.as_ref(), app.tools_expanded, app.generation.start);
+            ChatMessage::ToolCall { name, args, result, live_output } => {
+                render_chat_tool_call(&mut lines, name, args, result.as_ref(), live_output.as_deref(), app.tools_expanded, app.generation.start);
             }
             ChatMessage::Error(e) => {
                 render_chat_error(&mut lines, e);
@@ -142,6 +142,7 @@ fn render_chat_tool_call(
     name: &str,
     args: &str,
     result: Option<&ToolResultData>,
+    live_output: Option<&str>,
     expanded: bool,
     generation_start: Option<std::time::Instant>,
 ) {
@@ -177,6 +178,14 @@ fn render_chat_tool_call(
             _ => {
                 render_default_result(lines, result_data, expanded);
             }
+        }
+    } else if let Some(output) = live_output {
+        // Show last few lines of output from a still-running command.
+        for line in output.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", format::PREFIX_REST, line),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     }
 }

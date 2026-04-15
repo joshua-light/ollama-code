@@ -15,7 +15,7 @@ cargo run                # run TUI mode (requires ollama running)
 cargo run -- -p "prompt" # pipe mode
 cargo run -- -m model    # override model
 cargo clippy             # lint
-cargo test               # no tests yet
+cargo test               # run all tests (unit + integration)
 
 # llama-cpp backend (uses llama-server instead of ollama)
 cargo run -- --backend llama-cpp --llama-server-path /path/to/llama-server --model-path /path/to/model.gguf

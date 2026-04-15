@@ -24,7 +24,7 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
             app.generation.has_received_tokens = false;
             app.generation.verb = pick_verb();
             app.messages
-                .push(ChatMessage::ToolCall { name, args, result: None });
+                .push(ChatMessage::ToolCall { name, args, result: None, live_output: None });
         }
         AgentEvent::ToolResult {
             name, output, success,
@@ -35,9 +35,10 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
             // Merge result into the last pending ToolCall
             let mut found = false;
             for msg in app.messages.iter_mut().rev() {
-                if let ChatMessage::ToolCall { result, .. } = msg {
+                if let ChatMessage::ToolCall { result, live_output, .. } = msg {
                     if result.is_none() {
                         *result = Some(ToolResultData { output, success });
+                        *live_output = None;
                         found = true;
                         break;
                     }
@@ -151,6 +152,26 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
         AgentEvent::ReloadComplete { summary, system_prompt } => {
             app.system_prompt = system_prompt;
             app.messages.push(ChatMessage::Info(summary));
+        }
+        AgentEvent::ToolOutput { output } => {
+            // Append to the live_output of the last pending ToolCall.
+            // Keep only the last 3 lines to avoid unbounded growth.
+            const MAX_LINES: usize = 3;
+            for msg in app.messages.iter_mut().rev() {
+                if let ChatMessage::ToolCall { result: None, live_output, .. } = msg {
+                    let buf = live_output.get_or_insert_with(String::new);
+                    buf.push_str(&output);
+                    let line_count = buf.chars().filter(|&c| c == '\n').count();
+                    if line_count > MAX_LINES {
+                        // Find the byte offset of the (line_count - MAX_LINES)th newline.
+                        let skip = line_count - MAX_LINES;
+                        if let Some(pos) = buf.match_indices('\n').nth(skip - 1) {
+                            buf.drain(..pos.0 + 1);
+                        }
+                    }
+                    break;
+                }
+            }
         }
         // MessageLogged and Debug are handled by the session logger in the event loop,
         // not by the app state.

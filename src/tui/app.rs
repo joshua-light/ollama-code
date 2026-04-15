@@ -90,6 +90,8 @@ pub(crate) enum ChatMessage {
         name: String,
         args: String,
         result: Option<ToolResultData>,
+        /// Last few lines of output from a still-running command.
+        live_output: Option<String>,
     },
     Error(String),
     Info(String),
@@ -532,6 +534,7 @@ pub(crate) fn messages_to_chat_messages(messages: &[Message]) -> Vec<ChatMessage
                             name: tc.function.name.clone(),
                             args: args_display,
                             result: None,
+                            live_output: None,
                         });
                     }
                 }
