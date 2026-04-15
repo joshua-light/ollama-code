@@ -36,8 +36,14 @@ The agent loop lives in `src/agent.rs`. `Agent::run()` sends messages to the mod
 
 **Tool system** (`src/tools.rs`): `Tool` trait with `definition()` and `execute()`. `ToolRegistry` holds registered tools and converts definitions to the JSON tool format.
 
-**TUI** (`src/tui/`): Ratatui alternate-screen app with three panels (header, chat, input). Uses `tokio::select!` over terminal events, agent events, and an 80ms tick for the spinner. Includes a basic markdown renderer for assistant messages (code blocks, headings, lists, inline bold/code). The `/model` command supports runtime switching between Ollama models and HuggingFace models (via llama-server). The TUI owns the llama-server lifecycle when using HF models.
+**TUI** (`src/tui/`): Ratatui alternate-screen app with three panels (header, chat, input). Uses `tokio::select!` over terminal events, agent events, and an 80ms tick for the spinner. Includes a basic markdown renderer for assistant messages (code blocks, headings, lists, inline bold/code). The `/model` command supports runtime switching between Ollama models and HuggingFace models (via llama-server). The TUI owns the llama-server lifecycle when using HF models. Includes a `/settings` panel for interactive config editing and a `/tree` browser for navigating conversation branches.
+
+**Session** (`src/session.rs`): Manages conversation persistence with a tree-structured message store. Sessions support branching — rewinding and continuing from an earlier point creates a new branch. The `/tree` command lets users browse and switch between branches.
+
+**Context compaction** (`src/agent.rs`): When the context window fills up, the agent can compact old messages by asking the LLM to summarize them, replacing the originals with a condensed summary message. This is more intelligent than simple trimming and preserves important context.
+
+**Prompt templates** (`src/prompts.rs`, `prompts/`): User-defined prompt templates stored as markdown files with YAML frontmatter. Templates support `{{placeholder}}` and `{{name:default}}` syntax. Loaded from `prompts/` in the config directory and invokable as slash commands.
 
 **Message types** (`src/message.rs`): Serializable message structs matching Ollama's chat API format (system/user/assistant/tool roles).
 
-**Config** (`src/config.rs`): Loads from `~/.config/ollama-code/config.toml`. Stores model, context_size, and optional llama-cpp backend settings (backend, llama_server_path, model_path, llama_server_args).
+**Config** (`src/config.rs`): Loads from `~/.config/ollama-code/config.toml`. Stores model, context_size, and optional llama-cpp backend settings (backend, llama_server_path, model_path, llama_server_args). Editable at runtime via the `/settings` TUI panel.

@@ -42,6 +42,34 @@ pub fn truncate_args(s: &str, max: usize) -> String {
     }
 }
 
+/// Split `---` delimited frontmatter from body content.
+/// Returns `(frontmatter_text, body_text)` with leading newlines stripped from the body.
+pub fn split_frontmatter(content: &str) -> anyhow::Result<(&str, &str)> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        anyhow::bail!("missing frontmatter");
+    }
+    let after_opening = &trimmed[3..];
+    let end = after_opening
+        .find("\n---")
+        .ok_or_else(|| anyhow::anyhow!("malformed frontmatter"))?;
+    let frontmatter = &after_opening[..end];
+    let body = after_opening[end + 4..].trim_start_matches('\n');
+    Ok((frontmatter, body))
+}
+
+/// Parse a `key: value` line from frontmatter, stripping surrounding quotes.
+/// Returns `Some(value)` if the line starts with `prefix`, else `None`.
+pub fn parse_frontmatter_value(line: &str, prefix: &str) -> Option<String> {
+    line.strip_prefix(prefix).map(|value| {
+        value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string()
+    })
+}
+
 const MAX_OUTPUT_LINES: usize = 30;
 pub const PREFIX_FIRST: &str = "   ⎿  ";
 pub const PREFIX_REST: &str = "      ";

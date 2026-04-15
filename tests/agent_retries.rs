@@ -147,6 +147,11 @@ async fn context_trimmed_when_threshold_exceeded() {
     // Turn 2: read (low tokens) — more messages
     // Turn 3: glob again — now prompt_eval_count is high, should trigger trim
     // Turn 4: final response
+    // Disable compaction so we test pure blind trimming.
+    let config = Config {
+        context_compaction: Some(false),
+        ..Default::default()
+    };
     let backend = Arc::new(MockBackend::new(vec![
         MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.rs"}))
             .with_prompt_eval_count(2000),
@@ -156,7 +161,7 @@ async fn context_trimmed_when_threshold_exceeded() {
             .with_prompt_eval_count(7000), // above 80% of 8192 → trim
         MockResponse::text("Done.").with_prompt_eval_count(4000),
     ]));
-    let result = run_agent(backend.clone(), "search everything", ConfirmStrategy::ApproveAll).await;
+    let result = run_agent_with_config(backend.clone(), "search everything", ConfirmStrategy::ApproveAll, &config).await;
 
     assert!(result.is_done());
     let trimmed = result.events.iter().any(|e| {
@@ -197,6 +202,7 @@ async fn custom_trim_thresholds() {
     let config = Config {
         trim_threshold: Some(50),
         trim_target: Some(30),
+        context_compaction: Some(false),
         ..Default::default()
     };
 
@@ -222,6 +228,120 @@ async fn custom_trim_thresholds() {
         )
     });
     assert!(trimmed, "expected trimming with low threshold");
+}
+
+// ── Context compaction ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn context_compacted_when_enabled() {
+    // With compaction enabled, exceeding the threshold triggers an LLM
+    // summary call instead of blind trimming.
+    // Response sequence:
+    //   1-3: tool calls building up context
+    //   4:   compaction summary (consumed by compact_context, tools=None)
+    //   5:   final response (main loop resumes)
+    let config = Config {
+        context_compaction: Some(true),
+        ..Default::default()
+    };
+    let backend = Arc::new(MockBackend::new(vec![
+        MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.rs"}))
+            .with_prompt_eval_count(2000),
+        MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.toml"}))
+            .with_prompt_eval_count(4000),
+        MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.md"}))
+            .with_prompt_eval_count(7000), // above 80% of 8192 → compact
+        // Compaction LLM call response:
+        MockResponse::text("User searched for Rust, TOML, and Markdown files using glob. All searches completed successfully."),
+        // Main loop continues:
+        MockResponse::text("Done.").with_prompt_eval_count(4000),
+    ]));
+    let result =
+        run_agent_with_config(backend.clone(), "search everything", ConfirmStrategy::ApproveAll, &config)
+            .await;
+
+    assert!(result.is_done());
+
+    // Should have ContextCompacted, not ContextTrimmed
+    let compacted = result.events.iter().any(|e| {
+        matches!(e, ollama_code::agent::AgentEvent::ContextCompacted { .. })
+    });
+    assert!(compacted, "expected ContextCompacted event");
+
+    let trimmed = result.events.iter().any(|e| {
+        matches!(e, ollama_code::agent::AgentEvent::ContextTrimmed { .. })
+    });
+    assert!(!trimmed, "should not have ContextTrimmed when compaction succeeds");
+
+    // Verify the compaction call was made without tools
+    let calls = backend.calls();
+    let compaction_call = calls.iter().find(|c| c.tools.is_none());
+    assert!(compaction_call.is_some(), "expected a tools=None call for compaction");
+}
+
+#[tokio::test]
+async fn context_compaction_fallback_on_empty_summary() {
+    // When compaction returns an empty summary, fall back to blind trimming.
+    let config = Config {
+        context_compaction: Some(true),
+        ..Default::default()
+    };
+    let backend = Arc::new(MockBackend::new(vec![
+        MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.rs"}))
+            .with_prompt_eval_count(2000),
+        MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.toml"}))
+            .with_prompt_eval_count(4000),
+        MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.md"}))
+            .with_prompt_eval_count(7000), // triggers compaction
+        // Compaction returns empty → fallback to blind trim
+        MockResponse::text(""),
+        MockResponse::text("Done.").with_prompt_eval_count(4000),
+    ]));
+    let result =
+        run_agent_with_config(backend.clone(), "search everything", ConfirmStrategy::ApproveAll, &config)
+            .await;
+
+    assert!(result.is_done());
+
+    // Should fall back to ContextTrimmed
+    let trimmed = result.events.iter().any(|e| {
+        matches!(e, ollama_code::agent::AgentEvent::ContextTrimmed { .. })
+    });
+    assert!(trimmed, "expected ContextTrimmed fallback when compaction returns empty");
+}
+
+#[tokio::test]
+async fn context_compaction_disabled_uses_blind_trim() {
+    // With compaction explicitly disabled, only blind trimming happens.
+    let config = Config {
+        context_compaction: Some(false),
+        ..Default::default()
+    };
+    let backend = Arc::new(MockBackend::new(vec![
+        MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.rs"}))
+            .with_prompt_eval_count(2000),
+        MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.toml"}))
+            .with_prompt_eval_count(4000),
+        MockResponse::tool_call("glob", serde_json::json!({"pattern": "*.md"}))
+            .with_prompt_eval_count(7000),
+        // No compaction response needed — goes straight to blind trim
+        MockResponse::text("Done.").with_prompt_eval_count(4000),
+    ]));
+    let result =
+        run_agent_with_config(backend.clone(), "search everything", ConfirmStrategy::ApproveAll, &config)
+            .await;
+
+    assert!(result.is_done());
+
+    let trimmed = result.events.iter().any(|e| {
+        matches!(e, ollama_code::agent::AgentEvent::ContextTrimmed { .. })
+    });
+    assert!(trimmed, "expected ContextTrimmed with compaction disabled");
+
+    let compacted = result.events.iter().any(|e| {
+        matches!(e, ollama_code::agent::AgentEvent::ContextCompacted { .. })
+    });
+    assert!(!compacted, "should not have ContextCompacted when disabled");
 }
 
 // ── Context nearly full with pending tool calls ─────────────────────

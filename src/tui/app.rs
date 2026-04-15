@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,9 +10,12 @@ use crate::format;
 use crate::llama_server::ModelSource;
 use crate::message::{Message, Role};
 use crate::ollama::OllamaBackend;
+use crate::prompts::PromptTemplate;
 use crate::skills::SkillMeta;
 
 use super::picker::Picker;
+use super::settings::SettingsPanel;
+use super::tree_browser::TreeBrowser;
 
 /// Active text selection in the chat area, tracked in content-space coordinates
 /// so the selection stays anchored to the content as the user scrolls.
@@ -147,6 +150,18 @@ impl GenerationState {
     }
 }
 
+/// State for interactive prompt template variable filling.
+pub(crate) struct PromptFill {
+    /// The template being filled.
+    pub(crate) template: PromptTemplate,
+    /// Variables to fill (in order).
+    pub(crate) variables: Vec<crate::prompts::TemplateVar>,
+    /// Index of the variable currently being filled.
+    pub(crate) current: usize,
+    /// Collected values so far (variable name -> value).
+    pub(crate) values: std::collections::HashMap<String, String>,
+}
+
 pub(crate) struct SessionStats {
     pub(crate) session_start: Instant,
     pub(crate) tool_call_count: usize,
@@ -189,6 +204,10 @@ pub(crate) struct App {
     // Model/session picker
     pub(crate) ollama: OllamaBackend,
     pub(crate) picker: Option<Picker>,
+    /// Settings editor overlay for /settings command.
+    pub(crate) settings: Option<SettingsPanel>,
+    /// Tree browser overlay for /tree command.
+    pub(crate) tree_browser: Option<TreeBrowser>,
     pub(crate) config: Config,
     /// Pending tool confirmation awaiting user response
     pub(crate) pending_confirm: Option<PendingConfirm>,
@@ -198,6 +217,10 @@ pub(crate) struct App {
     pub(crate) needs_clear: bool,
     /// Discovered skills available as slash commands.
     pub(crate) skills: Vec<SkillMeta>,
+    /// Discovered prompt templates available as slash commands.
+    pub(crate) prompts: Vec<PromptTemplate>,
+    /// Active prompt template fill state (None when not filling).
+    pub(crate) pending_prompt: Option<PromptFill>,
     pub(crate) generation: GenerationState,
     pub(crate) stats: SessionStats,
     pub(crate) server: ServerState,
@@ -209,8 +232,11 @@ pub(crate) struct App {
     pub(crate) history_index: Option<usize>,
     /// Saved draft input when browsing history.
     pub(crate) history_draft: String,
-    /// Message queued while the model is processing, sent when the turn finishes.
-    pub(crate) queued_message: Option<String>,
+    /// Follow-up messages queued while the model is processing (Alt+Enter).
+    /// Sent as new turns after the agent fully completes.
+    pub(crate) followup_queue: VecDeque<String>,
+    /// Channel for sending steering messages to the agent mid-run (Enter while processing).
+    pub(crate) steer_tx: mpsc::UnboundedSender<String>,
     /// Full system prompt sent to the model (for /system-prompt command).
     pub(crate) system_prompt: String,
     // ── Text selection (mouse capture) ──
@@ -230,7 +256,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(model: String, context_size: u64, ollama: OllamaBackend, config: Config, skills: Vec<SkillMeta>, system_prompt: String) -> Self {
+    pub(crate) fn new(model: String, context_size: u64, ollama: OllamaBackend, config: Config, skills: Vec<SkillMeta>, system_prompt: String, steer_tx: mpsc::UnboundedSender<String>) -> Self {
         let (git_branch, git_dirty) = super::render::get_git_info_sync();
         let dir_name = std::env::current_dir()
             .ok()
@@ -254,11 +280,15 @@ impl App {
             git_dirty,
             ollama,
             picker: None,
+            settings: None,
+            tree_browser: None,
             config,
             pending_confirm: None,
             auto_approve: false,
             needs_clear: false,
             skills,
+            prompts: Vec::new(),
+            pending_prompt: None,
             generation: GenerationState {
                 start: None,
                 tokens: 0,
@@ -289,7 +319,8 @@ impl App {
             input_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
-            queued_message: None,
+            followup_queue: VecDeque::new(),
+            steer_tx,
             system_prompt,
             selection: None,
             chat_area: ratatui::layout::Rect::default(),
@@ -310,28 +341,19 @@ impl App {
         self.generation.start = None;
     }
 
+    /// Submit a message. When idle, starts a new agent turn and returns the
+    /// message. When the agent is processing, sends it as a steering message
+    /// that gets injected into the current run.
     pub(crate) fn submit(&mut self) -> Option<String> {
         if self.input.trim().is_empty() {
             return None;
         }
-        // Only allow one queued message at a time
-        if self.is_processing && self.queued_message.is_some() {
-            return None;
-        }
-        let msg = self.input.clone();
-        // Save to history (dedup consecutive identical entries)
-        if self.input_history.last() != Some(&msg) {
-            self.input_history.push(msg.clone());
-        }
-        self.history_index = None;
-        self.history_draft.clear();
-        self.input.clear();
-        self.cursor_pos = 0;
+        let msg = self.take_input();
         self.messages.push(ChatMessage::User(msg.clone()));
 
         if self.is_processing {
-            // Queue for delivery when the current turn finishes
-            self.queued_message = Some(msg);
+            // Steering: inject into the current agent run
+            let _ = self.steer_tx.send(msg);
             return None;
         }
 
@@ -339,16 +361,41 @@ impl App {
         Some(msg)
     }
 
-    /// If processing just finished and there is a queued message, start a new
+    /// Queue a follow-up message to be sent after the agent fully completes.
+    /// Used with Alt+Enter while the agent is processing.
+    pub(crate) fn submit_followup(&mut self) {
+        if self.input.trim().is_empty() {
+            return;
+        }
+        if !self.is_processing {
+            return;
+        }
+        let msg = self.take_input();
+        self.messages.push(ChatMessage::User(msg.clone()));
+        self.followup_queue.push_back(msg);
+    }
+
+    /// If processing just finished and there is a follow-up queued, start a new
     /// turn immediately and return the message to send to the agent.
     pub(crate) fn drain_queued(&mut self) -> Option<String> {
         if !self.is_processing {
-            if let Some(msg) = self.queued_message.take() {
+            if let Some(msg) = self.followup_queue.pop_front() {
                 self.begin_processing(super::render::pick_verb());
                 return Some(msg);
             }
         }
         None
+    }
+
+    fn take_input(&mut self) -> String {
+        let msg = std::mem::take(&mut self.input);
+        if self.input_history.last() != Some(&msg) {
+            self.input_history.push(msg.clone());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+        self.cursor_pos = 0;
+        msg
     }
 
     pub(crate) fn flush_streaming(&mut self) {
@@ -402,6 +449,16 @@ impl App {
 
     pub(crate) fn dismiss_picker(&mut self) {
         self.picker = None;
+        self.needs_clear = true;
+    }
+
+    pub(crate) fn dismiss_settings(&mut self) {
+        self.settings = None;
+        self.needs_clear = true;
+    }
+
+    pub(crate) fn dismiss_tree_browser(&mut self) {
+        self.tree_browser = None;
         self.needs_clear = true;
     }
 

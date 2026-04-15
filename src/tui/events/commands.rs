@@ -4,9 +4,11 @@ use tokio::sync::mpsc;
 use crate::commands::SlashCommand;
 use crate::llama_server::ModelSource;
 
-use super::super::app::{AgentInput, App, ChatMessage, ContextInfoData, PendingServerStart, StatsInfoData};
+use super::super::app::{AgentInput, App, ChatMessage, ContextInfoData, PendingServerStart, PromptFill, StatsInfoData};
 use super::super::picker::{Picker, PickerItem, PickerKind};
 use super::super::render::{format_number, pick_verb};
+use super::super::settings::SettingsPanel;
+use super::super::tree_browser::TreeBrowser;
 
 pub(super) fn handle_command(
     cmd: SlashCommand,
@@ -14,7 +16,7 @@ pub(super) fn handle_command(
     app: &mut App,
     input_tx: &mpsc::UnboundedSender<AgentInput>,
     model_tx: &mpsc::UnboundedSender<Result<Vec<String>>>,
-    session: &crate::session::Session,
+    session: &mut crate::session::Session,
 ) {
     let was_at_bottom = app.is_at_bottom();
 
@@ -49,12 +51,16 @@ pub(super) fn handle_command(
             let rewound = app.rewind_turns(n, input_tx);
             if rewound == 0 {
                 app.messages.push(ChatMessage::Info("Nothing to rewind.".into()));
-            } else if rewound == 1 {
-                app.messages.push(ChatMessage::Info("Rewound last turn.".into()));
             } else {
-                app.messages.push(ChatMessage::Info(
-                    format!("Rewound last {} turns.", rewound),
-                ));
+                // Sync tree leaf to match the rewound position
+                session.rewind_leaf(rewound);
+                if rewound == 1 {
+                    app.messages.push(ChatMessage::Info("Rewound last turn.".into()));
+                } else {
+                    app.messages.push(ChatMessage::Info(
+                        format!("Rewound last {} turns.", rewound),
+                    ));
+                }
             }
         }
         SlashCommand::Context => {
@@ -172,6 +178,12 @@ pub(super) fn handle_command(
                     info.push_str(&format!("  {:12} {}\n", format!("/{}", skill.name), skill.description));
                 }
             }
+            if !app.prompts.is_empty() {
+                info.push_str("\nPrompt templates:\n");
+                for prompt in &app.prompts {
+                    info.push_str(&format!("  {:12} {}\n", format!("/{}", prompt.name), prompt.description));
+                }
+            }
             app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
         }
         SlashCommand::Mcp => {
@@ -251,6 +263,9 @@ pub(super) fn handle_command(
                 session.path().display()
             )));
         }
+        SlashCommand::Settings => {
+            app.settings = Some(SettingsPanel::new(&app.config));
+        }
         SlashCommand::Skills => {
             if app.skills.is_empty() {
                 app.messages.push(ChatMessage::Info(
@@ -260,6 +275,26 @@ pub(super) fn handle_command(
                 let mut info = String::from("Skills:\n");
                 for skill in &app.skills {
                     info.push_str(&format!("  /{}: {}\n    {}\n", skill.name, skill.description, skill.dir.display()));
+                }
+                app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
+            }
+        }
+        SlashCommand::Prompts => {
+            if app.prompts.is_empty() {
+                app.messages.push(ChatMessage::Info(
+                    "No prompt templates found. Add .md files to .agents/prompts/ or ~/.config/ollama-code/prompts/.".into(),
+                ));
+            } else {
+                let mut info = String::from("Prompt templates:\n");
+                for prompt in &app.prompts {
+                    let vars = prompt.variables();
+                    let var_names: Vec<&str> = vars.iter().map(|v| v.name.as_str()).collect();
+                    if var_names.is_empty() {
+                        info.push_str(&format!("  /{}: {}\n", prompt.name, prompt.description));
+                    } else {
+                        info.push_str(&format!("  /{}: {} ({})\n", prompt.name, prompt.description, var_names.join(", ")));
+                    }
+                    info.push_str(&format!("    {}\n", prompt.path.display()));
                 }
                 app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
             }
@@ -288,6 +323,23 @@ pub(super) fn handle_command(
                 context_trims: app.stats.context_trims,
                 model: app.model.clone(),
             }));
+        }
+        SlashCommand::Tree => {
+            if app.is_processing {
+                app.messages.push(ChatMessage::Info("Cannot browse tree while processing.".into()));
+            } else {
+                let tree = session.get_tree();
+                if tree.is_empty() {
+                    app.messages.push(ChatMessage::Info("No conversation history.".into()));
+                } else if tree.iter().all(|n| count_branches(n) == 0) {
+                    app.messages.push(ChatMessage::Info(
+                        "No branches yet. Use /rewind and send a new message to create a branch.".into(),
+                    ));
+                } else {
+                    let active_path = session.active_path_ids();
+                    app.tree_browser = Some(TreeBrowser::new(tree, session.leaf_id(), active_path));
+                }
+            }
         }
         SlashCommand::Unknown(name) => {
             let skill_name = name.trim_start_matches('/');
@@ -323,6 +375,30 @@ pub(super) fn handle_command(
                         )));
                     }
                 }
+            } else if let Some(template) = app.prompts.iter().find(|p| p.name == skill_name).cloned() {
+                let variables = template.variables();
+                if variables.is_empty() {
+                    // No variables — send immediately
+                    app.messages.push(ChatMessage::SkillLoad {
+                        name: format!("prompt:{}", template.name),
+                    });
+                    app.begin_processing(pick_verb());
+                    let _ = input_tx.send(AgentInput::Message(template.body.clone()));
+                } else {
+                    // Enter variable fill mode
+                    app.messages.push(ChatMessage::Info(format!(
+                        "Filling prompt template '{}' ({} variable{})...",
+                        template.name,
+                        variables.len(),
+                        if variables.len() == 1 { "" } else { "s" },
+                    )));
+                    app.pending_prompt = Some(PromptFill {
+                        template,
+                        variables,
+                        current: 0,
+                        values: std::collections::HashMap::new(),
+                    });
+                }
             } else {
                 app.messages
                     .push(ChatMessage::Info(format!("Unknown command: {}", name)));
@@ -336,4 +412,10 @@ pub(super) fn handle_command(
     if was_at_bottom {
         app.scroll_offset = 0;
     }
+}
+
+/// Count branch points (nodes with >1 child) in a tree.
+fn count_branches(node: &crate::session::TreeNode) -> usize {
+    let here = if node.children.len() > 1 { 1 } else { 0 };
+    here + node.children.iter().map(count_branches).sum::<usize>()
 }

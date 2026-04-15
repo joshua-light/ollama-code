@@ -14,6 +14,8 @@ use crate::session::Session;
 use super::app::{AgentInput, App, ChatMessage, PendingServerStart, messages_to_chat_messages};
 use super::picker::{PickerKind, PickerResult};
 use super::render::format_number;
+use super::settings::SettingsResult;
+use super::tree_browser::TreeBrowserResult;
 
 pub(super) use agent_events::handle_agent_event;
 
@@ -23,7 +25,7 @@ pub(super) fn handle_terminal_event(
     input_tx: &mpsc::UnboundedSender<AgentInput>,
     confirm_tx: &mpsc::UnboundedSender<bool>,
     model_tx: &mpsc::UnboundedSender<Result<Vec<String>>>,
-    session: &Session,
+    session: &mut Session,
 ) {
     if let Event::Paste(text) = evt {
         if app.pending_confirm.is_none() && app.picker.is_none() {
@@ -113,6 +115,14 @@ pub(super) fn handle_terminal_event(
                 let _ = confirm_tx.send(false);
                 return;
             }
+            if app.settings.is_some() {
+                app.dismiss_settings();
+                return;
+            }
+            if app.tree_browser.is_some() {
+                app.dismiss_tree_browser();
+                return;
+            }
             if app.picker.is_some() {
                 app.dismiss_picker();
                 return;
@@ -135,6 +145,18 @@ pub(super) fn handle_terminal_event(
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             app.tools_expanded = !app.tools_expanded;
             app.needs_clear = true;
+            return;
+        }
+
+        // Settings panel — delegate all keys
+        if app.settings.is_some() {
+            handle_settings_key(key, app);
+            return;
+        }
+
+        // Tree browser mode — delegate all keys to the tree browser
+        if app.tree_browser.is_some() {
+            handle_tree_browser_key(key, app, input_tx, session);
             return;
         }
 
@@ -161,18 +183,21 @@ pub(super) fn handle_terminal_event(
             }
         }
 
-        // Esc: cancel generation when processing, quit when idle
+        // Esc: cancel prompt fill, cancel generation, or quit
         if key.code == KeyCode::Esc {
-            if app.is_processing {
+            if app.pending_prompt.is_some() {
+                // Let handle_normal_input deal with it (prompt fill cancel)
+            } else if app.is_processing {
                 if app.server.loading.is_some() {
                     app.should_quit = true;
                 } else {
                     app.server.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                return;
             } else {
                 app.should_quit = true;
+                return;
             }
-            return;
         }
 
         handle_normal_input(key, app, input_tx, model_tx, session);
@@ -197,11 +222,58 @@ fn handle_confirm_keys(
     }
 }
 
+fn handle_settings_key(key: crossterm::event::KeyEvent, app: &mut App) {
+    let result = app.settings.as_mut().unwrap().handle_key(key);
+    match result {
+        SettingsResult::Active => {}
+        SettingsResult::Dismissed => {
+            app.dismiss_settings();
+        }
+        SettingsResult::Modified => {
+            let config = app.settings.as_ref().unwrap().config().clone();
+            if let Err(e) = config.save() {
+                app.messages.push(ChatMessage::Error(format!(
+                    "Warning: could not save config: {}", e
+                )));
+            }
+            app.config = config;
+        }
+    }
+}
+
+fn handle_tree_browser_key(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+    session: &mut Session,
+) {
+    let result = app.tree_browser.as_mut().unwrap().handle_key(key);
+    match result {
+        TreeBrowserResult::Cancelled => {
+            app.dismiss_tree_browser();
+        }
+        TreeBrowserResult::Active => {}
+        TreeBrowserResult::Selected(entry_id) => {
+            app.dismiss_tree_browser();
+
+            // Branch to the selected entry
+            if let Err(e) = session.branch(&entry_id) {
+                app.messages.push(ChatMessage::Error(format!("Branch failed: {}", e)));
+                return;
+            }
+
+            let msgs = session.get_branch_path();
+            let short_id = if entry_id.len() > 8 { &entry_id[..8] } else { &entry_id };
+            restore_messages(app, input_tx, msgs, &format!("Switched to branch at {}.", short_id));
+        }
+    }
+}
+
 fn handle_picker_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
     input_tx: &mpsc::UnboundedSender<AgentInput>,
-    session: &Session,
+    session: &mut Session,
 ) {
     let result = app.picker.as_mut().unwrap().handle_key(key);
 
@@ -253,11 +325,28 @@ fn handle_model_picked(
     }
 }
 
+/// Reset conversation display, load messages, and send them to the agent.
+fn restore_messages(
+    app: &mut App,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+    msgs: Vec<crate::message::Message>,
+    info: &str,
+) {
+    app.reset_conversation(input_tx, info);
+    let chat_messages = messages_to_chat_messages(&msgs);
+    let info_msg = app.messages.pop();
+    app.messages = chat_messages;
+    if let Some(info) = info_msg {
+        app.messages.push(info);
+    }
+    let _ = input_tx.send(AgentInput::RestoreMessages(msgs));
+}
+
 fn handle_resume_picked(
     app: &mut App,
     session_id: &str,
     input_tx: &mpsc::UnboundedSender<AgentInput>,
-    session: &Session,
+    session: &mut Session,
 ) {
     if session_id == session.id() {
         app.messages
@@ -267,15 +356,7 @@ fn handle_resume_picked(
 
     match Session::load_messages(session_id) {
         Ok(msgs) => {
-            app.reset_conversation(input_tx, &format!("Resumed session {}.", session_id));
-            let chat_messages = messages_to_chat_messages(&msgs);
-            // Insert loaded messages before the "Resumed" info message
-            let info_msg = app.messages.pop();
-            app.messages = chat_messages;
-            if let Some(info) = info_msg {
-                app.messages.push(info);
-            }
-            let _ = input_tx.send(AgentInput::RestoreMessages(msgs));
+            restore_messages(app, input_tx, msgs, &format!("Resumed session {}.", session_id));
         }
         Err(e) => {
             app.messages.push(ChatMessage::Error(format!(
@@ -400,8 +481,56 @@ fn handle_normal_input(
     app: &mut App,
     input_tx: &mpsc::UnboundedSender<AgentInput>,
     model_tx: &mpsc::UnboundedSender<Result<Vec<String>>>,
-    session: &Session,
+    session: &mut Session,
 ) {
+    // ── Prompt template variable fill mode ───────────────────────────
+    if app.pending_prompt.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.pending_prompt = None;
+                app.input.clear();
+                app.cursor_pos = 0;
+                app.messages.push(ChatMessage::Info("Prompt cancelled.".into()));
+                return;
+            }
+            KeyCode::Enter => {
+                let fill = app.pending_prompt.as_mut().unwrap();
+                let var = &fill.variables[fill.current];
+                let value = if !app.input.trim().is_empty() {
+                    app.input.trim().to_string()
+                } else if let Some(ref default) = var.default {
+                    default.clone()
+                } else {
+                    return;
+                };
+                let var_name = var.name.clone();
+                fill.values.insert(var_name, value);
+                fill.current += 1;
+                app.input.clear();
+                app.cursor_pos = 0;
+
+                // Check if all variables are filled
+                let fill = app.pending_prompt.as_ref().unwrap();
+                if fill.current >= fill.variables.len() {
+                    let fill = app.pending_prompt.take().unwrap();
+                    let expanded = fill.template.expand(&fill.values);
+                    let was_at_bottom = app.is_at_bottom();
+                    app.messages.push(ChatMessage::SkillLoad {
+                        name: format!("prompt:{}", fill.template.name),
+                    });
+                    app.begin_processing(super::render::pick_verb());
+                    let _ = input_tx.send(AgentInput::Message(expanded));
+                    if was_at_bottom {
+                        app.scroll_offset = 0;
+                    }
+                }
+                return;
+            }
+            // Allow normal text editing during fill mode — fall through
+            _ => {}
+        }
+    }
+
     // Ctrl key combos
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
@@ -441,6 +570,18 @@ fn handle_normal_input(
     // Alt key combos
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
+            // Alt+Enter — queue follow-up (sent after agent completes)
+            KeyCode::Enter => {
+                if app.is_processing {
+                    app.submit_followup();
+                } else {
+                    // When idle, Alt+Enter behaves like Enter
+                    if let Some(msg) = app.submit() {
+                        let _ = input_tx.send(AgentInput::Message(msg));
+                    }
+                }
+                return;
+            }
             // Alt+Left — word backward
             KeyCode::Left => {
                 app.cursor_pos = prev_word_boundary(&app.input, app.cursor_pos);
@@ -472,6 +613,8 @@ fn handle_normal_input(
                     commands::handle_command(cmd, &raw_input, app, input_tx, model_tx, session);
                 }
             } else if let Some(msg) = app.submit() {
+                // submit() handles both idle (returns Some) and processing
+                // (sends steering message via steer_tx, returns None)
                 let _ = input_tx.send(AgentInput::Message(msg));
             }
         }
@@ -481,11 +624,14 @@ fn handle_normal_input(
                 app.input = cmd.name.to_string();
                 app.cursor_pos = app.input.len();
             } else {
-                // Check skill name completions
+                // Check skill and prompt name completions
                 let prefix = app.input.trim();
                 if let Some(skill_prefix) = prefix.strip_prefix('/') {
                     if let Some(skill) = app.skills.iter().find(|s| s.name.starts_with(skill_prefix)) {
                         app.input = format!("/{}", skill.name);
+                        app.cursor_pos = app.input.len();
+                    } else if let Some(prompt) = app.prompts.iter().find(|p| p.name.starts_with(skill_prefix)) {
+                        app.input = format!("/{}", prompt.name);
                         app.cursor_pos = app.input.len();
                     }
                 }

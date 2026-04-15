@@ -3,7 +3,9 @@ mod events;
 mod markdown;
 pub(crate) mod picker;
 pub(crate) mod render;
+pub(crate) mod settings;
 mod syntax;
+pub(crate) mod tree_browser;
 
 use std::io;
 use std::sync::Arc;
@@ -168,19 +170,25 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
     );
     let no_confirm = config.no_confirm.unwrap_or(false);
     let bypass = config.bypass.unwrap_or(false);
-    let mut app = App::new(model.clone(), context_size, ollama, config, skills, system_prompt);
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+    let (confirm_tx, mut confirm_rx) = mpsc::unbounded_channel::<bool>();
+    let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<String>();
+    let (model_tx, mut model_rx) = mpsc::unbounded_channel::<Result<Vec<String>>>();
+    let (backend_tx, mut backend_rx) = mpsc::unbounded_channel::<BackendReady>();
+
+    let mut app = App::new(model.clone(), context_size, ollama, config, skills, system_prompt, steer_tx);
+    // Discover prompt templates
+    if let Ok(cwd) = std::env::current_dir() {
+        app.prompts = crate::prompts::discover_prompts(&cwd.to_string_lossy());
+    }
     if no_confirm || bypass {
         app.auto_approve = true;
     }
 
     session.log_debug(&format!("TUI_START model={}", model));
     let session_path = session.path().display().to_string();
-
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
-    let (confirm_tx, mut confirm_rx) = mpsc::unbounded_channel::<bool>();
-    let (model_tx, mut model_rx) = mpsc::unbounded_channel::<Result<Vec<String>>>();
-    let (backend_tx, mut backend_rx) = mpsc::unbounded_channel::<BackendReady>();
 
     // Keep a clone for the panic handler
     let panic_event_tx = event_tx.clone();
@@ -195,7 +203,7 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                 match input {
                     AgentInput::Message(msg) => {
                         cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                        if let Err(e) = agent.run(&msg, &event_tx, &mut confirm_rx, cancel_flag.clone()).await {
+                        if let Err(e) = agent.run(&msg, &event_tx, &mut confirm_rx, &mut steer_rx, cancel_flag.clone()).await {
                             let _ = event_tx.send(AgentEvent::Error(format!("Agent error: {}", e)));
                             let _ = event_tx.send(AgentEvent::Done { prompt_tokens: 0, eval_count: 0 });
                         }
@@ -303,7 +311,7 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                 }
             }
             Some(Ok(evt)) = reader.next() => {
-                events::handle_terminal_event(evt, &mut app, &input_tx, &confirm_tx, &model_tx, &session);
+                events::handle_terminal_event(evt, &mut app, &input_tx, &confirm_tx, &model_tx, &mut session);
                 if app.server.stop_llama_server {
                     app.server.stop_llama_server = false;
                     let old_server = llama_server.take();
@@ -343,8 +351,12 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                             session.log_message(msg);
                         }
                         // Persist trim watermark so resumed sessions skip trimmed messages
-                        if let AgentEvent::ContextTrimmed { removed_messages, .. } = &e {
-                            session.record_trim(*removed_messages);
+                        match &e {
+                            AgentEvent::ContextTrimmed { removed_messages, .. }
+                            | AgentEvent::ContextCompacted { removed_messages, .. } => {
+                                session.record_trim(*removed_messages);
+                            }
+                            _ => {}
                         }
                         events::handle_agent_event(e, &mut app);
                         // Auto-approve tool calls when bypass is enabled

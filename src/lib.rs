@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod message;
 pub mod ollama;
 pub mod plugin;
+pub mod prompts;
 pub mod session;
 pub mod skills;
 pub mod tools;

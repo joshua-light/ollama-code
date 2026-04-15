@@ -410,8 +410,9 @@ async fn run_agent_full(
     });
 
     let input = input.to_string();
+    let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel::<String>();
     // Run the agent — this blocks until done
-    let _ = agent.run(&input, &event_tx, &mut confirm_rx, cancel).await;
+    let _ = agent.run(&input, &event_tx, &mut confirm_rx, &mut steer_rx, cancel).await;
     // Drop sender to signal collector to finish
     drop(event_tx);
 

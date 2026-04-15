@@ -176,6 +176,12 @@ pub struct Config {
     #[serde(default)]
     pub trim_target: Option<u8>,
 
+    /// Use LLM-based context compaction instead of blind removal (default: true).
+    /// When enabled, old messages are summarized by the model before being removed,
+    /// preserving critical context that would otherwise be lost.
+    #[serde(default)]
+    pub context_compaction: Option<bool>,
+
     /// Recently used HuggingFace model repos (most recent first, max 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_hf_models: Option<Vec<String>>,
@@ -305,6 +311,7 @@ impl Config {
             reinjection_interval: self.reinjection_interval.or(other.reinjection_interval),
             trim_threshold: self.trim_threshold.or(other.trim_threshold),
             trim_target: self.trim_target.or(other.trim_target),
+            context_compaction: self.context_compaction.or(other.context_compaction),
             // User-scope only: always take from the lower-priority layer (user config).
             recent_hf_models: other.recent_hf_models.clone(),
             project_config_path: None,
@@ -425,6 +432,9 @@ impl Config {
 # Trimming removes messages until usage drops to this level.
 # trim_target = 60
 
+# Use LLM to summarize old context instead of blind removal (default: true)
+# context_compaction = true
+
 # Plugin feature flags and configuration
 # Boolean values enable/disable tools by name:
 #   bash = false     # disables the built-in bash tool
@@ -472,6 +482,10 @@ impl Config {
 
     pub fn effective_trim_target(&self) -> u8 {
         self.trim_target.unwrap_or(DEFAULT_TRIM_TARGET_PCT).min(100)
+    }
+
+    pub fn effective_context_compaction(&self) -> bool {
+        self.context_compaction.unwrap_or(true)
     }
 
     pub fn effective_reinjection_interval(&self) -> u16 {

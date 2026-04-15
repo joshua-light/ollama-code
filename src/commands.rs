@@ -6,12 +6,15 @@ pub enum SlashCommand {
     Help,
     Mcp,
     Model,
+    Prompts,
     Resume,
     Rewind,
     Session,
+    Settings,
     Skills,
     Stats,
     SystemPrompt,
+    Tree,
     New,
     Unknown(String),
 }
@@ -47,6 +50,10 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Switch the active model",
     },
     CommandInfo {
+        name: "/prompts",
+        description: "List available prompt templates",
+    },
+    CommandInfo {
         name: "/resume",
         description: "List recent sessions",
     },
@@ -59,6 +66,10 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Show session log directory",
     },
     CommandInfo {
+        name: "/settings",
+        description: "Open interactive settings editor",
+    },
+    CommandInfo {
         name: "/skills",
         description: "List available skills",
     },
@@ -69,6 +80,10 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "/system-prompt",
         description: "Show the full system prompt sent to the model",
+    },
+    CommandInfo {
+        name: "/tree",
+        description: "Browse conversation tree and switch branches",
     },
     CommandInfo {
         name: "/new",
@@ -88,13 +103,16 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         "/help" => Some(SlashCommand::Help),
         "/mcp" => Some(SlashCommand::Mcp),
         "/model" => Some(SlashCommand::Model),
+        "/prompts" => Some(SlashCommand::Prompts),
         "/resume" => Some(SlashCommand::Resume),
         "/session" => Some(SlashCommand::Session),
+        "/settings" => Some(SlashCommand::Settings),
         "/skills" => Some(SlashCommand::Skills),
         "/stats" => Some(SlashCommand::Stats),
         "/system-prompt" => Some(SlashCommand::SystemPrompt),
         "/new" => Some(SlashCommand::New),
         "/rewind" => Some(SlashCommand::Rewind),
+        "/tree" => Some(SlashCommand::Tree),
         cmd => Some(SlashCommand::Unknown(cmd.to_string())),
     }
 }
@@ -125,12 +143,15 @@ mod tests {
             ("/help", "Help"),
             ("/mcp", "Mcp"),
             ("/model", "Model"),
+            ("/prompts", "Prompts"),
             ("/resume", "Resume"),
             ("/rewind", "Rewind"),
             ("/session", "Session"),
+            ("/settings", "Settings"),
             ("/skills", "Skills"),
             ("/stats", "Stats"),
             ("/system-prompt", "SystemPrompt"),
+            ("/tree", "Tree"),
             ("/new", "New"),
         ];
         for (input, expected_name) in cases {

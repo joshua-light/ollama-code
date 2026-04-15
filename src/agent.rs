@@ -30,6 +30,14 @@ pub enum AgentEvent {
     ContextUpdate { prompt_tokens: u64 },
     /// Context was auto-trimmed to stay within the window.
     ContextTrimmed { removed_messages: usize, estimated_tokens_freed: u64 },
+    /// Context compaction is starting (LLM summarization of old messages).
+    ContextCompacting,
+    /// Context was compacted via LLM summarization.
+    ContextCompacted {
+        removed_messages: usize,
+        summary_tokens: u64,
+        estimated_tokens_freed: u64,
+    },
     Done { prompt_tokens: u64, eval_count: u64 },
     /// Generation was cancelled by the user.
     Cancelled,
@@ -70,6 +78,57 @@ fn truncate_tool_output(output: &str) -> String {
         kept,
         lines.len() - MAX_TOOL_OUTPUT_LINES,
     )
+}
+
+/// Format messages for the context compaction prompt.
+fn format_messages_for_compaction(messages: &[Message]) -> String {
+    use crate::format::truncate_args;
+    use crate::message::Role;
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    for msg in messages {
+        match msg.role {
+            Role::User => {
+                out.push_str("[User] ");
+                out.push_str(&truncate_args(&msg.content, 500));
+                out.push('\n');
+            }
+            Role::Assistant => {
+                if !msg.content.is_empty() {
+                    out.push_str("[Assistant] ");
+                    out.push_str(&truncate_args(&msg.content, 500));
+                    out.push('\n');
+                }
+                if let Some(ref calls) = msg.tool_calls {
+                    for tc in calls {
+                        let _ = writeln!(
+                            out,
+                            "[Tool call: {}({})]",
+                            tc.function.name,
+                            truncate_args(&tc.function.arguments.to_string(), 150),
+                        );
+                    }
+                }
+            }
+            Role::Tool => {
+                let status = match msg.success {
+                    Some(true) => "success",
+                    Some(false) => "failure",
+                    None => "unknown",
+                };
+                let _ = write!(out, "[Tool result ({})]: ", status);
+                out.push_str(&truncate_args(&msg.content, 200));
+                out.push('\n');
+            }
+            Role::System => {
+                out.push_str("[System] ");
+                out.push_str(&truncate_args(&msg.content, 200));
+                out.push('\n');
+            }
+        }
+    }
+    out
 }
 
 /// Poll a cancel flag, resolving when it becomes true.
@@ -160,6 +219,8 @@ pub struct Agent {
     trim_threshold_pct: u8,
     /// Context trim target (percentage of context_size).
     trim_target_pct: u8,
+    /// Whether to use LLM-based context compaction instead of blind trimming.
+    context_compaction: bool,
     /// Tracks whether a file-reading tool has been used (for tool scoping).
     has_explored: bool,
     /// The original user input for the current run (for task re-injection).
@@ -359,6 +420,7 @@ impl Agent {
             reinjection_interval: cfg.effective_reinjection_interval(),
             trim_threshold_pct: cfg.effective_trim_threshold(),
             trim_target_pct: cfg.effective_trim_target(),
+            context_compaction: cfg.effective_context_compaction(),
             has_explored: false,
             current_task: String::new(),
             read_file_ranges: Vec::new(),
@@ -494,9 +556,10 @@ impl Agent {
             .unwrap_or_else(|| "Sub-agent produced no response.".to_string())
     }
 
-    /// Trim oldest non-system messages when context usage exceeds threshold.
-    /// Removes complete exchanges (user + assistant + tool messages) as units.
-    fn trim_context(&mut self, current_prompt_tokens: u64) -> Option<(usize, u64)> {
+    /// Identify a range of old non-system messages to remove, walking forward
+    /// through complete exchanges until `need_to_free` tokens are covered.
+    /// Returns `(first_non_system, remove_until, estimated_freed)` or `None`.
+    fn find_removal_range(&self, current_prompt_tokens: u64) -> Option<(usize, usize, u64)> {
         if self.context_size == 0 {
             return None;
         }
@@ -518,12 +581,10 @@ impl Agent {
         let mut freed: u64 = 0;
         let mut remove_until = first_non_system;
 
-        // Walk forward, removing complete exchanges (up to the next User message)
         let mut i = first_non_system;
         while freed < need_to_free && i < self.messages.len().saturating_sub(1) {
             freed += self.messages[i].estimated_tokens();
             i += 1;
-            // Keep going until we hit the next User message (start of a new exchange)
             while i < self.messages.len().saturating_sub(1)
                 && !matches!(self.messages[i].role, crate::message::Role::User)
             {
@@ -534,12 +595,112 @@ impl Agent {
         }
 
         if remove_until > first_non_system {
-            let removed = remove_until - first_non_system;
-            self.messages.drain(first_non_system..remove_until);
-            Some((removed, freed))
+            Some((first_non_system, remove_until, freed))
         } else {
             None
         }
+    }
+
+    /// Trim oldest non-system messages when context usage exceeds threshold.
+    /// Removes complete exchanges (user + assistant + tool messages) as units.
+    fn trim_context(&mut self, current_prompt_tokens: u64) -> Option<(usize, u64)> {
+        let (first_non_system, remove_until, freed) =
+            self.find_removal_range(current_prompt_tokens)?;
+        let removed = remove_until - first_non_system;
+        self.messages.drain(first_non_system..remove_until);
+        Some((removed, freed))
+    }
+
+    /// Attempt LLM-based context compaction. Summarizes old exchanges via
+    /// the model before removing them, preserving critical context.
+    /// Returns `Some((removed, freed, summary_tokens))` on success, or `None`
+    /// if below threshold or compaction failed (caller should fall back to
+    /// `trim_context`).
+    async fn compact_context(
+        &mut self,
+        current_prompt_tokens: u64,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &AtomicBool,
+        num_ctx: Option<u64>,
+    ) -> Option<(usize, u64, u64)> {
+        let (first_non_system, remove_until, freed) =
+            self.find_removal_range(current_prompt_tokens)?;
+
+        // Notify that compaction is starting
+        let _ = send_event(events, AgentEvent::ContextCompacting);
+
+        // Format the messages to be compacted
+        let excerpt = format_messages_for_compaction(&self.messages[first_non_system..remove_until]);
+
+        // Calculate a word budget (~25% of original size)
+        let word_budget = (freed / 4).clamp(50, 500);
+
+        let compaction_messages = vec![
+            Message::system(format!(
+                "You are a context compaction assistant. Summarize the following conversation \
+                 excerpt concisely. This summary replaces the original messages to free context space.\n\
+                 \n\
+                 PRESERVE: file paths, function/type/variable names, error messages and resolutions, \
+                 decisions and rationale, tool call outcomes, current task state.\n\
+                 OMIT: full file contents (just note which files were read/modified), verbose tool output, \
+                 redundant exchanges.\n\
+                 \n\
+                 Keep your summary under {} words. Output only the summary.",
+                word_budget
+            )),
+            Message::user(excerpt),
+        ];
+
+        // Call the LLM for compaction (no tools, no streaming to user)
+        let compaction_response = tokio::select! {
+            r = self.backend.chat(
+                &self.model,
+                &compaction_messages,
+                None,
+                num_ctx,
+                Box::new(|_| {}),
+            ) => {
+                match r {
+                    Ok(r) => r,
+                    Err(_) => return None,
+                }
+            }
+            _ = poll_cancel(cancel) => {
+                return None;
+            }
+        };
+
+        let summary = compaction_response.content.trim().to_string();
+        if summary.is_empty() {
+            return None;
+        }
+
+        // Guard: if summary is too large relative to freed space, discard it
+        let summary_tokens = message::estimate_tokens(summary.len());
+        if summary_tokens > freed / 2 {
+            return None;
+        }
+
+        // Remove old messages and insert the summary exchange
+        let removed = remove_until - first_non_system;
+        self.messages.drain(first_non_system..remove_until);
+
+        let summary_user = Message::user(format!(
+            "[Context compaction — summary of {} earlier messages]\n\n{}",
+            removed, summary
+        ));
+        let summary_assistant = Message::assistant(
+            "Understood. I have the context from the conversation summary and will continue from here.",
+        );
+
+        // Emit MessageLogged so the summary pair gets persisted to the session
+        let _ = send_event(events, AgentEvent::MessageLogged(summary_user.clone()));
+        let _ = send_event(events, AgentEvent::MessageLogged(summary_assistant.clone()));
+
+        self.messages.insert(first_non_system, summary_user);
+        self.messages.insert(first_non_system + 1, summary_assistant);
+
+        Some((removed, freed, summary_tokens))
     }
 
     /// Force a final text response when the sub-agent turn limit is exceeded.
@@ -702,8 +863,10 @@ impl Agent {
         let task_owned = task.to_string();
         let mut sub_future = Box::pin(async move {
             let mut sa = sub_agent;
+            // Sub-agents don't receive steering messages
+            let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel::<String>();
             let result = sa
-                .run(&task_owned, &sub_tx_for_agent, &mut sub_confirm_rx, cancel_for_sub)
+                .run(&task_owned, &sub_tx_for_agent, &mut sub_confirm_rx, &mut steer_rx, cancel_for_sub)
                 .await;
             let last_msg = sa.last_assistant_message();
             (result, last_msg)
@@ -981,6 +1144,7 @@ impl Agent {
         user_input: &str,
         events: &mpsc::UnboundedSender<AgentEvent>,
         confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
+        steer_rx: &mut mpsc::UnboundedReceiver<String>,
         cancel: Arc<AtomicBool>,
     ) -> Result<()> {
         if !self.system_prompt_logged {
@@ -1093,6 +1257,13 @@ impl Agent {
             }
             turn += 1;
 
+            // Drain steering messages: inject user messages sent mid-run
+            while let Ok(steer_msg) = steer_rx.try_recv() {
+                let user_msg = Message::user(&steer_msg);
+                self.messages.push(user_msg.clone());
+                send_event(events, AgentEvent::MessageLogged(user_msg))?;
+            }
+
             // Task re-injection: periodically remind the model what it's doing.
             if self.task_reinjection
                 && turn > 1
@@ -1195,8 +1366,45 @@ impl Agent {
                     },
                 )?;
 
-                // Auto-trim context if approaching the limit
-                if let Some((removed, freed)) = self.trim_context(response.prompt_eval_count) {
+                // Auto-trim/compact context if approaching the limit
+                if self.context_compaction {
+                    match self
+                        .compact_context(
+                            response.prompt_eval_count,
+                            events,
+                            &cancel,
+                            num_ctx,
+                        )
+                        .await
+                    {
+                        Some((removed, freed, summary_tokens)) => {
+                            send_event(
+                                events,
+                                AgentEvent::ContextCompacted {
+                                    removed_messages: removed,
+                                    summary_tokens,
+                                    estimated_tokens_freed: freed,
+                                },
+                            )?;
+                        }
+                        None => {
+                            // Below threshold or compaction failed — fall back to blind trim
+                            if let Some((removed, freed)) =
+                                self.trim_context(response.prompt_eval_count)
+                            {
+                                send_event(
+                                    events,
+                                    AgentEvent::ContextTrimmed {
+                                        removed_messages: removed,
+                                        estimated_tokens_freed: freed,
+                                    },
+                                )?;
+                            }
+                        }
+                    }
+                } else if let Some((removed, freed)) =
+                    self.trim_context(response.prompt_eval_count)
+                {
                     send_event(
                         events,
                         AgentEvent::ContextTrimmed {

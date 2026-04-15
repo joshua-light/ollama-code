@@ -432,7 +432,10 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
 
     let prompt = prompt.to_string();
     let cancel = Arc::new(AtomicBool::new(false));
-    let handle = tokio::spawn(async move { agent.run(&prompt, &tx, &mut confirm_rx, cancel).await });
+    let handle = tokio::spawn(async move {
+        let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel::<String>();
+        agent.run(&prompt, &tx, &mut confirm_rx, &mut steer_rx, cancel).await
+    });
 
     // Buffer streamed tokens so ContentReplaced can discard/replace them.
     // This handles models that emit tool calls as text (e.g. <function=...>
@@ -483,6 +486,16 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
             AgentEvent::ContextTrimmed { removed_messages, estimated_tokens_freed } => {
                 session.record_trim(removed_messages);
                 eprintln!("(context trimmed: {} messages, ~{} tokens freed)", removed_messages, estimated_tokens_freed);
+            }
+            AgentEvent::ContextCompacting => {
+                eprintln!("(compacting context...)");
+            }
+            AgentEvent::ContextCompacted { removed_messages, summary_tokens, estimated_tokens_freed } => {
+                session.record_trim(removed_messages);
+                eprintln!(
+                    "(context compacted: {} messages summarized, ~{} tokens freed, ~{} token summary)",
+                    removed_messages, estimated_tokens_freed, summary_tokens
+                );
             }
             AgentEvent::Done { .. } => {
                 // Flush remaining buffer and finish.

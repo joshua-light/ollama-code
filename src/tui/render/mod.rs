@@ -212,6 +212,16 @@ pub(super) fn render(f: &mut Frame, app: &mut App) {
     if let Some(ref mut picker) = app.picker {
         picker.render(f, f.area());
     }
+
+    // Tree browser overlay
+    if let Some(ref mut tree) = app.tree_browser {
+        tree.render(f, f.area());
+    }
+
+    // Settings panel overlay
+    if let Some(ref mut settings) = app.settings {
+        settings.render(f, f.area());
+    }
 }
 
 fn render_header(f: &mut Frame, _app: &App, area: ratatui::layout::Rect) {
@@ -410,12 +420,57 @@ fn render_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_status_line(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    // Show command + skill completions when input starts with /
+    // Prompt template variable fill mode — show variable prompt
+    if let Some(ref fill) = app.pending_prompt {
+        let var = &fill.variables[fill.current];
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled(
+            format!(" /{} ", fill.template.name),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("[{}/{}] ", fill.current + 1, fill.variables.len()),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("{}:", var.name),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if let Some(ref default) = var.default {
+            spans.push(Span::styled(
+                format!(" (default: {})", default),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        // Esc hint on the right
+        let hint = " esc to cancel";
+        let content_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let available = area.width as usize;
+        if content_width + hint.len() < available {
+            let pad = available - content_width - hint.len();
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(
+                hint,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+        let line = Line::from(spans);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    // Show command + skill + prompt completions when input starts with /
     if !app.is_processing {
         let builtin_matches = commands::completions(&app.input);
         let prefix = app.input.trim();
         let skill_prefix = prefix.strip_prefix('/').unwrap_or("");
-        let skill_matches: Vec<(&str, &str)> = if !skill_prefix.is_empty() {
+        let mut skill_matches: Vec<(&str, &str)> = if !skill_prefix.is_empty() {
             app.skills
                 .iter()
                 .filter(|s| s.name.starts_with(skill_prefix))
@@ -429,6 +484,23 @@ fn render_status_line(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         } else {
             Vec::new()
         };
+
+        // Also include prompt template completions
+        let prompt_matches: Vec<(&str, &str)> = if !skill_prefix.is_empty() {
+            app.prompts
+                .iter()
+                .filter(|p| p.name.starts_with(skill_prefix))
+                .map(|p| (p.name.as_str(), p.description.as_str()))
+                .collect()
+        } else if prefix == "/" {
+            app.prompts
+                .iter()
+                .map(|p| (p.name.as_str(), p.description.as_str()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        skill_matches.extend(prompt_matches);
 
         if !builtin_matches.is_empty() || !skill_matches.is_empty() {
             render_command_completions(f, area, &app.input, &builtin_matches, &skill_matches);
@@ -513,6 +585,16 @@ fn render_status_line(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(
             format!("⚙ {}", app.stats.tool_call_count),
             Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    // Queued follow-up messages indicator
+    if !app.followup_queue.is_empty() {
+        let count = app.followup_queue.len();
+        spans.push(sep_span());
+        spans.push(Span::styled(
+            format!("{} queued", count),
+            Style::default().fg(Color::Cyan),
         ));
     }
 

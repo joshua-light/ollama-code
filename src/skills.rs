@@ -137,19 +137,10 @@ fn ensure_default_skills() {
 
 /// Parse SKILL.md YAML frontmatter to extract name and description.
 fn parse_frontmatter(path: &Path, dir: &Path) -> Result<SkillMeta> {
+    use crate::format::{parse_frontmatter_value, split_frontmatter};
+
     let content = std::fs::read_to_string(path)?;
-    let trimmed = content.trim_start();
-
-    if !trimmed.starts_with("---") {
-        anyhow::bail!("missing frontmatter");
-    }
-
-    let after_opening = &trimmed[3..];
-    let end = after_opening
-        .find("\n---")
-        .ok_or_else(|| anyhow::anyhow!("malformed frontmatter"))?;
-
-    let frontmatter = &after_opening[..end];
+    let (frontmatter, _body) = split_frontmatter(&content)?;
 
     let mut name = None;
     let mut description = None;
@@ -157,24 +148,11 @@ fn parse_frontmatter(path: &Path, dir: &Path) -> Result<SkillMeta> {
 
     for line in frontmatter.lines() {
         let line = line.trim();
-        if let Some(value) = line.strip_prefix("name:") {
-            name = Some(
-                value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string(),
-            );
-        } else if let Some(value) = line.strip_prefix("description:") {
-            description = Some(
-                value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string(),
-            );
-        } else if let Some(value) = line.strip_prefix("trigger:") {
-            let v = value.trim().trim_matches('"').trim_matches('\'').to_string();
+        if let Some(v) = parse_frontmatter_value(line, "name:") {
+            name = Some(v);
+        } else if let Some(v) = parse_frontmatter_value(line, "description:") {
+            description = Some(v);
+        } else if let Some(v) = parse_frontmatter_value(line, "trigger:") {
             if !v.is_empty() {
                 trigger = Some(v);
             }
@@ -196,15 +174,10 @@ fn parse_frontmatter(path: &Path, dir: &Path) -> Result<SkillMeta> {
 
 /// Extract the body of a SKILL.md (everything after the closing `---` of frontmatter).
 fn extract_body(content: &str) -> String {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return content.to_string();
-    }
-    let after_opening = &trimmed[3..];
-    if let Some(end) = after_opening.find("\n---") {
-        after_opening[end + 4..].trim_start_matches('\n').to_string()
-    } else {
-        content.to_string()
+    use crate::format::split_frontmatter;
+    match split_frontmatter(content) {
+        Ok((_fm, body)) => body.to_string(),
+        Err(_) => content.to_string(),
     }
 }
 

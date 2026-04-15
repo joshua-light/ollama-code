@@ -90,6 +90,22 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
                 removed_messages, estimated_tokens_freed
             )));
         }
+        AgentEvent::ContextCompacting => {
+            app.messages.push(ChatMessage::Info(
+                "Compacting context (summarizing old messages)...".to_string(),
+            ));
+        }
+        AgentEvent::ContextCompacted {
+            removed_messages,
+            summary_tokens,
+            estimated_tokens_freed,
+        } => {
+            app.stats.context_trims += 1;
+            app.messages.push(ChatMessage::Info(format!(
+                "Context compacted: summarized {} messages (~{} tokens freed, ~{} token summary retained)",
+                removed_messages, estimated_tokens_freed, summary_tokens
+            )));
+        }
         AgentEvent::SubagentStart { .. } => {
             // The ToolCall event already shows "Subagent(task...)" in the UI.
         }
@@ -121,6 +137,8 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
         }
         AgentEvent::Cancelled => {
             app.flush_streaming();
+            // Clear any pending follow-ups on cancel
+            app.followup_queue.clear();
             app.messages.push(ChatMessage::Info("Generation cancelled.".into()));
             app.finish_processing();
         }
