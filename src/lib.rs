@@ -2,6 +2,7 @@ pub mod agent;
 pub mod backend;
 pub mod commands;
 pub mod config;
+pub mod discovery;
 pub mod format;
 pub mod hooks;
 pub mod llama_server;

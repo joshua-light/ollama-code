@@ -4,6 +4,7 @@ use anyhow::Result;
 use regex::{Regex, RegexBuilder};
 
 use crate::config::config_dir;
+use crate::discovery::{discover_layered, install_defaults, Named};
 
 /// Metadata from SKILL.md frontmatter -- kept in memory for discovery.
 #[derive(Clone, Debug)]
@@ -30,6 +31,12 @@ impl SkillMeta {
     }
 }
 
+impl Named for SkillMeta {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// User-scoped skills directory (`~/.config/ollama-code/skills/`).
 pub fn user_skills_dir() -> PathBuf {
     config_dir().join("skills")
@@ -45,41 +52,8 @@ pub fn user_skills_dir() -> PathBuf {
 /// Both sets are merged. Project-scoped skills override user-scoped skills
 /// with the same name.
 pub fn discover_skills(cwd: &str) -> Vec<SkillMeta> {
-    // Ensure built-in default skills are installed.
     ensure_default_skills();
-
-    // 1. Load user-scoped skills (lower priority).
-    let mut skills = load_skills_from_dir(&user_skills_dir());
-
-    // 2. Load project-scoped skills (higher priority — override by name).
-    let project_skills = discover_project_skills(cwd);
-    for ps in project_skills {
-        if let Some(existing) = skills.iter_mut().find(|s| s.name == ps.name) {
-            *existing = ps;
-        } else {
-            skills.push(ps);
-        }
-    }
-
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
-    skills
-}
-
-/// Walk up from `cwd` looking for `.agents/skills/*/SKILL.md`.
-/// Stops at the first directory that contains valid skills.
-fn discover_project_skills(cwd: &str) -> Vec<SkillMeta> {
-    let mut dir = Path::new(cwd).to_path_buf();
-    loop {
-        let skills_dir = dir.join(".agents").join("skills");
-        let found = load_skills_from_dir(&skills_dir);
-        if !found.is_empty() {
-            return found;
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    Vec::new()
+    discover_layered(&user_skills_dir(), "skills", cwd, load_skills_from_dir)
 }
 
 /// Load all valid skills from a single directory (`dir/*/SKILL.md`).
@@ -113,24 +87,17 @@ const DEFAULT_SKILLS: &[(&str, &str)] = &[
 ];
 
 /// Ensure that built-in default skills exist in the user skills directory.
-/// Only writes a skill if its directory does not already exist (so user edits
+/// Only writes a skill if its SKILL.md does not already exist (so user edits
 /// are preserved).
 fn ensure_default_skills() {
     let base = user_skills_dir();
-    for (name, content) in DEFAULT_SKILLS {
-        let skill_dir = base.join(name);
-        let skill_md = skill_dir.join("SKILL.md");
-        if skill_md.exists() {
-            continue;
-        }
-        if let Err(e) = std::fs::create_dir_all(&skill_dir) {
-            eprintln!("Warning: could not create skill dir {}: {}", skill_dir.display(), e);
-            continue;
-        }
-        if let Err(e) = std::fs::write(&skill_md, content) {
-            eprintln!("Warning: could not write default skill {}: {}", skill_md.display(), e);
-        }
-    }
+    install_defaults(
+        &base,
+        "skill",
+        DEFAULT_SKILLS
+            .iter()
+            .map(|(name, content)| (format!("{}/SKILL.md", name), *content)),
+    );
 }
 
 // ── Frontmatter parsing ──────────────────────────────────────────────────

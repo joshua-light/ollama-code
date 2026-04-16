@@ -6,6 +6,7 @@ use anyhow::Result;
 use regex::Regex;
 
 use crate::config::config_dir;
+use crate::discovery::{discover_layered, install_defaults, Named};
 
 fn template_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -80,6 +81,12 @@ impl PromptTemplate {
     }
 }
 
+impl Named for PromptTemplate {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// User-scoped prompts directory (`~/.config/ollama-code/prompts/`).
 pub fn user_prompts_dir() -> PathBuf {
     config_dir().join("prompts")
@@ -93,38 +100,7 @@ pub fn user_prompts_dir() -> PathBuf {
 /// Project-scoped prompts override user-scoped prompts with the same name.
 pub fn discover_prompts(cwd: &str) -> Vec<PromptTemplate> {
     ensure_default_prompts();
-
-    // 1. Load user-scoped prompts (lower priority).
-    let mut prompts = load_prompts_from_dir(&user_prompts_dir());
-
-    // 2. Load project-scoped prompts (higher priority — override by name).
-    let project_prompts = discover_project_prompts(cwd);
-    for pp in project_prompts {
-        if let Some(existing) = prompts.iter_mut().find(|p| p.name == pp.name) {
-            *existing = pp;
-        } else {
-            prompts.push(pp);
-        }
-    }
-
-    prompts.sort_by(|a, b| a.name.cmp(&b.name));
-    prompts
-}
-
-/// Walk up from `cwd` looking for `.agents/prompts/*.md`.
-fn discover_project_prompts(cwd: &str) -> Vec<PromptTemplate> {
-    let mut dir = Path::new(cwd).to_path_buf();
-    loop {
-        let prompts_dir = dir.join(".agents").join("prompts");
-        let found = load_prompts_from_dir(&prompts_dir);
-        if !found.is_empty() {
-            return found;
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    Vec::new()
+    discover_layered(&user_prompts_dir(), "prompts", cwd, load_prompts_from_dir)
 }
 
 /// Load all valid prompt templates from a directory (`dir/*.md`).
@@ -155,28 +131,11 @@ const DEFAULT_PROMPTS: &[(&str, &str)] = &[
 /// Ensure that built-in default prompts exist in the user prompts directory.
 /// Only writes a prompt if the file does not already exist (so user edits are preserved).
 fn ensure_default_prompts() {
-    let base = user_prompts_dir();
-    if let Err(e) = std::fs::create_dir_all(&base) {
-        eprintln!(
-            "Warning: could not create prompts dir {}: {}",
-            base.display(),
-            e
-        );
-        return;
-    }
-    for (filename, content) in DEFAULT_PROMPTS {
-        let path = base.join(filename);
-        if path.exists() {
-            continue;
-        }
-        if let Err(e) = std::fs::write(&path, content) {
-            eprintln!(
-                "Warning: could not write default prompt {}: {}",
-                path.display(),
-                e
-            );
-        }
-    }
+    install_defaults(
+        &user_prompts_dir(),
+        "prompt",
+        DEFAULT_PROMPTS.iter().map(|(name, content)| (*name, *content)),
+    );
 }
 
 // ── Frontmatter parsing ─────────────────────────────────────────────────
