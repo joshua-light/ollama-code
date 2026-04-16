@@ -9,7 +9,7 @@ use syntect::{
     parsing::SyntaxSet,
 };
 
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 static THEME: LazyLock<highlighting::Theme> = LazyLock::new(|| {
     let ts = ThemeSet::load_defaults();
     ts.themes["base16-ocean.dark"].clone()
