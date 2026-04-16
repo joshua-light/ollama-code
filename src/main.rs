@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Read as _, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -66,7 +66,21 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    if let Some(ref p) = cli.prompt {
+        if p.trim().is_empty() {
+            anyhow::bail!("empty prompt: -p requires a non-empty string");
+        }
+    } else if !std::io::stdin().is_terminal() {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        if buf.trim().is_empty() {
+            anyhow::bail!("no prompt: pass -p or pipe input on stdin");
+        }
+        cli.prompt = Some(buf);
+    }
+
     let mut config = Config::load()?;
 
     // Ensure a default config file exists so the user can discover and edit it.
@@ -507,7 +521,6 @@ async fn run_pipe(mut agent: Agent, prompt: &str, mut session: Session, verbose:
                 break;
             }
             AgentEvent::Error(e) => {
-                eprintln!("\nerror: {}", e);
                 agent_error = Some(e);
                 break;
             }

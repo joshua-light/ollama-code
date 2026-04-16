@@ -59,6 +59,9 @@ ollama-code
 
 # Or run a one-shot prompt
 ollama-code -p "list all TODO comments in this directory"
+
+# Or pipe the prompt on stdin
+echo "list all TODO comments in this directory" | ollama-code
 ```
 
 On first launch, a default `config.toml` is created automatically with all available options documented as comments. If no model is configured, you'll be prompted to pick from your locally available models. The config file location is `~/.config/ollama-code/config.toml` (or `$XDG_CONFIG_HOME/ollama-code/config.toml` if set).

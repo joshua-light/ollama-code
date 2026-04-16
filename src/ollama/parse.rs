@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 use crate::message::{FunctionCall, ToolCall};
@@ -163,6 +165,45 @@ fn find_json_objects(text: &str) -> Vec<(String, usize, usize)> {
     results
 }
 
+/// Remove empty code-fence pairs left behind after tool-call JSON extraction.
+///
+/// After we strip a fenced JSON tool-call out of the content, we can be left
+/// with a bare ```` ```json ```` / ```` ``` ```` pair surrounding nothing but
+/// whitespace. Collapse any such pair (with optional language tag).
+fn strip_empty_fences(text: &str) -> Cow<'_, str> {
+    if !text.contains("```") {
+        return Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0;
+    let mut copy_start = 0;
+    while idx < bytes.len() {
+        // All markers scanned here are ASCII, so fence starts always land on a
+        // UTF-8 char boundary — non-matching positions can safely advance by 1
+        // byte because continuation bytes (>= 0x80) never equal b'`'.
+        if bytes[idx] == b'`' && text[idx..].starts_with("```") {
+            let mut j = idx + 3;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let mut k = j;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k + 3 <= bytes.len() && &bytes[k..k + 3] == b"```" {
+                out.push_str(&text[copy_start..idx]);
+                idx = k + 3;
+                copy_start = idx;
+                continue;
+            }
+        }
+        idx += 1;
+    }
+    out.push_str(&text[copy_start..]);
+    Cow::Owned(out)
+}
+
 /// Try to extract tool calls from the text content when a model emits them as
 /// plain-text JSON instead of using Ollama's structured `tool_calls` field.
 /// Only matches JSON objects whose `"name"` value is in `known_tools`.
@@ -213,12 +254,13 @@ pub(super) fn extract_tool_calls_from_content(
         for &(start, end) in removals.iter().rev() {
             remaining.replace_range(start..end, "");
         }
-        return (calls, remaining.trim().to_string());
+        return (calls, strip_empty_fences(&remaining).trim().to_string());
     }
 
     // Fallback: try to extract <function=NAME>...</function> XML-style tool calls.
     let (xml_calls, xml_remaining) = extract_function_tag_calls(&cleaned, known_tools);
     if !xml_calls.is_empty() {
+        let xml_remaining = strip_empty_fences(&xml_remaining).trim().to_string();
         return (xml_calls, xml_remaining);
     }
 
@@ -655,6 +697,29 @@ mod tests {
         let (calls, remaining) = extract_tool_calls_from_content(content, &known);
         assert!(calls.is_empty());
         assert_eq!(remaining, content);
+    }
+
+    #[test]
+    fn extract_json_fenced_strips_empty_fences() {
+        // Models sometimes emit tool calls wrapped in ```json ... ``` fences.
+        // After the JSON is pulled out, the surrounding fence pair should be
+        // collapsed so the assistant's remaining content isn't just "```json\n\n```".
+        let content = "```json\n{\"name\":\"write\",\"arguments\":{\"file_path\":\"x\"}}\n```";
+        let known = vec!["write".to_string()];
+        let (calls, remaining) = extract_tool_calls_from_content(content, &known);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write");
+        assert_eq!(
+            calls[0]
+                .function
+                .arguments
+                .get("file_path")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "x"
+        );
+        assert!(remaining.is_empty(), "remaining was: {:?}", remaining);
     }
 
     #[test]
