@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+use crate::agent::RewindMode;
 use crate::commands::SlashCommand;
 use crate::llama_server::ModelSource;
 
@@ -33,34 +34,60 @@ pub(super) fn handle_command(
         }
         SlashCommand::Rewind => {
             let arg = raw_input.trim().strip_prefix("/rewind").unwrap_or("").trim();
-            let n = if arg.is_empty() {
-                1
-            } else if let Ok(num) = arg.parse::<usize>() {
-                if num == 0 {
-                    app.messages.push(ChatMessage::Info(
-                        "Usage: /rewind [N] — undo the last N turns (default: 1)".into(),
-                    ));
-                    if was_at_bottom { app.scroll_offset = 0; }
-                    return;
-                }
-                num
-            } else {
-                1
-            };
 
-            let rewound = app.rewind_turns(n, input_tx);
-            if rewound == 0 {
+            // `/rewind N` — numeric shortcut, rewind N turns immediately.
+            if !arg.is_empty() {
+                let n = match arg.parse::<usize>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        app.messages.push(ChatMessage::Info(
+                            "Usage: /rewind [N] — pick a message to rewind to, or undo the last N turns".into(),
+                        ));
+                        if was_at_bottom { app.scroll_offset = 0; }
+                        return;
+                    }
+                };
+                apply_rewind(app, input_tx, session, n, RewindMode::UndoTurn);
+                if was_at_bottom { app.scroll_offset = 0; }
+                return;
+            }
+
+            // No argument — open a picker of user messages (oldest at top,
+            // newest at bottom, with the newest highlighted by default).
+            let user_texts: Vec<&str> = app
+                .messages
+                .iter()
+                .filter_map(|m| if let ChatMessage::User(t) = m { Some(t.as_str()) } else { None })
+                .collect();
+
+            if user_texts.is_empty() {
                 app.messages.push(ChatMessage::Info("Nothing to rewind.".into()));
             } else {
-                // Sync tree leaf to match the rewound position
-                session.rewind_leaf(rewound);
-                if rewound == 1 {
-                    app.messages.push(ChatMessage::Info("Rewound last turn.".into()));
-                } else {
-                    app.messages.push(ChatMessage::Info(
-                        format!("Rewound last {} turns.", rewound),
-                    ));
-                }
+                let total = user_texts.len();
+                let items: Vec<PickerItem> = user_texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, text)| {
+                        let first_line = text.lines().next().unwrap_or("").trim();
+                        let label = if first_line.is_empty() {
+                            "(empty message)".to_string()
+                        } else {
+                            crate::format::truncate_args(first_line, 60)
+                        };
+                        // Turn count = distance from the newest (bottom) row.
+                        let n = total - i;
+                        let hint = if n == 1 {
+                            "1 turn back".into()
+                        } else {
+                            format!("{} turns back", n)
+                        };
+                        PickerItem { label, hint }
+                    })
+                    .collect();
+
+                let mut picker = Picker::new("Rewind to message", items, PickerKind::Rewind);
+                picker.select_last();
+                app.picker = Some(picker);
             }
         }
         SlashCommand::Context => {
@@ -452,4 +479,26 @@ pub(super) fn handle_command(
 fn count_branches(node: &crate::session::TreeNode) -> usize {
     let here = if node.children.len() > 1 { 1 } else { 0 };
     here + node.children.iter().map(count_branches).sum::<usize>()
+}
+
+/// Shared rewind logic used by both `/rewind N` and the picker selection.
+pub(super) fn apply_rewind(
+    app: &mut App,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+    session: &mut crate::session::Session,
+    n: usize,
+    mode: RewindMode,
+) {
+    let rewound = app.rewind_turns(n, mode, input_tx);
+    if rewound == 0 {
+        app.messages.push(ChatMessage::Info("Nothing to rewind.".into()));
+    } else {
+        session.rewind_leaf(rewound, mode);
+        let msg = match (rewound, mode) {
+            (1, RewindMode::UndoTurn) => "Rewound last turn.".to_string(),
+            (n, RewindMode::UndoTurn) => format!("Rewound last {} turns.", n),
+            (_, RewindMode::RewindTo) => "Rewound to selected message.".to_string(),
+        };
+        app.messages.push(ChatMessage::Info(msg));
+    }
 }

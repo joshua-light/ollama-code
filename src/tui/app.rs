@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+use crate::agent::RewindMode;
 use crate::backend::ModelBackend;
 use crate::config::Config;
 use crate::format;
@@ -42,7 +43,7 @@ impl TextSelection {
 pub(crate) enum AgentInput {
     Message(String),
     ClearHistory,
-    Rewind(usize),
+    Rewind { turns: usize, mode: RewindMode },
     SetModel(String),
     SetContextSize(u64),
     SetBackend(Arc<dyn ModelBackend>),
@@ -465,9 +466,15 @@ impl App {
         self.needs_clear = true;
     }
 
-    /// Remove the last `n` user turns (user message + all subsequent non-user messages).
-    /// Returns how many turns were actually removed.
-    pub(crate) fn rewind_turns(&mut self, n: usize, input_tx: &mpsc::UnboundedSender<AgentInput>) -> usize {
+    /// Rewind the last `n` user turns. `UndoTurn` removes the nth-from-last user
+    /// message itself; `RewindTo` preserves it and removes only subsequent
+    /// messages. Returns how many turns were actually rewound.
+    pub(crate) fn rewind_turns(
+        &mut self,
+        n: usize,
+        mode: RewindMode,
+        input_tx: &mpsc::UnboundedSender<AgentInput>,
+    ) -> usize {
         let user_indices: Vec<usize> = self
             .messages
             .iter()
@@ -480,10 +487,14 @@ impl App {
         }
 
         let actual_n = n.min(user_indices.len());
-        let truncate_at = user_indices[user_indices.len() - actual_n];
+        let anchor = user_indices[user_indices.len() - actual_n];
+        let truncate_at = match mode {
+            RewindMode::RewindTo => anchor + 1,
+            RewindMode::UndoTurn => anchor,
+        };
         self.messages.truncate(truncate_at);
 
-        let _ = input_tx.send(AgentInput::Rewind(actual_n));
+        let _ = input_tx.send(AgentInput::Rewind { turns: actual_n, mode });
 
         self.scroll_offset = 0;
         actual_n

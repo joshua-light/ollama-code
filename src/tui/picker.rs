@@ -12,9 +12,11 @@ pub(crate) struct PickerItem {
     pub hint: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PickerKind {
     Model,
     Resume,
+    Rewind,
 }
 
 pub(crate) enum PickerResult {
@@ -53,6 +55,13 @@ impl Picker {
             filter_cursor: 0,
             scroll_offset: 0,
             kind,
+        }
+    }
+
+    /// Move the initial highlight to the last filtered row.
+    pub fn select_last(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected = self.filtered.len() - 1;
         }
     }
 

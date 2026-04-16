@@ -4,7 +4,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, RewindMode};
 use crate::config;
 use crate::message::{Message, Role};
 
@@ -190,11 +190,11 @@ impl Session {
     }
 
     /// Rewind the tree leaf by `n` user turns on the current branch path.
-    /// Walks backward from the leaf, counting User messages, and sets the
-    /// leaf to the entry just before the nth User message.
-    pub fn rewind_leaf(&mut self, n: usize) {
+    /// `UndoTurn` makes the anchor's parent the new leaf (removing the anchor
+    /// user message); `RewindTo` makes the anchor itself the new leaf so the
+    /// next turn branches from that user message.
+    pub fn rewind_leaf(&mut self, n: usize, mode: RewindMode) {
         let path = self.branch_path_indices();
-        // Find positions of user messages in the path
         let user_positions: Vec<usize> = path
             .iter()
             .enumerate()
@@ -207,13 +207,14 @@ impl Session {
         }
 
         let actual_n = n.min(user_positions.len());
-        let truncate_at = user_positions[user_positions.len() - actual_n];
+        let anchor = user_positions[user_positions.len() - actual_n];
+        let new_leaf_path_idx = match mode {
+            RewindMode::RewindTo => Some(anchor),
+            RewindMode::UndoTurn if anchor > 0 => Some(anchor - 1),
+            RewindMode::UndoTurn => None,
+        };
 
-        if truncate_at > 0 {
-            self.leaf = Some(self.entries[path[truncate_at - 1]].id.clone());
-        } else {
-            self.leaf = None;
-        }
+        self.leaf = new_leaf_path_idx.map(|i| self.entries[path[i]].id.clone());
         self.persist_meta();
     }
 
@@ -288,8 +289,24 @@ impl Session {
             }
         }
 
+        // System messages act as the invisible seed of the tree. Promote their
+        // children so the displayed root is the first user message.
         let root_indices = children_map.get(&None).cloned().unwrap_or_default();
-        root_indices
+        let effective_roots: Vec<usize> = root_indices
+            .iter()
+            .flat_map(|&i| {
+                if matches!(self.entries[i].message.role, Role::System) {
+                    children_map
+                        .get(&Some(self.entries[i].id.as_str()))
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    vec![i]
+                }
+            })
+            .collect();
+
+        effective_roots
             .iter()
             .map(|&i| build_node(&self.entries, &children_map, i))
             .collect()

@@ -284,14 +284,26 @@ fn handle_picker_key(
         PickerResult::Active => {}
         PickerResult::Selected(idx) => {
             let picker = app.picker.as_ref().unwrap();
+            let kind = picker.kind;
             let label = picker.item_label(idx).to_string();
-            let is_model = matches!(picker.kind, PickerKind::Model);
+            let total = picker.items.len();
             app.dismiss_picker();
 
-            if is_model {
-                handle_model_picked(app, label, input_tx);
-            } else {
-                handle_resume_picked(app, &label, input_tx, session);
+            match kind {
+                PickerKind::Model => handle_model_picked(app, label, input_tx),
+                PickerKind::Resume => handle_resume_picked(app, &label, input_tx, session),
+                PickerKind::Rewind => {
+                    // Picker items are oldest-first with the newest at the bottom,
+                    // so the number of turns to rewind is (total - idx).
+                    let turns = total.saturating_sub(idx);
+                    commands::apply_rewind(
+                        app,
+                        input_tx,
+                        session,
+                        turns,
+                        crate::agent::RewindMode::RewindTo,
+                    );
+                }
             }
         }
         PickerResult::FreeText(text) => {

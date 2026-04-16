@@ -97,7 +97,7 @@ Options:
 | `/model`   | Switch the active model                      |
 | `/new`     | Start a new conversation                     |
 | `/resume`  | List recent sessions                         |
-| `/rewind`  | Undo the last turn (or `/rewind N`)          |
+| `/rewind`  | Pick a message to rewind to (or `/rewind N`) |
 | `/session` | Show session log directory                   |
 | `/skills`  | List available skills                        |
 | `/stats`   | Show session statistics                      |

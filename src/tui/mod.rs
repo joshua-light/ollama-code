@@ -211,8 +211,8 @@ pub async fn run(agent: Agent, context_size: u64, mut session: Session, config: 
                     AgentInput::ClearHistory => {
                         agent.clear_history();
                     }
-                    AgentInput::Rewind(n) => {
-                        agent.rewind_turns(n);
+                    AgentInput::Rewind { turns, mode } => {
+                        agent.rewind_turns(turns, mode);
                     }
                     AgentInput::SetModel(model) => {
                         agent.set_model(model);

@@ -64,7 +64,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "/rewind",
-        description: "Undo the last turn (or /rewind N for N turns)",
+        description: "Pick a message to rewind to (or /rewind N for N turns)",
     },
     CommandInfo {
         name: "/session",

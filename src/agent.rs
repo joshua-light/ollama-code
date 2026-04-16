@@ -15,6 +15,15 @@ use crate::plugin::{self, ExternalTool};
 use crate::skills::{self, SkillMeta};
 use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SkillTool, SubagentToolDef, Tool, WriteTool, ToolRegistry};
 
+/// How `rewind_turns` / `rewind_leaf` treats the anchor user message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindMode {
+    /// Remove the anchor user message itself (undo that turn).
+    UndoTurn,
+    /// Preserve the anchor; drop only the messages after it.
+    RewindTo,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Token(String),
@@ -622,9 +631,10 @@ impl Agent {
         self.system_prompt_logged = true;
     }
 
-    /// Remove the last `n` user turns from the message history.
+    /// Rewind the last `n` user turns. `UndoTurn` removes the anchor user message
+    /// itself; `RewindTo` preserves the anchor and drops only subsequent messages.
     /// The system prompt (index 0) is always preserved.
-    pub fn rewind_turns(&mut self, n: usize) {
+    pub fn rewind_turns(&mut self, n: usize, mode: RewindMode) {
         let user_indices: Vec<usize> = self
             .messages
             .iter()
@@ -637,7 +647,11 @@ impl Agent {
         }
 
         let actual_n = n.min(user_indices.len());
-        let truncate_at = user_indices[user_indices.len() - actual_n];
+        let anchor = user_indices[user_indices.len() - actual_n];
+        let truncate_at = match mode {
+            RewindMode::RewindTo => anchor + 1,
+            RewindMode::UndoTurn => anchor,
+        };
         self.messages.truncate(truncate_at);
     }
 

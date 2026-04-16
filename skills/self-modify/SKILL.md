@@ -49,7 +49,7 @@ These are available in the TUI:
 - `/bypass` — Toggle auto-approve for all tool calls
 - `/clear` — Clear conversation history
 - `/new` — Start a fresh conversation (same as /clear)
-- `/rewind` — Undo the last turn, or `/rewind N` for N turns
+- `/rewind` — Pick a message to rewind to (or `/rewind N` for N turns)
 - `/session` — Show the current session log directory
 - `/resume` — List recent sessions (resume with `--resume <id>` on startup)
 
