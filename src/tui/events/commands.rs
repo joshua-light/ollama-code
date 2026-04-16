@@ -4,8 +4,11 @@ use tokio::sync::mpsc;
 use crate::agent::RewindMode;
 use crate::commands::SlashCommand;
 use crate::llama_server::ModelSource;
+use crate::session::Session;
 
-use super::super::app::{AgentInput, App, ChatMessage, ContextInfoData, PendingServerStart, PromptFill, StatsInfoData};
+use super::super::app::{
+    AgentInput, App, ChatMessage, ContextInfoData, PendingServerStart, PromptFill, StatsInfoData,
+};
 use super::super::picker::{Picker, PickerItem, PickerKind};
 use super::super::render::{format_number, pick_verb};
 use super::super::settings::SettingsPanel;
@@ -17,273 +20,21 @@ pub(super) fn handle_command(
     app: &mut App,
     input_tx: &mpsc::UnboundedSender<AgentInput>,
     model_tx: &mpsc::UnboundedSender<Result<Vec<String>>>,
-    session: &mut crate::session::Session,
+    session: &mut Session,
 ) {
     let was_at_bottom = app.is_at_bottom();
 
     match cmd {
-        SlashCommand::Bypass => {
-            app.auto_approve = !app.auto_approve;
-            let status = if app.auto_approve { "on" } else { "off" };
-            app.messages.push(ChatMessage::Info(format!(
-                "Bypass permissions {}.", status
-            )));
-        }
+        SlashCommand::Bypass => cmd_bypass(app),
         SlashCommand::Clear | SlashCommand::New => {
             app.reset_conversation(input_tx, "Conversation cleared.");
         }
-        SlashCommand::Rewind => {
-            let arg = raw_input.trim().strip_prefix("/rewind").unwrap_or("").trim();
-
-            // `/rewind N` — numeric shortcut, rewind N turns immediately.
-            if !arg.is_empty() {
-                let n = match arg.parse::<usize>() {
-                    Ok(n) if n > 0 => n,
-                    _ => {
-                        app.messages.push(ChatMessage::Info(
-                            "Usage: /rewind [N] — pick a message to rewind to, or undo the last N turns".into(),
-                        ));
-                        if was_at_bottom { app.scroll_offset = 0; }
-                        return;
-                    }
-                };
-                apply_rewind(app, input_tx, session, n, RewindMode::UndoTurn);
-                if was_at_bottom { app.scroll_offset = 0; }
-                return;
-            }
-
-            // No argument — open a picker of user messages (oldest at top,
-            // newest at bottom, with the newest highlighted by default).
-            let user_texts: Vec<&str> = app
-                .messages
-                .iter()
-                .filter_map(|m| if let ChatMessage::User(t) = m { Some(t.as_str()) } else { None })
-                .collect();
-
-            if user_texts.is_empty() {
-                app.messages.push(ChatMessage::Info("Nothing to rewind.".into()));
-            } else {
-                let total = user_texts.len();
-                let items: Vec<PickerItem> = user_texts
-                    .iter()
-                    .enumerate()
-                    .map(|(i, text)| {
-                        let first_line = text.lines().next().unwrap_or("").trim();
-                        let label = if first_line.is_empty() {
-                            "(empty message)".to_string()
-                        } else {
-                            crate::format::truncate_args(first_line, 60)
-                        };
-                        // Turn count = distance from the newest (bottom) row.
-                        let n = total - i;
-                        let hint = if n == 1 {
-                            "1 turn back".into()
-                        } else {
-                            format!("{} turns back", n)
-                        };
-                        PickerItem { label, hint }
-                    })
-                    .collect();
-
-                let mut picker = Picker::new("Rewind to message", items, PickerKind::Rewind);
-                picker.select_last();
-                app.picker = Some(picker);
-            }
-        }
-        SlashCommand::Context => {
-            // `/context <size>` — set context size for current model
-            let arg = raw_input.trim().strip_prefix("/context").unwrap_or("").trim();
-            if let Ok(new_size) = arg.parse::<u64>() {
-                let is_llama_cpp = app.config.backend.as_deref() == Some("llama-cpp");
-
-                app.context_size = new_size;
-                let _ = input_tx.send(AgentInput::SetContextSize(new_size));
-
-                // Save to config
-                let mut config = app.config.clone();
-                config.context_size = Some(new_size);
-                if let Err(e) = config.save() {
-                    app.messages.push(ChatMessage::Error(format!(
-                        "Warning: could not save config: {}", e
-                    )));
-                }
-                app.config = config;
-
-                if is_llama_cpp && app.config.llama_server_url.is_some() {
-                    // Remote server — can't restart it, just update the local parameter
-                    app.messages.push(ChatMessage::Info(format!(
-                        "Context size set to {} (local parameter). The remote server's actual context limit is controlled on the server side.",
-                        format_number(new_size)
-                    )));
-                } else if is_llama_cpp {
-                    // Restart llama-server with the new context size
-                    let model_source = if let Some(ref hf) = app.config.hf_repo {
-                        Some(ModelSource::HuggingFace(hf.clone()))
-                    } else if let Some(ref p) = app.config.model_path {
-                        let path = std::path::PathBuf::from(p);
-                        if path.exists() {
-                            Some(ModelSource::File(path))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let (Some(server_path), Some(model_source)) =
-                        (app.config.llama_server_path.clone(), model_source)
-                    {
-                        app.messages.push(ChatMessage::Info(format!(
-                            "Restarting llama-server with context {}...",
-                            format_number(new_size)
-                        )));
-                        app.begin_processing("Restarting server".to_string());
-
-                        let extra_args = app.config.llama_server_args.clone().unwrap_or_default();
-                        app.server.pending_server_start = Some(PendingServerStart {
-                            server_path,
-                            model_source,
-                            ctx: new_size,
-                            extra_args,
-                            model_name: app.model.clone(),
-                            sampling: crate::ollama::SamplingParams {
-                                temperature: app.config.temperature,
-                                top_p: app.config.top_p,
-                                top_k: app.config.top_k,
-                            },
-                            unload: None,
-                        });
-                        app.server.stop_llama_server = true;
-                    } else {
-                        app.messages.push(ChatMessage::Error(
-                            "Cannot restart llama-server: missing server path or model source.".into(),
-                        ));
-                    }
-                } else {
-                    app.messages.push(ChatMessage::Info(format!(
-                        "Context size set to {} for {}.",
-                        format_number(new_size),
-                        app.model
-                    )));
-                }
-            } else {
-                // No argument — show context info
-                let mut user_messages = 0u32;
-                let mut assistant_messages = 0u32;
-                let mut tool_calls = 0u32;
-
-                for msg in &app.messages {
-                    match msg {
-                        ChatMessage::User(_) => user_messages += 1,
-                        ChatMessage::Assistant(_) => assistant_messages += 1,
-                        ChatMessage::ToolCall { .. } => tool_calls += 1,
-                        _ => {}
-                    }
-                }
-
-                app.messages.push(ChatMessage::ContextInfo(ContextInfoData {
-                    context_used: app.context_used,
-                    context_size: app.context_size,
-                    user_messages,
-                    assistant_messages,
-                    tool_calls,
-                    base_prompt_tokens: app.stats.base_prompt_tokens,
-                    project_docs_tokens: app.stats.project_docs_tokens.clone(),
-                    skills_tokens: app.stats.skills_tokens,
-                    tool_defs_breakdown: app.stats.tool_defs_breakdown.clone(),
-                }));
-            }
-        }
-        SlashCommand::Help => {
-            let mut info = String::from("Commands:\n");
-            for cmd in crate::commands::COMMANDS {
-                info.push_str(&format!("  {:12} {}\n", cmd.name, cmd.description));
-            }
-            if !app.skills.is_empty() {
-                info.push_str("\nSkills:\n");
-                for skill in &app.skills {
-                    info.push_str(&format!("  {:12} {}\n", format!("/{}", skill.name), skill.description));
-                }
-            }
-            if !app.prompts.is_empty() {
-                info.push_str("\nPrompt templates:\n");
-                for prompt in &app.prompts {
-                    info.push_str(&format!("  {:12} {}\n", format!("/{}", prompt.name), prompt.description));
-                }
-            }
-            app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
-        }
-        SlashCommand::Mcp => {
-            match &app.config.mcp {
-                Some(servers) if !servers.is_empty() => {
-                    let mut info = String::new();
-                    for (name, cfg) in servers {
-                        let enabled = app.config.is_tool_enabled(name);
-                        let status = if enabled { "enabled" } else { "disabled" };
-                        let transport = if let Some(ref url) = cfg.url {
-                            format!("http: {}", url)
-                        } else {
-                            format!(
-                                "stdio: {} {}",
-                                cfg.command.as_deref().unwrap_or("?"),
-                                cfg.args.join(" ")
-                            )
-                        };
-                        info.push_str(&format!(
-                            "  {} ({}, {})\n",
-                            name, status, transport,
-                        ));
-                    }
-                    app.messages.push(ChatMessage::Info(format!(
-                        "MCP servers:\n{}",
-                        info.trim_end()
-                    )));
-                }
-                _ => {
-                    app.messages.push(ChatMessage::Info(
-                        "No MCP servers configured. Add [mcp.<name>] to your config.".into(),
-                    ));
-                }
-            }
-        }
-        SlashCommand::Model => {
-            app.messages.push(ChatMessage::Info("Fetching models...".into()));
-            let ollama = app.ollama.clone();
-            let tx = model_tx.clone();
-            tokio::spawn(async move {
-                let result = match ollama.list_models().await {
-                    Ok(models) => Ok(models.into_iter().map(|m| m.name).collect()),
-                    Err(e) => Err(e),
-                };
-                let _ = tx.send(result);
-            });
-        }
-        SlashCommand::Resume => {
-            match crate::session::Session::list_recent(10) {
-                Ok(sessions) if sessions.is_empty() => {
-                    app.messages.push(ChatMessage::Info("No previous sessions found.".into()));
-                }
-                Ok(sessions) => {
-                    let items: Vec<PickerItem> = sessions
-                        .iter()
-                        .map(|id| PickerItem {
-                            label: id.clone(),
-                            hint: if id == session.id() {
-                                "(current)".into()
-                            } else {
-                                String::new()
-                            },
-                        })
-                        .collect();
-                    app.picker = Some(Picker::new("Resume Session", items, PickerKind::Resume));
-                }
-                Err(e) => {
-                    app.messages.push(ChatMessage::Error(format!(
-                        "Failed to list sessions: {}", e
-                    )));
-                }
-            }
-        }
+        SlashCommand::Rewind => cmd_rewind(app, input_tx, session, raw_input, was_at_bottom),
+        SlashCommand::Context => cmd_context(app, input_tx, raw_input),
+        SlashCommand::Help => cmd_help(app),
+        SlashCommand::Mcp => cmd_mcp(app),
+        SlashCommand::Model => cmd_model(app, model_tx),
+        SlashCommand::Resume => cmd_resume(app, session),
         SlashCommand::Session => {
             app.messages.push(ChatMessage::Info(format!(
                 "Session: {}",
@@ -293,39 +44,8 @@ pub(super) fn handle_command(
         SlashCommand::Settings => {
             app.settings = Some(SettingsPanel::new(&app.config));
         }
-        SlashCommand::Skills => {
-            if app.skills.is_empty() {
-                app.messages.push(ChatMessage::Info(
-                    "No skills found. Add SKILL.md files to .agents/skills/<name>/ or ~/.config/ollama-code/skills/<name>/.".into(),
-                ));
-            } else {
-                let mut info = String::from("Skills:\n");
-                for skill in &app.skills {
-                    info.push_str(&format!("  /{}: {}\n    {}\n", skill.name, skill.description, skill.dir.display()));
-                }
-                app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
-            }
-        }
-        SlashCommand::Prompts => {
-            if app.prompts.is_empty() {
-                app.messages.push(ChatMessage::Info(
-                    "No prompt templates found. Add .md files to .agents/prompts/ or ~/.config/ollama-code/prompts/.".into(),
-                ));
-            } else {
-                let mut info = String::from("Prompt templates:\n");
-                for prompt in &app.prompts {
-                    let vars = prompt.variables();
-                    let var_names: Vec<&str> = vars.iter().map(|v| v.name.as_str()).collect();
-                    if var_names.is_empty() {
-                        info.push_str(&format!("  /{}: {}\n", prompt.name, prompt.description));
-                    } else {
-                        info.push_str(&format!("  /{}: {} ({})\n", prompt.name, prompt.description, var_names.join(", ")));
-                    }
-                    info.push_str(&format!("    {}\n", prompt.path.display()));
-                }
-                app.messages.push(ChatMessage::Info(info.trim_end().to_string()));
-            }
-        }
+        SlashCommand::Skills => cmd_skills(app),
+        SlashCommand::Prompts => cmd_prompts(app),
         SlashCommand::SystemPrompt => {
             app.messages.push(ChatMessage::Info(format!(
                 "System prompt ({} chars):\n\n{}",
@@ -333,138 +53,10 @@ pub(super) fn handle_command(
                 app.system_prompt
             )));
         }
-        SlashCommand::Stats => {
-            let mut breakdown: Vec<(String, usize)> = app.stats.tool_call_breakdown
-                .iter()
-                .map(|(k, v)| (k.clone(), *v))
-                .collect();
-            breakdown.sort_by(|a, b| b.1.cmp(&a.1));
-            app.messages.push(ChatMessage::StatsInfo(StatsInfoData {
-                session_duration: app.stats.session_start.elapsed(),
-                agent_turns: app.stats.agent_turns,
-                tool_call_count: app.stats.tool_call_count,
-                failed_tool_call_count: app.stats.failed_tool_call_count,
-                tool_call_breakdown: breakdown,
-                input_tokens: app.stats.input_tokens,
-                output_tokens: app.stats.output_tokens,
-                context_trims: app.stats.context_trims,
-                model: app.model.clone(),
-            }));
-        }
-        SlashCommand::Tree => {
-            if app.is_processing {
-                app.messages.push(ChatMessage::Info("Cannot browse tree while processing.".into()));
-            } else {
-                let tree = session.get_tree();
-                if tree.is_empty() {
-                    app.messages.push(ChatMessage::Info("No conversation history.".into()));
-                } else if tree.iter().all(|n| count_branches(n) == 0) {
-                    app.messages.push(ChatMessage::Info(
-                        "No branches yet. Use /rewind and send a new message to create a branch.".into(),
-                    ));
-                } else {
-                    let active_path = session.active_path_ids();
-                    app.tree_browser = Some(TreeBrowser::new(tree, session.leaf_id(), active_path));
-                }
-            }
-        }
-        SlashCommand::Reload => {
-            if app.is_processing {
-                app.messages.push(ChatMessage::Info(
-                    "Cannot reload while the model is processing.".into(),
-                ));
-            } else {
-                match crate::config::Config::load() {
-                    Ok(new_config) => {
-                        // Update TUI-side state
-                        let cwd = std::env::current_dir()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| ".".to_string());
-                        app.skills = crate::skills::discover_skills(&cwd);
-
-                        // Propagate bypass/no_confirm changes
-                        let no_confirm = new_config.no_confirm.unwrap_or(false);
-                        let bypass = new_config.bypass.unwrap_or(false);
-                        app.auto_approve = no_confirm || bypass;
-
-                        // Re-discover prompt templates
-                        app.prompts = crate::prompts::discover_prompts(&cwd);
-
-                        app.config = new_config.clone();
-                        let _ = input_tx.send(AgentInput::Reload(Box::new(new_config)));
-                        app.messages.push(ChatMessage::Info("Reloading...".into()));
-                    }
-                    Err(e) => {
-                        app.messages.push(ChatMessage::Error(format!(
-                            "Failed to reload config: {}", e
-                        )));
-                    }
-                }
-            }
-        }
-        SlashCommand::Unknown(name) => {
-            let skill_name = name.trim_start_matches('/');
-            if let Some(skill) = app.skills.iter().find(|s| s.name == skill_name) {
-                match skill.load_instructions() {
-                    Ok(instructions) => {
-                        // Extract user args after the command name
-                        let args = raw_input
-                            .trim()
-                            .strip_prefix(&name)
-                            .unwrap_or("")
-                            .trim();
-
-                        // Show skill load indicator
-                        app.messages.push(ChatMessage::SkillLoad {
-                            name: skill_name.to_string(),
-                        });
-
-                        // Build the prompt: instructions + optional user args
-                        let prompt = if args.is_empty() {
-                            instructions
-                        } else {
-                            format!("{}\n\nUser input: {}", instructions, args)
-                        };
-
-                        app.begin_processing(pick_verb());
-                        let _ = input_tx.send(AgentInput::Message(prompt));
-                    }
-                    Err(e) => {
-                        app.messages.push(ChatMessage::Error(format!(
-                            "Failed to load skill '{}': {}",
-                            skill_name, e
-                        )));
-                    }
-                }
-            } else if let Some(template) = app.prompts.iter().find(|p| p.name == skill_name).cloned() {
-                let variables = template.variables();
-                if variables.is_empty() {
-                    // No variables — send immediately
-                    app.messages.push(ChatMessage::SkillLoad {
-                        name: format!("prompt:{}", template.name),
-                    });
-                    app.begin_processing(pick_verb());
-                    let _ = input_tx.send(AgentInput::Message(template.body.clone()));
-                } else {
-                    // Enter variable fill mode
-                    app.messages.push(ChatMessage::Info(format!(
-                        "Filling prompt template '{}' ({} variable{})...",
-                        template.name,
-                        variables.len(),
-                        if variables.len() == 1 { "" } else { "s" },
-                    )));
-                    app.pending_prompt = Some(PromptFill {
-                        template,
-                        variables,
-                        current: 0,
-                        values: std::collections::HashMap::new(),
-                    });
-                }
-            } else {
-                app.messages
-                    .push(ChatMessage::Info(format!("Unknown command: {}", name)));
-            }
-        }
+        SlashCommand::Stats => cmd_stats(app),
+        SlashCommand::Tree => cmd_tree(app, session),
+        SlashCommand::Reload => cmd_reload(app, input_tx),
+        SlashCommand::Unknown(name) => cmd_unknown(app, input_tx, raw_input, &name),
     }
 
     app.input.clear();
@@ -475,23 +67,107 @@ pub(super) fn handle_command(
     }
 }
 
-/// Count branch points (nodes with >1 child) in a tree.
-fn count_branches(node: &crate::session::TreeNode) -> usize {
-    let here = if node.children.len() > 1 { 1 } else { 0 };
-    here + node.children.iter().map(count_branches).sum::<usize>()
+// ─── /bypass ──────────────────────────────────────────────────────────────
+
+fn cmd_bypass(app: &mut App) {
+    app.auto_approve = !app.auto_approve;
+    let status = if app.auto_approve { "on" } else { "off" };
+    app.messages.push(ChatMessage::Info(format!(
+        "Bypass permissions {}.",
+        status
+    )));
+}
+
+// ─── /rewind ──────────────────────────────────────────────────────────────
+
+fn cmd_rewind(
+    app: &mut App,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+    session: &mut Session,
+    raw_input: &str,
+    was_at_bottom: bool,
+) {
+    let arg = raw_input.trim().strip_prefix("/rewind").unwrap_or("").trim();
+
+    // `/rewind N` — numeric shortcut, rewind N turns immediately.
+    if !arg.is_empty() {
+        let n = match arg.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                app.messages.push(ChatMessage::Info(
+                    "Usage: /rewind [N] — pick a message to rewind to, or undo the last N turns"
+                        .into(),
+                ));
+                if was_at_bottom {
+                    app.scroll_offset = 0;
+                }
+                return;
+            }
+        };
+        apply_rewind(app, input_tx, session, n, RewindMode::UndoTurn);
+        if was_at_bottom {
+            app.scroll_offset = 0;
+        }
+        return;
+    }
+
+    // No argument — open a picker of user messages (oldest at top, newest at bottom).
+    let user_texts: Vec<&str> = app
+        .messages
+        .iter()
+        .filter_map(|m| {
+            if let ChatMessage::User(t) = m {
+                Some(t.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if user_texts.is_empty() {
+        app.messages
+            .push(ChatMessage::Info("Nothing to rewind.".into()));
+        return;
+    }
+
+    let total = user_texts.len();
+    let items: Vec<PickerItem> = user_texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let first_line = text.lines().next().unwrap_or("").trim();
+            let label = if first_line.is_empty() {
+                "(empty message)".to_string()
+            } else {
+                crate::format::truncate_args(first_line, 60)
+            };
+            let n = total - i;
+            let hint = if n == 1 {
+                "1 turn back".into()
+            } else {
+                format!("{} turns back", n)
+            };
+            PickerItem { label, hint }
+        })
+        .collect();
+
+    let mut picker = Picker::new("Rewind to message", items, PickerKind::Rewind);
+    picker.select_last();
+    app.picker = Some(picker);
 }
 
 /// Shared rewind logic used by both `/rewind N` and the picker selection.
 pub(super) fn apply_rewind(
     app: &mut App,
     input_tx: &mpsc::UnboundedSender<AgentInput>,
-    session: &mut crate::session::Session,
+    session: &mut Session,
     n: usize,
     mode: RewindMode,
 ) {
     let rewound = app.rewind_turns(n, mode, input_tx);
     if rewound == 0 {
-        app.messages.push(ChatMessage::Info("Nothing to rewind.".into()));
+        app.messages
+            .push(ChatMessage::Info("Nothing to rewind.".into()));
     } else {
         session.rewind_leaf(rewound, mode);
         let msg = match (rewound, mode) {
@@ -501,4 +177,466 @@ pub(super) fn apply_rewind(
         };
         app.messages.push(ChatMessage::Info(msg));
     }
+}
+
+// ─── /context ─────────────────────────────────────────────────────────────
+
+fn cmd_context(
+    app: &mut App,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+    raw_input: &str,
+) {
+    let arg = raw_input.trim().strip_prefix("/context").unwrap_or("").trim();
+    let Ok(new_size) = arg.parse::<u64>() else {
+        // No argument — show context info
+        show_context_info(app);
+        return;
+    };
+
+    let is_llama_cpp = app.config.backend.as_deref() == Some("llama-cpp");
+
+    app.context_size = new_size;
+    let _ = input_tx.send(AgentInput::SetContextSize(new_size));
+
+    let mut config = app.config.clone();
+    config.context_size = Some(new_size);
+    if let Err(e) = config.save() {
+        app.messages.push(ChatMessage::Error(format!(
+            "Warning: could not save config: {}",
+            e
+        )));
+    }
+    app.config = config;
+
+    if is_llama_cpp && app.config.llama_server_url.is_some() {
+        // Remote server — can't restart it, just update the local parameter
+        app.messages.push(ChatMessage::Info(format!(
+            "Context size set to {} (local parameter). The remote server's actual context limit is controlled on the server side.",
+            format_number(new_size)
+        )));
+    } else if is_llama_cpp {
+        restart_llama_server(app, new_size);
+    } else {
+        app.messages.push(ChatMessage::Info(format!(
+            "Context size set to {} for {}.",
+            format_number(new_size),
+            app.model
+        )));
+    }
+}
+
+fn restart_llama_server(app: &mut App, new_size: u64) {
+    let model_source = if let Some(ref hf) = app.config.hf_repo {
+        Some(ModelSource::HuggingFace(hf.clone()))
+    } else if let Some(ref p) = app.config.model_path {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            Some(ModelSource::File(path))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let (Some(server_path), Some(model_source)) =
+        (app.config.llama_server_path.clone(), model_source)
+    else {
+        app.messages.push(ChatMessage::Error(
+            "Cannot restart llama-server: missing server path or model source.".into(),
+        ));
+        return;
+    };
+
+    app.messages.push(ChatMessage::Info(format!(
+        "Restarting llama-server with context {}...",
+        format_number(new_size)
+    )));
+    app.begin_processing("Restarting server".to_string());
+
+    let extra_args = app.config.llama_server_args.clone().unwrap_or_default();
+    app.server.pending_server_start = Some(PendingServerStart {
+        server_path,
+        model_source,
+        ctx: new_size,
+        extra_args,
+        model_name: app.model.clone(),
+        sampling: crate::ollama::SamplingParams {
+            temperature: app.config.temperature,
+            top_p: app.config.top_p,
+            top_k: app.config.top_k,
+        },
+        unload: None,
+    });
+    app.server.stop_llama_server = true;
+}
+
+fn show_context_info(app: &mut App) {
+    let mut user_messages = 0u32;
+    let mut assistant_messages = 0u32;
+    let mut tool_calls = 0u32;
+
+    for msg in &app.messages {
+        match msg {
+            ChatMessage::User(_) => user_messages += 1,
+            ChatMessage::Assistant(_) => assistant_messages += 1,
+            ChatMessage::ToolCall { .. } => tool_calls += 1,
+            _ => {}
+        }
+    }
+
+    app.messages.push(ChatMessage::ContextInfo(ContextInfoData {
+        context_used: app.context_used,
+        context_size: app.context_size,
+        user_messages,
+        assistant_messages,
+        tool_calls,
+        base_prompt_tokens: app.stats.base_prompt_tokens,
+        project_docs_tokens: app.stats.project_docs_tokens.clone(),
+        skills_tokens: app.stats.skills_tokens,
+        tool_defs_breakdown: app.stats.tool_defs_breakdown.clone(),
+    }));
+}
+
+// ─── /help ────────────────────────────────────────────────────────────────
+
+fn cmd_help(app: &mut App) {
+    let mut info = String::from("Commands:\n");
+    for cmd in crate::commands::COMMANDS {
+        info.push_str(&format!("  {:12} {}\n", cmd.name, cmd.description));
+    }
+    if !app.skills.is_empty() {
+        info.push_str("\nSkills:\n");
+        for skill in &app.skills {
+            info.push_str(&format!(
+                "  {:12} {}\n",
+                format!("/{}", skill.name),
+                skill.description
+            ));
+        }
+    }
+    if !app.prompts.is_empty() {
+        info.push_str("\nPrompt templates:\n");
+        for prompt in &app.prompts {
+            info.push_str(&format!(
+                "  {:12} {}\n",
+                format!("/{}", prompt.name),
+                prompt.description
+            ));
+        }
+    }
+    app.messages
+        .push(ChatMessage::Info(info.trim_end().to_string()));
+}
+
+// ─── /mcp ─────────────────────────────────────────────────────────────────
+
+fn cmd_mcp(app: &mut App) {
+    match &app.config.mcp {
+        Some(servers) if !servers.is_empty() => {
+            let mut info = String::new();
+            for (name, cfg) in servers {
+                let enabled = app.config.is_tool_enabled(name);
+                let status = if enabled { "enabled" } else { "disabled" };
+                let transport = if let Some(ref url) = cfg.url {
+                    format!("http: {}", url)
+                } else {
+                    format!(
+                        "stdio: {} {}",
+                        cfg.command.as_deref().unwrap_or("?"),
+                        cfg.args.join(" ")
+                    )
+                };
+                info.push_str(&format!("  {} ({}, {})\n", name, status, transport));
+            }
+            app.messages.push(ChatMessage::Info(format!(
+                "MCP servers:\n{}",
+                info.trim_end()
+            )));
+        }
+        _ => {
+            app.messages.push(ChatMessage::Info(
+                "No MCP servers configured. Add [mcp.<name>] to your config.".into(),
+            ));
+        }
+    }
+}
+
+// ─── /model ───────────────────────────────────────────────────────────────
+
+fn cmd_model(app: &mut App, model_tx: &mpsc::UnboundedSender<Result<Vec<String>>>) {
+    app.messages
+        .push(ChatMessage::Info("Fetching models...".into()));
+    let ollama = app.ollama.clone();
+    let tx = model_tx.clone();
+    tokio::spawn(async move {
+        let result = match ollama.list_models().await {
+            Ok(models) => Ok(models.into_iter().map(|m| m.name).collect()),
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(result);
+    });
+}
+
+// ─── /resume ──────────────────────────────────────────────────────────────
+
+fn cmd_resume(app: &mut App, session: &Session) {
+    match Session::list_recent(10) {
+        Ok(sessions) if sessions.is_empty() => {
+            app.messages
+                .push(ChatMessage::Info("No previous sessions found.".into()));
+        }
+        Ok(sessions) => {
+            let items: Vec<PickerItem> = sessions
+                .iter()
+                .map(|id| PickerItem {
+                    label: id.clone(),
+                    hint: if id == session.id() {
+                        "(current)".into()
+                    } else {
+                        String::new()
+                    },
+                })
+                .collect();
+            app.picker = Some(Picker::new("Resume Session", items, PickerKind::Resume));
+        }
+        Err(e) => {
+            app.messages.push(ChatMessage::Error(format!(
+                "Failed to list sessions: {}",
+                e
+            )));
+        }
+    }
+}
+
+// ─── /skills ──────────────────────────────────────────────────────────────
+
+fn cmd_skills(app: &mut App) {
+    if app.skills.is_empty() {
+        app.messages.push(ChatMessage::Info(
+            "No skills found. Add SKILL.md files to .agents/skills/<name>/ or ~/.config/ollama-code/skills/<name>/.".into(),
+        ));
+        return;
+    }
+    let mut info = String::from("Skills:\n");
+    for skill in &app.skills {
+        info.push_str(&format!(
+            "  /{}: {}\n    {}\n",
+            skill.name,
+            skill.description,
+            skill.dir.display()
+        ));
+    }
+    app.messages
+        .push(ChatMessage::Info(info.trim_end().to_string()));
+}
+
+// ─── /prompts ─────────────────────────────────────────────────────────────
+
+fn cmd_prompts(app: &mut App) {
+    if app.prompts.is_empty() {
+        app.messages.push(ChatMessage::Info(
+            "No prompt templates found. Add .md files to .agents/prompts/ or ~/.config/ollama-code/prompts/.".into(),
+        ));
+        return;
+    }
+    let mut info = String::from("Prompt templates:\n");
+    for prompt in &app.prompts {
+        let vars = prompt.variables();
+        let var_names: Vec<&str> = vars.iter().map(|v| v.name.as_str()).collect();
+        if var_names.is_empty() {
+            info.push_str(&format!("  /{}: {}\n", prompt.name, prompt.description));
+        } else {
+            info.push_str(&format!(
+                "  /{}: {} ({})\n",
+                prompt.name,
+                prompt.description,
+                var_names.join(", ")
+            ));
+        }
+        info.push_str(&format!("    {}\n", prompt.path.display()));
+    }
+    app.messages
+        .push(ChatMessage::Info(info.trim_end().to_string()));
+}
+
+// ─── /stats ───────────────────────────────────────────────────────────────
+
+fn cmd_stats(app: &mut App) {
+    let mut breakdown: Vec<(String, usize)> = app
+        .stats
+        .tool_call_breakdown
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+    app.messages.push(ChatMessage::StatsInfo(StatsInfoData {
+        session_duration: app.stats.session_start.elapsed(),
+        agent_turns: app.stats.agent_turns,
+        tool_call_count: app.stats.tool_call_count,
+        failed_tool_call_count: app.stats.failed_tool_call_count,
+        tool_call_breakdown: breakdown,
+        input_tokens: app.stats.input_tokens,
+        output_tokens: app.stats.output_tokens,
+        context_trims: app.stats.context_trims,
+        model: app.model.clone(),
+    }));
+}
+
+// ─── /tree ────────────────────────────────────────────────────────────────
+
+fn cmd_tree(app: &mut App, session: &Session) {
+    if app.is_processing {
+        app.messages.push(ChatMessage::Info(
+            "Cannot browse tree while processing.".into(),
+        ));
+        return;
+    }
+
+    let tree = session.get_tree();
+    if tree.is_empty() {
+        app.messages
+            .push(ChatMessage::Info("No conversation history.".into()));
+    } else if tree.iter().all(|n| count_branches(n) == 0) {
+        app.messages.push(ChatMessage::Info(
+            "No branches yet. Use /rewind and send a new message to create a branch.".into(),
+        ));
+    } else {
+        let active_path = session.active_path_ids();
+        app.tree_browser = Some(TreeBrowser::new(tree, session.leaf_id(), active_path));
+    }
+}
+
+// ─── /reload ──────────────────────────────────────────────────────────────
+
+fn cmd_reload(app: &mut App, input_tx: &mpsc::UnboundedSender<AgentInput>) {
+    if app.is_processing {
+        app.messages.push(ChatMessage::Info(
+            "Cannot reload while the model is processing.".into(),
+        ));
+        return;
+    }
+
+    match crate::config::Config::load() {
+        Ok(new_config) => {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string());
+            app.skills = crate::skills::discover_skills(&cwd);
+
+            let no_confirm = new_config.no_confirm.unwrap_or(false);
+            let bypass = new_config.bypass.unwrap_or(false);
+            app.auto_approve = no_confirm || bypass;
+
+            app.prompts = crate::prompts::discover_prompts(&cwd);
+
+            app.config = new_config.clone();
+            let _ = input_tx.send(AgentInput::Reload(Box::new(new_config)));
+            app.messages
+                .push(ChatMessage::Info("Reloading...".into()));
+        }
+        Err(e) => {
+            app.messages.push(ChatMessage::Error(format!(
+                "Failed to reload config: {}",
+                e
+            )));
+        }
+    }
+}
+
+// ─── Unknown (skill / prompt dispatch) ────────────────────────────────────
+
+fn cmd_unknown(
+    app: &mut App,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+    raw_input: &str,
+    name: &str,
+) {
+    let skill_name = name.trim_start_matches('/');
+
+    if let Some(skill) = app.skills.iter().find(|s| s.name == skill_name) {
+        run_skill(app, input_tx, raw_input, name, skill_name, skill.clone());
+        return;
+    }
+
+    if let Some(template) = app
+        .prompts
+        .iter()
+        .find(|p| p.name == skill_name)
+        .cloned()
+    {
+        run_prompt_template(app, input_tx, template);
+        return;
+    }
+
+    app.messages
+        .push(ChatMessage::Info(format!("Unknown command: {}", name)));
+}
+
+fn run_skill(
+    app: &mut App,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+    raw_input: &str,
+    name: &str,
+    skill_name: &str,
+    skill: crate::skills::SkillMeta,
+) {
+    match skill.load_instructions() {
+        Ok(instructions) => {
+            let args = raw_input.trim().strip_prefix(name).unwrap_or("").trim();
+
+            app.messages.push(ChatMessage::SkillLoad {
+                name: skill_name.to_string(),
+            });
+
+            let prompt = if args.is_empty() {
+                instructions
+            } else {
+                format!("{}\n\nUser input: {}", instructions, args)
+            };
+
+            app.begin_processing(pick_verb());
+            let _ = input_tx.send(AgentInput::Message(prompt));
+        }
+        Err(e) => {
+            app.messages.push(ChatMessage::Error(format!(
+                "Failed to load skill '{}': {}",
+                skill_name, e
+            )));
+        }
+    }
+}
+
+fn run_prompt_template(
+    app: &mut App,
+    input_tx: &mpsc::UnboundedSender<AgentInput>,
+    template: crate::prompts::PromptTemplate,
+) {
+    let variables = template.variables();
+    if variables.is_empty() {
+        app.messages.push(ChatMessage::SkillLoad {
+            name: format!("prompt:{}", template.name),
+        });
+        app.begin_processing(pick_verb());
+        let _ = input_tx.send(AgentInput::Message(template.body.clone()));
+    } else {
+        app.messages.push(ChatMessage::Info(format!(
+            "Filling prompt template '{}' ({} variable{})...",
+            template.name,
+            variables.len(),
+            if variables.len() == 1 { "" } else { "s" },
+        )));
+        app.pending_prompt = Some(PromptFill {
+            template,
+            variables,
+            current: 0,
+            values: std::collections::HashMap::new(),
+        });
+    }
+}
+
+/// Count branch points (nodes with >1 child) in a tree.
+fn count_branches(node: &crate::session::TreeNode) -> usize {
+    let here = if node.children.len() > 1 { 1 } else { 0 };
+    here + node.children.iter().map(count_branches).sum::<usize>()
 }
