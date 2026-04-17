@@ -384,6 +384,275 @@ impl Agent {
         Ok(())
     }
 
+    /// Emit `MessageLogged` for the system prompt and a `SystemPromptInfo`
+    /// event with a per-category token breakdown. No-op after the first call.
+    fn emit_system_prompt_info_once(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<()> {
+        if self.system_prompt_logged {
+            return Ok(());
+        }
+        if let Some(sys_msg) = self.messages.first() {
+            send_event(events, AgentEvent::MessageLogged(sys_msg.clone()))?;
+        }
+
+        const BUILTIN_TOOLS: &[&str] = &[
+            "bash", "read", "edit", "write", "glob", "grep", "subagent", "skill",
+        ];
+        let mut builtin_chars: usize = 0;
+        let mut plugin_chars: usize = 0;
+        let mut mcp_chars: Vec<(String, usize)> = Vec::new();
+
+        for def in self.tools.definitions() {
+            let chars = def.to_string().len();
+            let name = def["function"]["name"].as_str().unwrap_or("");
+
+            if name.starts_with("mcp__") {
+                let server = name
+                    .strip_prefix("mcp__")
+                    .and_then(|rest| rest.split("__").next())
+                    .unwrap_or("unknown");
+                if let Some(entry) = mcp_chars.iter_mut().find(|(s, _)| s == server) {
+                    entry.1 += chars;
+                } else {
+                    mcp_chars.push((server.to_string(), chars));
+                }
+            } else if BUILTIN_TOOLS.contains(&name) {
+                builtin_chars += chars;
+            } else {
+                plugin_chars += chars;
+            }
+        }
+
+        let mut tool_defs_breakdown: Vec<(String, u64)> = Vec::new();
+        if builtin_chars > 0 {
+            tool_defs_breakdown
+                .push(("Built-in".to_string(), message::estimate_tokens(builtin_chars)));
+        }
+        for (server, chars) in &mcp_chars {
+            tool_defs_breakdown
+                .push((format!("MCP: {}", server), message::estimate_tokens(*chars)));
+        }
+        if plugin_chars > 0 {
+            tool_defs_breakdown
+                .push(("Plugins".to_string(), message::estimate_tokens(plugin_chars)));
+        }
+
+        send_event(
+            events,
+            AgentEvent::SystemPromptInfo {
+                base_prompt_tokens: message::estimate_tokens(self.system_prompt_base_len),
+                project_docs: self
+                    .project_docs_info
+                    .iter()
+                    .map(|(name, len)| (name.clone(), message::estimate_tokens(*len)))
+                    .collect(),
+                skills_tokens: message::estimate_tokens(self.skills_summary_len),
+                tool_defs_breakdown,
+            },
+        )?;
+        self.system_prompt_logged = true;
+        Ok(())
+    }
+
+    /// Emit a `Debug` event describing backend timings for the last response.
+    fn emit_response_metrics(
+        &self,
+        response: &crate::backend::ChatResponse,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<()> {
+        let ns_to_ms = |ns: u64| -> f64 { ns as f64 / 1_000_000.0 };
+        let prompt_tps = if response.prompt_eval_duration > 0 {
+            response.prompt_eval_count as f64 / (response.prompt_eval_duration as f64 / 1e9)
+        } else {
+            0.0
+        };
+        let gen_tps = if response.eval_duration > 0 {
+            response.eval_count as f64 / (response.eval_duration as f64 / 1e9)
+        } else {
+            0.0
+        };
+        send_event(
+            events,
+            AgentEvent::Debug(format!(
+                "OLLAMA_RESPONSE content_len={} tool_calls={} prompt_eval={} incomplete={} \
+                 | load={:.0}ms prompt={:.0}ms ({:.1} t/s) gen={:.0}ms/{} tokens ({:.1} t/s) total={:.0}ms",
+                response.content.len(),
+                response.tool_calls.len(),
+                response.prompt_eval_count,
+                response.incomplete,
+                ns_to_ms(response.load_duration),
+                ns_to_ms(response.prompt_eval_duration),
+                prompt_tps,
+                ns_to_ms(response.eval_duration),
+                response.eval_count,
+                gen_tps,
+                ns_to_ms(response.total_duration),
+            )),
+        )
+    }
+
+    /// Apply context trim/compact policy and emit the corresponding event.
+    async fn apply_context_management(
+        &mut self,
+        current_prompt_tokens: u64,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &AtomicBool,
+        num_ctx: Option<u64>,
+    ) -> Result<()> {
+        if self.context.compaction_enabled {
+            match self
+                .context
+                .compact(
+                    &mut self.messages,
+                    self.context_size,
+                    current_prompt_tokens,
+                    &*self.backend,
+                    &self.model,
+                    events,
+                    cancel,
+                    num_ctx,
+                )
+                .await
+            {
+                Some((removed, freed, summary_tokens)) => {
+                    send_event(
+                        events,
+                        AgentEvent::ContextCompacted {
+                            removed_messages: removed,
+                            summary_tokens,
+                            estimated_tokens_freed: freed,
+                        },
+                    )?;
+                    return Ok(());
+                }
+                None => {
+                    // Below threshold or compaction failed — fall through to blind trim.
+                }
+            }
+        }
+        if let Some((removed, freed)) = self.context.trim(
+            &mut self.messages,
+            self.context_size,
+            current_prompt_tokens,
+        ) {
+            send_event(
+                events,
+                AgentEvent::ContextTrimmed {
+                    removed_messages: removed,
+                    estimated_tokens_freed: freed,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// If the context window is exhausted, log any partial content, emit
+    /// Error + Done events, and return true so the caller stops the loop.
+    fn handle_context_exhausted(
+        &mut self,
+        response: &crate::backend::ChatResponse,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<bool> {
+        if self.context_size == 0 || response.prompt_eval_count == 0 {
+            return Ok(false);
+        }
+        let total = response.prompt_eval_count + response.eval_count;
+        let context_full = total >= self.context_size;
+        // If tool calls are pending, also check if prompt alone is >90% of
+        // context — tool results will push us over on the next iteration.
+        let context_nearly_full = !response.tool_calls.is_empty()
+            && response.prompt_eval_count > self.context_size * 90 / 100;
+
+        if !(context_full || context_nearly_full) {
+            return Ok(false);
+        }
+
+        if !response.content.trim().is_empty() {
+            let assistant_msg = Message::assistant(&response.content);
+            self.messages.push(assistant_msg.clone());
+            send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
+        }
+        send_event(
+            events,
+            AgentEvent::Error(
+                "Context window is full — the model can no longer process this \
+                 conversation. Use /clear to start fresh."
+                    .to_string(),
+            ),
+        )?;
+        send_event(
+            events,
+            AgentEvent::Done {
+                prompt_tokens: response.prompt_eval_count,
+                eval_count: response.eval_count,
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Append synthetic "Cancelled by user" tool results for each remaining
+    /// tool call. Keeps the message history consistent so the model doesn't
+    /// see orphan tool-call requests on the next run.
+    fn backfill_cancelled_tool_results(
+        &mut self,
+        remaining: &[crate::message::ToolCall],
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<()> {
+        const CANCELLED: &str = "Cancelled by user.";
+        for tc in remaining {
+            send_event(
+                events,
+                AgentEvent::ToolResult {
+                    name: tc.function.name.clone(),
+                    output: CANCELLED.to_string(),
+                    success: false,
+                },
+            )?;
+            let tool_msg = Message::tool(CANCELLED, tc.id.clone(), false);
+            self.messages.push(tool_msg.clone());
+            send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+        }
+        Ok(())
+    }
+
+    /// Run `cargo check` after an edit/write tool succeeded this turn and
+    /// inject the diagnostics as a system message if there are errors or
+    /// warnings. No-op if no edits happened or there's no Cargo.toml.
+    async fn run_post_edit_cargo_check(&mut self) {
+        if !self.had_edits_this_run || !std::path::Path::new("Cargo.toml").exists() {
+            return;
+        }
+        self.had_edits_this_run = false;
+
+        let Ok(output) = tokio::process::Command::new("cargo")
+            .args(["check", "--message-format=short"])
+            .output()
+            .await
+        else {
+            return;
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let has_errors = stderr.contains("error[");
+        let has_warnings = stderr.contains("warning:");
+        if !(has_errors || has_warnings) {
+            return;
+        }
+        let label = if has_errors { "errors" } else { "warnings" };
+        let check_msg = format!(
+            "[Auto cargo check detected {}]\n{}",
+            label,
+            stderr
+                .lines()
+                .filter(|l| l.contains("error") || l.contains("warning"))
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        self.messages.push(Message::system(&check_msg));
+    }
+
     pub async fn run(
         &mut self,
         user_input: &str,
@@ -392,60 +661,7 @@ impl Agent {
         steer_rx: &mut mpsc::UnboundedReceiver<String>,
         cancel: Arc<AtomicBool>,
     ) -> Result<()> {
-        if !self.system_prompt_logged {
-            if let Some(sys_msg) = self.messages.first() {
-                send_event(events, AgentEvent::MessageLogged(sys_msg.clone()))?;
-            }
-            // Estimate tool definition tokens, broken down by category.
-            const BUILTIN_TOOLS: &[&str] = &[
-                "bash", "read", "edit", "write", "glob", "grep", "subagent", "skill",
-            ];
-            let mut builtin_chars: usize = 0;
-            let mut plugin_chars: usize = 0;
-            let mut mcp_chars: Vec<(String, usize)> = Vec::new();
-
-            for def in self.tools.definitions() {
-                let chars = def.to_string().len();
-                let name = def["function"]["name"].as_str().unwrap_or("");
-
-                if name.starts_with("mcp__") {
-                    let server = name
-                        .strip_prefix("mcp__")
-                        .and_then(|rest| rest.split("__").next())
-                        .unwrap_or("unknown");
-                    if let Some(entry) = mcp_chars.iter_mut().find(|(s, _)| s == server) {
-                        entry.1 += chars;
-                    } else {
-                        mcp_chars.push((server.to_string(), chars));
-                    }
-                } else if BUILTIN_TOOLS.contains(&name) {
-                    builtin_chars += chars;
-                } else {
-                    plugin_chars += chars;
-                }
-            }
-
-            let mut tool_defs_breakdown: Vec<(String, u64)> = Vec::new();
-            if builtin_chars > 0 {
-                tool_defs_breakdown.push(("Built-in".to_string(), message::estimate_tokens(builtin_chars)));
-            }
-            for (server, chars) in &mcp_chars {
-                tool_defs_breakdown.push((format!("MCP: {}", server), message::estimate_tokens(*chars)));
-            }
-            if plugin_chars > 0 {
-                tool_defs_breakdown.push(("Plugins".to_string(), message::estimate_tokens(plugin_chars)));
-            }
-
-            send_event(events, AgentEvent::SystemPromptInfo {
-                base_prompt_tokens: message::estimate_tokens(self.system_prompt_base_len),
-                project_docs: self.project_docs_info.iter()
-                    .map(|(name, len)| (name.clone(), message::estimate_tokens(*len)))
-                    .collect(),
-                skills_tokens: message::estimate_tokens(self.skills_summary_len),
-                tool_defs_breakdown,
-            })?;
-            self.system_prompt_logged = true;
-        }
+        self.emit_system_prompt_info_once(events)?;
 
         // --- agent_start hooks ---
         if let Some(extra_context) = self.hooks.agent_start(user_input, &self.model).await {
@@ -573,35 +789,7 @@ impl Agent {
                 return Ok(());
             }
 
-            let ns_to_ms = |ns: u64| -> f64 { ns as f64 / 1_000_000.0 };
-            let prompt_tps = if response.prompt_eval_duration > 0 {
-                response.prompt_eval_count as f64 / (response.prompt_eval_duration as f64 / 1e9)
-            } else {
-                0.0
-            };
-            let gen_tps = if response.eval_duration > 0 {
-                response.eval_count as f64 / (response.eval_duration as f64 / 1e9)
-            } else {
-                0.0
-            };
-            send_event(
-                events,
-                AgentEvent::Debug(format!(
-                    "OLLAMA_RESPONSE content_len={} tool_calls={} prompt_eval={} incomplete={} \
-                     | load={:.0}ms prompt={:.0}ms ({:.1} t/s) gen={:.0}ms/{} tokens ({:.1} t/s) total={:.0}ms",
-                    response.content.len(),
-                    response.tool_calls.len(),
-                    response.prompt_eval_count,
-                    response.incomplete,
-                    ns_to_ms(response.load_duration),
-                    ns_to_ms(response.prompt_eval_duration),
-                    prompt_tps,
-                    ns_to_ms(response.eval_duration),
-                    response.eval_count,
-                    gen_tps,
-                    ns_to_ms(response.total_duration),
-                )),
-            )?;
+            self.emit_response_metrics(&response, events)?;
 
             if response.prompt_eval_count > 0 {
                 send_event(
@@ -610,63 +798,13 @@ impl Agent {
                         prompt_tokens: response.prompt_eval_count,
                     },
                 )?;
-
-                // Auto-trim/compact context if approaching the limit
-                if self.context.compaction_enabled {
-                    match self
-                        .context
-                        .compact(
-                            &mut self.messages,
-                            self.context_size,
-                            response.prompt_eval_count,
-                            &*self.backend,
-                            &self.model,
-                            events,
-                            &cancel,
-                            num_ctx,
-                        )
-                        .await
-                    {
-                        Some((removed, freed, summary_tokens)) => {
-                            send_event(
-                                events,
-                                AgentEvent::ContextCompacted {
-                                    removed_messages: removed,
-                                    summary_tokens,
-                                    estimated_tokens_freed: freed,
-                                },
-                            )?;
-                        }
-                        None => {
-                            // Below threshold or compaction failed — fall back to blind trim
-                            if let Some((removed, freed)) = self.context.trim(
-                                &mut self.messages,
-                                self.context_size,
-                                response.prompt_eval_count,
-                            ) {
-                                send_event(
-                                    events,
-                                    AgentEvent::ContextTrimmed {
-                                        removed_messages: removed,
-                                        estimated_tokens_freed: freed,
-                                    },
-                                )?;
-                            }
-                        }
-                    }
-                } else if let Some((removed, freed)) = self.context.trim(
-                    &mut self.messages,
-                    self.context_size,
+                self.apply_context_management(
                     response.prompt_eval_count,
-                ) {
-                    send_event(
-                        events,
-                        AgentEvent::ContextTrimmed {
-                            removed_messages: removed,
-                            estimated_tokens_freed: freed,
-                        },
-                    )?;
-                }
+                    events,
+                    &cancel,
+                    num_ctx,
+                )
+                .await?;
             }
 
             if response.incomplete {
@@ -728,39 +866,8 @@ impl Agent {
                 }
             }
 
-            // Check if context window is exhausted
-            if self.context_size > 0 && response.prompt_eval_count > 0 {
-                let total = response.prompt_eval_count + response.eval_count;
-                let context_full = total >= self.context_size;
-                // If tool calls are pending, also check if prompt alone is >90%
-                // of context — tool results will push us over on the next iteration.
-                let context_nearly_full = !response.tool_calls.is_empty()
-                    && response.prompt_eval_count > self.context_size * 90 / 100;
-
-                if context_full || context_nearly_full {
-                    // Save any text the model managed to generate
-                    if !response.content.trim().is_empty() {
-                        let assistant_msg = Message::assistant(&response.content);
-                        self.messages.push(assistant_msg.clone());
-                        send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
-                    }
-                    send_event(
-                        events,
-                        AgentEvent::Error(
-                            "Context window is full — the model can no longer process \
-                             this conversation. Use /clear to start fresh."
-                                .to_string(),
-                        ),
-                    )?;
-                    send_event(
-                        events,
-                        AgentEvent::Done {
-                            prompt_tokens: response.prompt_eval_count,
-                            eval_count: response.eval_count,
-                        },
-                    )?;
-                    return Ok(());
-                }
+            if self.handle_context_exhausted(&response, events)? {
+                return Ok(());
             }
 
             if response.tool_calls.is_empty() {
@@ -840,66 +947,21 @@ impl Agent {
                     .dispatch_tool_call(tool_call, events, confirm_rx, &cancel)
                     .await?;
                 if !continue_loop {
-                    // If cancelled, add "Cancelled" tool results for the
-                    // current (un-executed) tool call and all remaining ones
-                    // so the message history stays consistent — otherwise the
-                    // model sees its own tool-call request without a matching
-                    // result and retries the same action.
+                    // Backfill synthetic "Cancelled" results starting at `i`
+                    // because dispatch_tool_call does NOT push a tool result
+                    // message when returning Ok(false) — so the current tool
+                    // call still needs a result to pair with its request.
                     if cancel.load(Ordering::Relaxed) {
-                        // Starting from index `i` is correct because
-                        // dispatch_tool_call does NOT push a tool result
-                        // message when returning Ok(false) (cancel path),
-                        // so the current tool call still needs a result.
-                        for remaining in &tool_calls_with_ids[i..] {
-                            let cancelled_msg = "Cancelled by user.";
-                            send_event(events, AgentEvent::ToolResult {
-                                name: remaining.function.name.clone(),
-                                output: cancelled_msg.to_string(),
-                                success: false,
-                            })?;
-                            let tool_msg = Message::tool(
-                                cancelled_msg,
-                                remaining.id.clone(),
-                                false,
-                            );
-                            self.messages.push(tool_msg.clone());
-                            send_event(events, AgentEvent::MessageLogged(tool_msg))?;
-                        }
+                        self.backfill_cancelled_tool_results(
+                            &tool_calls_with_ids[i..],
+                            events,
+                        )?;
                     }
                     return Ok(());
                 }
             }
 
-            // Post-edit compilation check: if any edits were made this turn,
-            // run `cargo check` (if Cargo.toml exists) and inject diagnostics.
-            if self.had_edits_this_run && std::path::Path::new("Cargo.toml").exists() {
-                self.had_edits_this_run = false;
-                if let Ok(output) = tokio::process::Command::new("cargo")
-                    .args(["check", "--message-format=short"])
-                    .output()
-                    .await
-                {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    // Only inject if there are actual errors or warnings
-                    let has_errors = stderr.contains("error[");
-                    let has_warnings = stderr.contains("warning:");
-                    if has_errors || has_warnings {
-                        let label = if has_errors { "errors" } else { "warnings" };
-                        let check_msg = format!(
-                            "[Auto cargo check detected {}]\n{}",
-                            label,
-                            stderr.lines()
-                                .filter(|l| l.contains("error") || l.contains("warning"))
-                                .take(20)
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        );
-                        let system_hint = Message::system(&check_msg);
-                        self.messages.push(system_hint);
-                    }
-                }
-            }
-
+            self.run_post_edit_cargo_check().await;
         }
     }
 }
