@@ -153,6 +153,12 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
             app.system_prompt = system_prompt;
             app.messages.push(ChatMessage::Info(summary));
         }
+        AgentEvent::ThinkingBudgetExceeded { thinking_tokens } => {
+            app.messages.push(ChatMessage::Info(format!(
+                "Thinking budget exceeded (~{} tokens) — thinking disabled for this session, forcing the model to commit.",
+                thinking_tokens
+            )));
+        }
         AgentEvent::ToolOutput { output } => {
             // Append to the live_output of the last pending ToolCall.
             // Keep only the last 3 lines to avoid unbounded growth.

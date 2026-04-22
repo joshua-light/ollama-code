@@ -162,6 +162,12 @@ pub struct Config {
     #[serde(default)]
     pub task_reinjection: Option<bool>,
 
+    /// Enable per-turn skill injection: rank discovered skills each turn and
+    /// append the top match's guidance as a transient note (not persisted to
+    /// history, so the system prompt stays cache-stable).
+    #[serde(default)]
+    pub skill_inject: Option<bool>,
+
     /// How often to re-inject the task objective (in agent turns). Default: 3.
     #[serde(default)]
     pub reinjection_interval: Option<u16>,
@@ -181,6 +187,27 @@ pub struct Config {
     /// preserving critical context that would otherwise be lost.
     #[serde(default)]
     pub context_compaction: Option<bool>,
+
+    /// Per-turn thinking-token budget. When set, the backend is asked to think
+    /// (`think: true` to Ollama) and the stream is aborted mid-generation if
+    /// accumulated thinking tokens exceed this value. After a trip, thinking is
+    /// disabled for the rest of the session and a "commit to an implementation"
+    /// follow-up is injected. `None` disables the feature entirely.
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u64>,
+
+    /// Hard cap on the total number of agent-loop turns per `run()` for the
+    /// main (non-sub) agent. When hit, the loop stops with an error. `None`
+    /// = unlimited. Sub-agents use `subagent_max_turns` instead.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+
+    /// Bash command prefixes that auto-approve without a confirmation prompt.
+    /// Each entry matches the literal leading substring of the command (after
+    /// trimming leading whitespace). Empty list = every bash call prompts.
+    /// Typical safe set: `["ls", "cat", "rg", "git status", "git log", "git diff"]`.
+    #[serde(default)]
+    pub bash_safe_prefixes: Option<Vec<String>>,
 
     /// Recently used HuggingFace model repos (most recent first, max 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,10 +335,16 @@ impl Config {
             top_k: self.top_k.or(other.top_k),
             tool_scoping: self.tool_scoping.or(other.tool_scoping),
             task_reinjection: self.task_reinjection.or(other.task_reinjection),
+            skill_inject: self.skill_inject.or(other.skill_inject),
             reinjection_interval: self.reinjection_interval.or(other.reinjection_interval),
             trim_threshold: self.trim_threshold.or(other.trim_threshold),
             trim_target: self.trim_target.or(other.trim_target),
             context_compaction: self.context_compaction.or(other.context_compaction),
+            thinking_budget_tokens: self.thinking_budget_tokens.or(other.thinking_budget_tokens),
+            max_turns: self.max_turns.or(other.max_turns),
+            bash_safe_prefixes: self
+                .bash_safe_prefixes
+                .or_else(|| other.bash_safe_prefixes.clone()),
             // User-scope only: always take from the lower-priority layer (user config).
             recent_hf_models: other.recent_hf_models.clone(),
             project_config_path: None,
@@ -421,6 +454,11 @@ impl Config {
 # Enable periodic task re-injection to fight coherence decay (default: false)
 # task_reinjection = false
 
+# Per-turn skill injection: rank available skills each turn and append the
+# top match's guidance as a transient note (default: false). Helps small
+# models pick the right approach when they hit errors or shift tasks.
+# skill_inject = false
+
 # How often to re-inject the task objective, in agent turns (default: 3)
 # reinjection_interval = 3
 
@@ -434,6 +472,24 @@ impl Config {
 
 # Use LLM to summarize old context instead of blind removal (default: true)
 # context_compaction = true
+
+# Thinking-token budget per turn (default: disabled).
+# When set, the backend is asked to think and the stream is aborted mid-
+# generation if thinking exceeds this budget. Once tripped, thinking is
+# disabled for the rest of the session and a "commit to an implementation"
+# follow-up is injected. Useful for small models that over-ruminate.
+# thinking_budget_tokens = 2048
+
+# Hard cap on agent-loop turns per run (main agent only; sub-agents use
+# subagent_max_turns). When hit, the loop stops with an error — send a new
+# message to continue. Default: unlimited.
+# max_turns = 30
+
+# Bash command prefixes that auto-approve without a confirmation prompt.
+# Each entry matches the leading substring of the command (after trimming
+# leading whitespace). Default: empty (everything prompts). A typical safe
+# set for read-only inspection:
+# bash_safe_prefixes = ["ls", "cat", "rg", "git status", "git log", "git diff", "pwd", "echo"]
 
 # Plugin feature flags and configuration
 # Boolean values enable/disable tools by name:

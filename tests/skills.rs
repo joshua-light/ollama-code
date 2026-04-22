@@ -51,6 +51,7 @@ fn skill_load_instructions() {
         description: "A test".to_string(),
         trigger: None,
         compiled_trigger: None,
+        target_tool: None,
         dir: skill_dir,
     };
     let body = meta.load_instructions().unwrap();
@@ -73,6 +74,7 @@ fn skill_load_instructions_no_body() {
         description: "Empty".to_string(),
         trigger: None,
         compiled_trigger: None,
+        target_tool: None,
         dir: skill_dir,
     };
     let body = meta.load_instructions().unwrap();
@@ -150,6 +152,7 @@ fn format_skill_summaries_output() {
             description: "Deploy to production".to_string(),
             trigger: None,
             compiled_trigger: None,
+            target_tool: None,
             dir: std::path::PathBuf::from("/tmp"),
         },
         skills::SkillMeta {
@@ -157,6 +160,7 @@ fn format_skill_summaries_output() {
             description: "Run tests".to_string(),
             trigger: None,
             compiled_trigger: None,
+            target_tool: None,
             dir: std::path::PathBuf::from("/tmp"),
         },
     ];

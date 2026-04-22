@@ -92,9 +92,13 @@ async fn run_with_backend(
     let verbose = config.verbose.unwrap_or(false);
     let (session, restored) = resolve_session(&resume)?;
 
+    // Attach the session directory so file edits/writes get first-write-wins
+    // snapshots under <session>/checkpoints/.
+    let mut agent = agent;
+    agent.set_session_dir(Some(session.path()));
+
     if let Some(prompt) = prompt {
         // Pipe mode: wait for server synchronously (no TUI to show progress)
-        let mut agent = agent;
         if let Some(msgs) = restored {
             agent.restore_messages(msgs);
         }

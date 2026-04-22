@@ -86,6 +86,8 @@ const BEHAVIOR_FIELDS: &[FieldDef] = &[
     FieldDef { name: "bash_timeout", kind: FieldKind::U64 },
     FieldDef { name: "subagent_max_turns", kind: FieldKind::U16 },
     FieldDef { name: "tool_scoping", kind: FieldKind::Bool },
+    FieldDef { name: "skill_inject", kind: FieldKind::Bool },
+    FieldDef { name: "thinking_budget_tokens", kind: FieldKind::U64 },
 ];
 
 const CONTEXT_FIELDS: &[FieldDef] = &[
@@ -154,6 +156,11 @@ impl SettingsPanel {
             "bash_timeout" => opt_num(self.config.bash_timeout, DEFAULT_BASH_TIMEOUT_SECS),
             "subagent_max_turns" => opt_num(self.config.subagent_max_turns, DEFAULT_SUBAGENT_MAX_TURNS),
             "tool_scoping" => bool_display(self.config.tool_scoping.unwrap_or(false)),
+            "skill_inject" => bool_display(self.config.skill_inject.unwrap_or(false)),
+            "thinking_budget_tokens" => self
+                .config
+                .thinking_budget_tokens
+                .map_or_else(|| "(disabled)".into(), |v| v.to_string()),
             "trim_threshold" => opt_num(self.config.trim_threshold, DEFAULT_TRIM_THRESHOLD_PCT),
             "trim_target" => opt_num(self.config.trim_target, DEFAULT_TRIM_TARGET_PCT),
             "context_compaction" => bool_display(self.config.context_compaction.unwrap_or(true)),
@@ -181,6 +188,7 @@ impl SettingsPanel {
             "trim_threshold" => self.config.trim_threshold.map_or_else(String::new, |v| v.to_string()),
             "trim_target" => self.config.trim_target.map_or_else(String::new, |v| v.to_string()),
             "reinjection_interval" => self.config.reinjection_interval.map_or_else(String::new, |v| v.to_string()),
+            "thinking_budget_tokens" => self.config.thinking_budget_tokens.map_or_else(String::new, |v| v.to_string()),
             _ => String::new(),
         }
     }
@@ -193,6 +201,7 @@ impl SettingsPanel {
             "bypass" => self.config.bypass = Some(!self.config.bypass.unwrap_or(false)),
             "verbose" => self.config.verbose = Some(!self.config.verbose.unwrap_or(false)),
             "tool_scoping" => self.config.tool_scoping = Some(!self.config.tool_scoping.unwrap_or(false)),
+            "skill_inject" => self.config.skill_inject = Some(!self.config.skill_inject.unwrap_or(false)),
             "task_reinjection" => self.config.task_reinjection = Some(!self.config.task_reinjection.unwrap_or(false)),
             "context_compaction" => self.config.context_compaction = Some(!self.config.context_compaction.unwrap_or(true)),
             "show_cost_estimate" => self.config.show_cost_estimate = Some(!self.config.show_cost_estimate.unwrap_or(false)),
@@ -219,6 +228,7 @@ impl SettingsPanel {
             "trim_threshold" => return parse_opt(&mut self.config.trim_threshold, value),
             "trim_target" => return parse_opt(&mut self.config.trim_target, value),
             "reinjection_interval" => return parse_opt(&mut self.config.reinjection_interval, value),
+            "thinking_budget_tokens" => return parse_opt(&mut self.config.thinking_budget_tokens, value),
             _ => return false,
         }
         true

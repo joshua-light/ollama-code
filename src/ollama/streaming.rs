@@ -27,6 +27,10 @@ pub(super) struct ChunkMessage {
     #[allow(dead_code)]
     pub role: Option<String>,
     pub content: Option<String>,
+    /// Ollama emits reasoning tokens here when `think: true` is set on the
+    /// request. Kept separate from `content` so the budget can be counted
+    /// without conflating it with the model's answer.
+    pub thinking: Option<String>,
     pub tool_calls: Option<Vec<ToolCallResponse>>,
 }
 
@@ -58,6 +62,9 @@ pub(super) struct OpenAIChoice {
 #[derive(Debug, Deserialize)]
 pub(super) struct OpenAIDelta {
     pub content: Option<String>,
+    /// Reasoning channel in OpenAI-compatible streams (llama-server, Ollama
+    /// GPT-OSS, etc.). Kept separate from `content` for the budget counter.
+    pub reasoning_content: Option<String>,
     pub tool_calls: Option<Vec<OpenAIToolCallDelta>>,
 }
 
@@ -111,6 +118,7 @@ impl TimingMetrics {
 pub(super) fn process_openai_chunk(
     parsed: &OpenAIChunk,
     content: &mut String,
+    thinking: &mut String,
     tool_accum: &mut Vec<OpenAIToolCallAccum>,
     metrics: &mut TimingMetrics,
     on_token: &dyn Fn(&str),
@@ -128,6 +136,11 @@ pub(super) fn process_openai_chunk(
                             content.push_str(&cleaned);
                             on_token(&cleaned);
                         }
+                    }
+                }
+                if let Some(reasoning) = &delta.reasoning_content {
+                    if !reasoning.is_empty() {
+                        thinking.push_str(reasoning);
                     }
                 }
                 if let Some(tool_calls) = &delta.tool_calls {
@@ -172,6 +185,7 @@ pub(super) fn process_openai_chunk(
 pub(super) fn process_chunk(
     parsed: &ChatChunk,
     content: &mut String,
+    thinking: &mut String,
     tool_calls: &mut Vec<ToolCall>,
     metrics: &mut TimingMetrics,
     on_token: &dyn Fn(&str),
@@ -184,6 +198,11 @@ pub(super) fn process_chunk(
                     content.push_str(&cleaned);
                     on_token(&cleaned);
                 }
+            }
+        }
+        if let Some(reasoning) = &msg.thinking {
+            if !reasoning.is_empty() {
+                thinking.push_str(reasoning);
             }
         }
         if let Some(calls) = &msg.tool_calls {
@@ -223,10 +242,12 @@ pub(super) fn process_chunk(
 
 /// Process any data remaining in the buffer after the streaming loop ends.
 /// Returns `Ok(true)` if a done/finish signal was found in the remaining data.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn process_remaining_buffer(
     buffer: &str,
     is_openai: Option<bool>,
     content: &mut String,
+    thinking: &mut String,
     tool_calls: &mut Vec<ToolCall>,
     openai_tool_accum: &mut Vec<OpenAIToolCallAccum>,
     metrics: &mut TimingMetrics,
@@ -247,6 +268,7 @@ pub(super) fn process_remaining_buffer(
             let finish = process_openai_chunk(
                 &parsed,
                 content,
+                thinking,
                 openai_tool_accum,
                 metrics,
                 on_token,
@@ -269,6 +291,7 @@ pub(super) fn process_remaining_buffer(
         process_chunk(
             &parsed,
             content,
+            thinking,
             tool_calls,
             metrics,
             on_token,
@@ -283,6 +306,7 @@ pub(super) fn process_remaining_buffer(
 /// Accumulated state from the streaming loop, passed to [`postprocess_response`].
 pub(super) struct StreamResult {
     pub content: String,
+    pub thinking: String,
     pub tool_calls: Vec<ToolCall>,
     pub openai_tool_accum: Vec<OpenAIToolCallAccum>,
     pub is_openai: bool,
@@ -290,12 +314,14 @@ pub(super) struct StreamResult {
     pub metrics: TimingMetrics,
     pub saw_done: bool,
     pub repetition_detected: bool,
+    pub thinking_budget_exceeded: bool,
 }
 
 /// Convert accumulated state after streaming into a final [`ChatResponse`].
 pub(super) fn postprocess_response(result: StreamResult) -> ChatResponse {
     let StreamResult {
         mut content,
+        thinking,
         mut tool_calls,
         openai_tool_accum,
         is_openai,
@@ -303,15 +329,18 @@ pub(super) fn postprocess_response(result: StreamResult) -> ChatResponse {
         metrics,
         saw_done,
         repetition_detected,
+        thinking_budget_exceeded,
     } = result;
     // Convert accumulated OpenAI tool calls to our format
     if is_openai {
         for accum in &openai_tool_accum {
             if !accum.name.is_empty() {
-                let arguments: Value =
-                    serde_json::from_str(&accum.arguments).unwrap_or(Value::Object(
-                        serde_json::Map::new(),
-                    ));
+                // Small models frequently emit argument fragments with trailing
+                // commas, single quotes, or missing closing braces. Try strict
+                // parsing first; on failure, run `repair_json` and retry before
+                // giving up.
+                let arguments: Value = super::parse::parse_json_lenient(&accum.arguments)
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
                 tool_calls.push(ToolCall {
                     id: None,
                     call_type: None,
@@ -359,6 +388,8 @@ pub(super) fn postprocess_response(result: StreamResult) -> ChatResponse {
         incomplete: !saw_done,
         tool_calls_from_content,
         repetition_detected,
+        thinking,
+        thinking_budget_exceeded,
     }
 }
 
@@ -373,6 +404,55 @@ mod tests {
     // Helper: token-collecting callback
     fn collecting_token(collected: &std::cell::RefCell<Vec<String>>) -> impl Fn(&str) + '_ {
         move |t: &str| collected.borrow_mut().push(t.to_string())
+    }
+
+    // Test-local wrappers so existing test call sites don't need to thread a
+    // discarded thinking buffer. The thinking channel itself has dedicated
+    // tests further down.
+    fn process_chunk(
+        parsed: &ChatChunk,
+        content: &mut String,
+        tool_calls: &mut Vec<ToolCall>,
+        metrics: &mut TimingMetrics,
+        on_token: &dyn Fn(&str),
+    ) {
+        let mut thinking = String::new();
+        super::process_chunk(parsed, content, &mut thinking, tool_calls, metrics, on_token);
+    }
+
+    fn process_openai_chunk(
+        parsed: &OpenAIChunk,
+        content: &mut String,
+        tool_accum: &mut Vec<OpenAIToolCallAccum>,
+        metrics: &mut TimingMetrics,
+        on_token: &dyn Fn(&str),
+    ) -> Option<String> {
+        let mut thinking = String::new();
+        super::process_openai_chunk(
+            parsed, content, &mut thinking, tool_accum, metrics, on_token,
+        )
+    }
+
+    fn process_remaining_buffer(
+        buffer: &str,
+        is_openai: Option<bool>,
+        content: &mut String,
+        tool_calls: &mut Vec<ToolCall>,
+        openai_tool_accum: &mut Vec<OpenAIToolCallAccum>,
+        metrics: &mut TimingMetrics,
+        on_token: &dyn Fn(&str),
+    ) -> Result<bool> {
+        let mut thinking = String::new();
+        super::process_remaining_buffer(
+            buffer,
+            is_openai,
+            content,
+            &mut thinking,
+            tool_calls,
+            openai_tool_accum,
+            metrics,
+            on_token,
+        )
     }
 
     // ---------------------------------------------------------------
@@ -1054,6 +1134,7 @@ mod tests {
     fn make_stream_result() -> StreamResult {
         StreamResult {
             content: String::new(),
+            thinking: String::new(),
             tool_calls: Vec::new(),
             openai_tool_accum: Vec::new(),
             is_openai: false,
@@ -1061,6 +1142,7 @@ mod tests {
             metrics: TimingMetrics::new(),
             saw_done: true,
             repetition_detected: false,
+            thinking_budget_exceeded: false,
         }
     }
 
@@ -1334,6 +1416,7 @@ mod tests {
 
         let resp = postprocess_response(StreamResult {
             content,
+            thinking: String::new(),
             tool_calls,
             openai_tool_accum: Vec::new(),
             is_openai: false,
@@ -1341,6 +1424,7 @@ mod tests {
             metrics,
             saw_done,
             repetition_detected: false,
+            thinking_budget_exceeded: false,
         });
 
         assert_eq!(resp.content, "Hello, world!");
@@ -1376,6 +1460,7 @@ mod tests {
 
         let resp = postprocess_response(StreamResult {
             content,
+            thinking: String::new(),
             tool_calls: Vec::new(),
             openai_tool_accum: tool_accum,
             is_openai: true,
@@ -1383,6 +1468,7 @@ mod tests {
             metrics,
             saw_done,
             repetition_detected: false,
+            thinking_budget_exceeded: false,
         });
 
         assert_eq!(resp.tool_calls.len(), 1);
@@ -1394,5 +1480,107 @@ mod tests {
         assert!(!resp.incomplete);
         assert_eq!(resp.prompt_eval_count, 50);
         assert_eq!(resp.eval_count, 8);
+    }
+
+    // ---------------------------------------------------------------
+    // Thinking channel
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn process_chunk_accumulates_thinking_separately() {
+        // Ollama emits `message.thinking` when `think: true` is requested.
+        // It must land in the thinking buffer, not in content, and it must
+        // NOT call on_token (we don't stream reasoning to the UI).
+        let chunk: ChatChunk = serde_json::from_str(
+            r#"{"message": {"role": "assistant", "thinking": "let me reason about this", "content": ""}, "done": false}"#,
+        )
+        .unwrap();
+
+        let collected = std::cell::RefCell::new(Vec::<String>::new());
+        let mut content = String::new();
+        let mut thinking = String::new();
+        let mut tool_calls = Vec::new();
+        let mut metrics = TimingMetrics::new();
+
+        super::process_chunk(
+            &chunk,
+            &mut content,
+            &mut thinking,
+            &mut tool_calls,
+            &mut metrics,
+            &collecting_token(&collected),
+        );
+
+        assert_eq!(content, "");
+        assert_eq!(thinking, "let me reason about this");
+        assert!(
+            collected.borrow().is_empty(),
+            "on_token must not fire for thinking tokens",
+        );
+    }
+
+    #[test]
+    fn process_chunk_thinking_accumulates_across_chunks() {
+        let mut content = String::new();
+        let mut thinking = String::new();
+        let mut tool_calls = Vec::new();
+        let mut metrics = TimingMetrics::new();
+
+        for text in &["Step 1. ", "Step 2. ", "Step 3."] {
+            let json = format!(
+                r#"{{"message": {{"role": "assistant", "thinking": "{}", "content": ""}}, "done": false}}"#,
+                text
+            );
+            let chunk: ChatChunk = serde_json::from_str(&json).unwrap();
+            super::process_chunk(
+                &chunk,
+                &mut content,
+                &mut thinking,
+                &mut tool_calls,
+                &mut metrics,
+                &noop_token,
+            );
+        }
+
+        assert_eq!(thinking, "Step 1. Step 2. Step 3.");
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn process_openai_chunk_accumulates_reasoning_content() {
+        // llama-server and Ollama's OpenAI-compat mode emit reasoning under
+        // `delta.reasoning_content`.
+        let parsed: OpenAIChunk = serde_json::from_str(
+            r#"{"choices": [{"delta": {"reasoning_content": "thinking...", "content": "answer"}, "finish_reason": null}]}"#,
+        )
+        .unwrap();
+
+        let mut content = String::new();
+        let mut thinking = String::new();
+        let mut tool_accum = Vec::new();
+        let mut metrics = TimingMetrics::new();
+
+        super::process_openai_chunk(
+            &parsed,
+            &mut content,
+            &mut thinking,
+            &mut tool_accum,
+            &mut metrics,
+            &noop_token,
+        );
+
+        assert_eq!(content, "answer");
+        assert_eq!(thinking, "thinking...");
+    }
+
+    #[test]
+    fn postprocess_passes_through_thinking_fields() {
+        let mut r = make_stream_result();
+        r.thinking = "I reasoned but got cut off".to_string();
+        r.thinking_budget_exceeded = true;
+
+        let resp = postprocess_response(r);
+        assert_eq!(resp.thinking, "I reasoned but got cut off");
+        assert!(resp.thinking_budget_exceeded);
     }
 }

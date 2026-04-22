@@ -1,5 +1,6 @@
 mod bash;
 mod edit;
+mod evidence;
 mod glob;
 mod grep;
 mod read;
@@ -9,6 +10,9 @@ mod write;
 
 pub use bash::BashTool;
 pub use edit::EditTool;
+pub use evidence::{
+    new_evidence_store, EvidenceAddTool, EvidenceGetTool, EvidenceListTool, EvidenceStore,
+};
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;

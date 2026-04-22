@@ -31,6 +31,10 @@ pub struct MockResponse {
     pub incomplete: bool,
     /// Simulate repetition detection.
     pub repetition_detected: bool,
+    /// Simulated reasoning content (goes in the thinking channel).
+    pub thinking: String,
+    /// Simulate the budget-exceeded abort.
+    pub thinking_budget_exceeded: bool,
 }
 
 impl MockResponse {
@@ -43,6 +47,8 @@ impl MockResponse {
             eval_count: None,
             incomplete: false,
             repetition_detected: false,
+            thinking: String::new(),
+            thinking_budget_exceeded: false,
         }
     }
 
@@ -62,6 +68,8 @@ impl MockResponse {
             eval_count: None,
             incomplete: false,
             repetition_detected: false,
+            thinking: String::new(),
+            thinking_budget_exceeded: false,
         }
     }
 
@@ -84,6 +92,8 @@ impl MockResponse {
             eval_count: None,
             incomplete: false,
             repetition_detected: false,
+            thinking: String::new(),
+            thinking_budget_exceeded: false,
         }
     }
 
@@ -110,6 +120,14 @@ impl MockResponse {
         self.repetition_detected = true;
         self
     }
+
+    /// Simulate a budget-exceeded abort. Accumulated thinking content is
+    /// included so the agent can report a token count.
+    pub fn with_thinking_budget_exceeded(mut self, thinking: impl Into<String>) -> Self {
+        self.thinking_budget_exceeded = true;
+        self.thinking = thinking.into();
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +141,7 @@ pub struct CapturedCall {
     pub messages: Vec<Message>,
     pub tools: Option<Vec<Value>>,
     pub num_ctx: Option<u64>,
+    pub thinking_budget_tokens: Option<u64>,
 }
 
 impl CapturedCall {
@@ -168,6 +187,7 @@ impl ModelBackend for MockBackend {
         messages: &'a [Message],
         tools: Option<Vec<Value>>,
         num_ctx: Option<u64>,
+        thinking_budget_tokens: Option<u64>,
         on_token: Box<dyn Fn(&str) + Send + 'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
         // Capture the call
@@ -176,6 +196,7 @@ impl ModelBackend for MockBackend {
             messages: messages.to_vec(),
             tools: tools.clone(),
             num_ctx,
+            thinking_budget_tokens,
         });
 
         // Pop the next scripted response
@@ -206,6 +227,8 @@ impl ModelBackend for MockBackend {
                 incomplete: response.incomplete,
                 tool_calls_from_content: false,
                 repetition_detected: response.repetition_detected,
+                thinking: response.thinking,
+                thinking_budget_exceeded: response.thinking_budget_exceeded,
             })
         })
     }

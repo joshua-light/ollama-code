@@ -429,6 +429,9 @@ impl Session {
             AgentEvent::ReloadComplete { ref summary, .. } => {
                 format!("RELOAD_COMPLETE {}", summary)
             }
+            AgentEvent::ThinkingBudgetExceeded { thinking_tokens } => {
+                format!("THINKING_BUDGET_EXCEEDED tokens={}", thinking_tokens)
+            }
             AgentEvent::ToolOutput { .. } => return, // high-frequency, not logged
         };
         self.log_debug(&line);

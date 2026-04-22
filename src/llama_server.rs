@@ -430,8 +430,10 @@ impl ModelBackend for LlamaCppBackend {
         messages: &'a [Message],
         tools: Option<Vec<Value>>,
         num_ctx: Option<u64>,
+        thinking_budget_tokens: Option<u64>,
         on_token: Box<dyn Fn(&str) + Send + 'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
-        self.inner.chat(model, messages, tools, num_ctx, on_token)
+        self.inner
+            .chat(model, messages, tools, num_ctx, thinking_budget_tokens, on_token)
     }
 }

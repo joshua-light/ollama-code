@@ -26,6 +26,13 @@ pub struct ChatResponse {
     /// True if the response was cut short because repetitive/degenerate
     /// output was detected during streaming.
     pub repetition_detected: bool,
+    /// Accumulated reasoning/thinking content from the model (separate channel
+    /// from `content`). Empty when thinking wasn't requested or the model
+    /// didn't emit any.
+    pub thinking: String,
+    /// True if the stream was aborted because accumulated thinking exceeded
+    /// the configured budget.
+    pub thinking_budget_exceeded: bool,
 }
 
 /// Model metadata returned by backend model listing.
@@ -37,12 +44,19 @@ pub struct ModelInfo {
 /// Trait for model backends that can perform chat completions.
 pub trait ModelBackend: Send + Sync {
     /// Send a chat completion request, streaming tokens via `on_token`.
+    ///
+    /// When `thinking_budget_tokens` is `Some(n)`, the backend requests a
+    /// separate reasoning channel (`think: true` on Ollama) and aborts the
+    /// stream mid-generation if accumulated thinking exceeds that budget. The
+    /// returned `ChatResponse` carries `thinking_budget_exceeded: true` in
+    /// that case. `None` disables thinking entirely.
     fn chat<'a>(
         &'a self,
         model: &'a str,
         messages: &'a [Message],
         tools: Option<Vec<Value>>,
         num_ctx: Option<u64>,
+        thinking_budget_tokens: Option<u64>,
         on_token: Box<dyn Fn(&str) + Send + 'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>>;
 }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,7 +13,10 @@ use crate::mcp;
 use crate::message::{self, Message};
 use crate::plugin::{self, ExternalTool};
 use crate::skills::{self, SkillMeta};
-use crate::tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, SkillTool, SubagentToolDef, Tool, WriteTool, ToolRegistry};
+use crate::tools::{
+    new_evidence_store, BashTool, EditTool, EvidenceAddTool, EvidenceGetTool, EvidenceListTool,
+    GlobTool, GrepTool, ReadTool, SkillTool, SubagentToolDef, Tool, ToolRegistry, WriteTool,
+};
 
 /// How `rewind_turns` / `rewind_leaf` treats the anchor user message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +67,13 @@ pub enum AgentEvent {
     ReloadComplete {
         summary: String,
         system_prompt: String,
+    },
+    /// Thinking budget was exceeded mid-stream. The agent has disabled
+    /// thinking for the rest of the session and injected a follow-up asking
+    /// the model to commit to an implementation.
+    ThinkingBudgetExceeded {
+        /// Approximate tokens of reasoning emitted before the abort.
+        thinking_tokens: u64,
     },
     /// System prompt composition info (emitted once at first run).
     SystemPromptInfo {
@@ -242,6 +252,14 @@ fn build_tools_and_servers(
     if include_extensions {
         register_if_enabled!("subagent", SubagentToolDef);
 
+        // Evidence store: three tools share a single Arc<Mutex<HashMap>> so
+        // they read and write the same in-memory snippet collection. Lives
+        // on the Agent so it survives context compaction.
+        let evidence_store = new_evidence_store();
+        register_if_enabled!("evidence_add", EvidenceAddTool::new(evidence_store.clone()));
+        register_if_enabled!("evidence_get", EvidenceGetTool::new(evidence_store.clone()));
+        register_if_enabled!("evidence_list", EvidenceListTool::new(evidence_store));
+
         let plugin_dirs: Vec<std::path::PathBuf> = cfg
             .plugin_dirs
             .as_ref()
@@ -382,6 +400,12 @@ pub struct Agent {
     trim_target_pct: u8,
     /// Whether to use LLM-based context compaction instead of blind trimming.
     context_compaction: bool,
+    /// When true, rank discovered skills each turn and inject the top match's
+    /// body as a transient system note (not persisted to self.messages).
+    skill_inject: bool,
+    /// Recent (tool_name, is_error) entries; capped at 4. Fed to the skill
+    /// selector when `skill_inject` is enabled.
+    recent_tool_results: VecDeque<(String, bool)>,
     /// Tracks whether a file-reading tool has been used (for tool scoping).
     has_explored: bool,
     /// The original user input for the current run (for task re-injection).
@@ -391,6 +415,22 @@ pub struct Agent {
     read_file_ranges: Vec<(String, usize, usize)>,
     /// Whether any edit/write tool succeeded during the current `run()`.
     had_edits_this_run: bool,
+    /// Sticky flag: set true once the thinking budget has been exceeded in
+    /// this session. When set, subsequent turns are sent with thinking off
+    /// regardless of config. Cleared only by /settings changes or a new session.
+    thinking_disabled: bool,
+    /// Directory where per-session first-write-wins file snapshots are stored.
+    /// Set via `set_session_dir`; `None` disables checkpointing.
+    checkpoint_dir: Option<std::path::PathBuf>,
+    /// Canonical paths of files we've already snapshotted this session. Keeps
+    /// the first snapshot intact across repeated edits.
+    checkpointed_files: HashSet<std::path::PathBuf>,
+    /// Bash command prefixes that auto-approve without a confirmation prompt.
+    /// Intended for cheap read-only commands (ls, cat, rg, git status, …).
+    bash_safe_prefixes: Vec<String>,
+    /// Hard cap on the total number of agent-loop turns for the main agent.
+    /// `None` = unlimited. Sub-agents use `max_turns` instead.
+    main_turn_cap: Option<u32>,
 }
 
 impl Agent {
@@ -461,11 +501,26 @@ impl Agent {
             trim_threshold_pct: cfg.effective_trim_threshold(),
             trim_target_pct: cfg.effective_trim_target(),
             context_compaction: cfg.effective_context_compaction(),
+            skill_inject: cfg.skill_inject.unwrap_or(false),
+            recent_tool_results: VecDeque::with_capacity(4),
             has_explored: false,
             current_task: String::new(),
             read_file_ranges: Vec::new(),
             had_edits_this_run: false,
+            thinking_disabled: false,
+            checkpoint_dir: None,
+            checkpointed_files: HashSet::new(),
+            bash_safe_prefixes: cfg.bash_safe_prefixes.clone().unwrap_or_default(),
+            // Main-agent turn cap only applies when this isn't a sub-agent —
+            // sub-agents use `max_turns` which is already set.
+            main_turn_cap: if is_subagent { None } else { cfg.max_turns },
         }
+    }
+
+    /// Attach a session directory so file edits/writes get first-write-wins
+    /// snapshots under `<session_dir>/checkpoints/`. Pass `None` to disable.
+    pub fn set_session_dir(&mut self, session_dir: Option<&Path>) {
+        self.checkpoint_dir = session_dir.map(|p| p.join("checkpoints"));
     }
 
     pub fn new(
@@ -568,6 +623,12 @@ impl Agent {
         self.trim_threshold_pct = config.effective_trim_threshold();
         self.trim_target_pct = config.effective_trim_target();
         self.context_compaction = config.effective_context_compaction();
+        self.skill_inject = config.skill_inject.unwrap_or(false);
+        self.bash_safe_prefixes = config.bash_safe_prefixes.clone().unwrap_or_default();
+        // Sub-agents keep main_turn_cap at None (their cap is `max_turns`).
+        if self.max_turns.is_none() {
+            self.main_turn_cap = config.max_turns;
+        }
 
         self.tools = tools;
         self.plugin_confirm_tools = plugin_confirm_tools;
@@ -772,6 +833,7 @@ impl Agent {
                 &compaction_messages,
                 None,
                 num_ctx,
+                None, // thinking off for compaction — we want a terse summary
                 Box::new(|_| {}),
             ) => {
                 match r {
@@ -837,6 +899,7 @@ impl Agent {
                 &self.messages,
                 None, // no tools — force text response
                 num_ctx,
+                None, // thinking off: we're forcing a final answer, not deliberation
                 Box::new(move |token| {
                     let _ = events_clone.send(AgentEvent::Token(token.to_string()));
                 }),
@@ -1043,6 +1106,147 @@ impl Agent {
         }
     }
 
+    /// Emit the standard error-termination sequence for a tool call:
+    /// `ToolResult{success: false}` event, tool message appended to history,
+    /// `MessageLogged` event, and skill-inject bookkeeping. Used for the
+    /// hook-deny / user-deny / validation-error branches so they stay in sync.
+    fn emit_tool_error(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        name: &str,
+        tool_call_id: Option<String>,
+        msg: String,
+    ) -> Result<()> {
+        send_event(
+            events,
+            AgentEvent::ToolResult {
+                name: name.to_string(),
+                output: msg.clone(),
+                success: false,
+            },
+        )?;
+        let tool_msg = Message::tool(&msg, tool_call_id, false);
+        self.messages.push(tool_msg.clone());
+        send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+        self.record_tool_result(name, false);
+        Ok(())
+    }
+
+    /// Build the message list for the next `backend.chat()` call. When
+    /// `skill_inject` is on and the selector picks at least one skill, the
+    /// guidance block is appended as a transient system message without
+    /// touching `self.messages` — so the canonical history stays stable
+    /// across turns and remains cache-friendly. Fast paths borrow the
+    /// existing history; only an actual injection pays for a clone.
+    fn build_turn_messages(&self) -> (std::borrow::Cow<'_, [Message]>, Option<String>) {
+        use std::borrow::Cow;
+        if !self.skill_inject || self.skills.is_empty() {
+            return (Cow::Borrowed(self.messages.as_slice()), None);
+        }
+        let user_prompt = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::message::Role::User))
+            .map(|m| m.content.as_str());
+        let tool_results: Vec<(String, bool)> = self.recent_tool_results.iter().cloned().collect();
+        let body = match skills::select_skills_for_injection(
+            &self.skills,
+            &tool_results,
+            user_prompt,
+        ) {
+            Some(b) => b,
+            None => return (Cow::Borrowed(self.messages.as_slice()), None),
+        };
+        let mut msgs = self.messages.clone();
+        msgs.push(Message::system(format!("[Tool Usage Guidance]\n{}", body)));
+        (Cow::Owned(msgs), Some(body))
+    }
+
+    /// If `name` is an edit or write tool and checkpointing is enabled,
+    /// snapshot the target file's current contents to the session's
+    /// checkpoint dir. First-write-wins: a subsequent edit of the same file
+    /// leaves the original snapshot intact so rollback reaches pre-agent state.
+    fn maybe_checkpoint(&mut self, name: &str, args: &serde_json::Value) {
+        if !matches!(name, "edit" | "write") {
+            return;
+        }
+        let Some(dir) = self.checkpoint_dir.clone() else {
+            return;
+        };
+        let Some(raw_path) = args.get("file_path").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let expanded = crate::tools::expand_tilde(raw_path);
+        let path = Path::new(expanded.as_ref());
+        // `Write` refuses existing files, so canonicalize failure (non-existent
+        // path) just means there's nothing to snapshot — skip silently.
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if self.checkpointed_files.contains(&canonical) {
+            return;
+        }
+        let Ok(content) = std::fs::read(&canonical) else {
+            return;
+        };
+
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        canonical.hash(&mut h);
+        let hash = format!("{:016x}", h.finish());
+
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let backup = dir.join(format!("{}.bak", hash));
+        let meta = dir.join(format!("{}.meta.json", hash));
+        if std::fs::write(&backup, &content).is_err() {
+            return;
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let meta_json = serde_json::json!({
+            "original_path": canonical.display().to_string(),
+            "timestamp": ts,
+            "size": content.len(),
+        });
+        let _ = std::fs::write(&meta, meta_json.to_string());
+        self.checkpointed_files.insert(canonical);
+    }
+
+    /// Whether a bash tool call should auto-approve under the configured
+    /// safe-prefix whitelist. Empty whitelist = everything prompts as before.
+    fn is_bash_safe(&self, args: &serde_json::Value) -> bool {
+        if self.bash_safe_prefixes.is_empty() {
+            return false;
+        }
+        let cmd = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim_start();
+        self.bash_safe_prefixes
+            .iter()
+            .any(|p| cmd.starts_with(p.as_str()))
+    }
+
+    /// Record a tool call outcome for per-turn skill injection. Bounded at 4.
+    fn record_tool_result(&mut self, name: &str, success: bool) {
+        if !self.skill_inject {
+            return;
+        }
+        if self.recent_tool_results.len() == 4 {
+            self.recent_tool_results.pop_front();
+        }
+        self.recent_tool_results
+            .push_back((name.to_lowercase(), !success));
+    }
+
     /// Dispatch a single tool call: run pre-hooks, handle confirmation,
     /// execute the tool (bash / subagent / registry), run post-hooks,
     /// emit events, and append the result message.
@@ -1072,17 +1276,7 @@ impl Agent {
                             args: crate::format::format_tool_args_display(&name, original_args),
                         },
                     )?;
-                    send_event(
-                        events,
-                        AgentEvent::ToolResult {
-                            name: name.clone(),
-                            output: msg.clone(),
-                            success: false,
-                        },
-                    )?;
-                    let tool_msg = Message::tool(&msg, tool_call.id.clone(), false);
-                    self.messages.push(tool_msg.clone());
-                    send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+                    self.emit_tool_error(events, &name, tool_call.id.clone(), msg)?;
                     return Ok(true);
                 }
                 Some("rewrite") | Some("modify") => {
@@ -1120,9 +1314,20 @@ impl Agent {
             },
         )?;
 
-        // Request user confirmation for tools that modify state
-        let needs_confirm = matches!(name.as_str(), "bash" | "edit" | "write" | "subagent")
+        // Request user confirmation for tools that modify state — but
+        // auto-approve bash calls whose command matches a configured safe
+        // prefix (read-only commands like `ls`, `rg`, `git status`).
+        let mut needs_confirm = matches!(name.as_str(), "bash" | "edit" | "write" | "subagent")
             || self.plugin_confirm_tools.contains(name.as_str());
+        if needs_confirm && name == "bash" && self.is_bash_safe(args) {
+            needs_confirm = false;
+            send_event(
+                events,
+                AgentEvent::Debug(
+                    "bash auto-approved by safe-prefix whitelist".to_string(),
+                ),
+            )?;
+        }
         if needs_confirm {
             send_event(
                 events,
@@ -1135,17 +1340,7 @@ impl Agent {
             let approved = confirm_rx.recv().await.unwrap_or(false);
             if !approved {
                 let denied = "Tool execution denied by user.".to_string();
-                send_event(
-                    events,
-                    AgentEvent::ToolResult {
-                        name: name.clone(),
-                        output: denied.clone(),
-                        success: false,
-                    },
-                )?;
-                let tool_msg = Message::tool(&denied, tool_call.id.clone(), false);
-                self.messages.push(tool_msg.clone());
-                send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+                self.emit_tool_error(events, &name, tool_call.id.clone(), denied)?;
                 return Ok(true);
             }
         }
@@ -1156,17 +1351,7 @@ impl Agent {
                 "Invalid arguments for '{}': {}",
                 name, validation_err
             );
-            send_event(
-                events,
-                AgentEvent::ToolResult {
-                    name: name.clone(),
-                    output: msg.clone(),
-                    success: false,
-                },
-            )?;
-            let tool_msg = Message::tool(&msg, tool_call.id.clone(), false);
-            self.messages.push(tool_msg.clone());
-            send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+            self.emit_tool_error(events, &name, tool_call.id.clone(), msg)?;
             return Ok(true);
         }
 
@@ -1178,6 +1363,9 @@ impl Agent {
             send_event(events, AgentEvent::Cancelled)?;
             return Ok(false);
         }
+
+        // Snapshot the target file before any edit/write so we can roll back.
+        self.maybe_checkpoint(&name, args);
 
         let (mut result, mut success) = if name == "bash" {
             // Set up a channel for streaming partial output from the bash
@@ -1270,6 +1458,7 @@ impl Agent {
         let tool_msg = Message::tool(&context_result, tool_call.id.clone(), success);
         self.messages.push(tool_msg.clone());
         send_event(events, AgentEvent::MessageLogged(tool_msg))?;
+        self.record_tool_result(&name, success);
 
         Ok(true)
     }
@@ -1372,6 +1561,8 @@ impl Agent {
 
         let mut empty_retries: u32 = 0;
         const MAX_EMPTY_RETRIES: u32 = 10;
+        let mut correction_count: u32 = 0;
+        const MAX_CORRECTIONS: u32 = 2;
         let mut turn: u32 = 0;
         let mut tool_call_summary: Vec<String> = Vec::new();
         let num_ctx = if self.context_size > 0 { Some(self.context_size) } else { None };
@@ -1387,6 +1578,28 @@ impl Agent {
             if let Some(max) = self.max_turns {
                 if turn >= max as u32 {
                     self.force_final_response(events, num_ctx).await?;
+                    return Ok(());
+                }
+            }
+            // Main agent uses a hard stop instead of `force_final_response`
+            // so the user keeps control: they can send a new message to continue.
+            if let Some(max) = self.main_turn_cap {
+                if turn >= max {
+                    send_event(
+                        events,
+                        AgentEvent::Error(format!(
+                            "Turn cap reached ({} turns). Stopping — start a new \
+                             message to continue.",
+                            max
+                        )),
+                    )?;
+                    send_event(
+                        events,
+                        AgentEvent::Done {
+                            prompt_tokens: 0,
+                            eval_count: 0,
+                        },
+                    )?;
                     return Ok(());
                 }
             }
@@ -1426,18 +1639,40 @@ impl Agent {
             let tool_defs = self.scoped_tool_definitions();
             let events_clone = events.clone();
 
+            let (turn_messages, injected) = self.build_turn_messages();
+            if let Some(body) = &injected {
+                let first_line = body.lines().next().unwrap_or("").trim_start_matches("### ");
+                send_event(
+                    events,
+                    AgentEvent::Debug(format!(
+                        "skill_inject: {} chars — {}",
+                        body.len(),
+                        first_line
+                    )),
+                )?;
+            }
+
             send_event(
                 events,
                 AgentEvent::Debug(format!(
                     "OLLAMA_REQUEST model={} messages={} tools={}",
                     self.model,
-                    self.messages.len(),
+                    turn_messages.len(),
                     tool_defs.len()
                 )),
             )?;
 
+            let thinking_budget = if self.thinking_disabled {
+                None
+            } else {
+                self.config
+                    .as_ref()
+                    .and_then(|c| c.thinking_budget_tokens)
+                    .filter(|&n| n > 0)
+            };
+
             let mut response = tokio::select! {
-                r = self.backend.chat(&self.model, &self.messages, Some(tool_defs), num_ctx, Box::new(move |token| {
+                r = self.backend.chat(&self.model, &turn_messages, Some(tool_defs), num_ctx, thinking_budget, Box::new(move |token| {
                     let _ = events_clone.send(AgentEvent::Token(token.to_string()));
                 })) => {
                     match r {
@@ -1461,6 +1696,51 @@ impl Agent {
             if cancel.load(Ordering::Relaxed) {
                 send_event(events, AgentEvent::Cancelled)?;
                 return Ok(());
+            }
+
+            // Thinking budget tripped mid-stream: flip the session-sticky
+            // thinking-off flag, persist whatever partial content the model
+            // managed to emit (tagged so `/tree` stays honest), then inject a
+            // synthetic user turn forcing a commit and loop back immediately.
+            if response.thinking_budget_exceeded {
+                self.thinking_disabled = true;
+                let thinking_tokens =
+                    message::estimate_tokens(response.thinking.len());
+
+                // Only persist an assistant message if there's real content
+                // to preserve — an empty budget-abort is just noise.
+                let partial = response.content.trim();
+                if !partial.is_empty() {
+                    let tagged = format!(
+                        "{}\n\n[auto: thinking budget exceeded — forcing commit]",
+                        partial
+                    );
+                    send_event(events, AgentEvent::ContentReplaced(tagged.clone()))?;
+                    let assistant_msg = Message::assistant(&tagged);
+                    self.messages.push(assistant_msg.clone());
+                    send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
+                } else {
+                    // Clear any tokens the TUI streamed before the abort.
+                    send_event(events, AgentEvent::ContentReplaced(String::new()))?;
+                }
+
+                send_event(
+                    events,
+                    AgentEvent::ThinkingBudgetExceeded { thinking_tokens },
+                )?;
+
+                let nudge = Message::user(
+                    "[auto] You've spent enough time deliberating. Commit to an \
+                     implementation now — call a tool or give a final answer. \
+                     Do not reason further.",
+                );
+                self.messages.push(nudge.clone());
+                send_event(events, AgentEvent::MessageLogged(nudge))?;
+
+                // Reset the empty-response retry counter: budget trip is not
+                // a degenerate-empty case.
+                empty_retries = 0;
+                continue;
             }
 
             let ns_to_ms = |ns: u64| -> f64 { ns as f64 / 1_000_000.0 };
@@ -1645,18 +1925,43 @@ impl Agent {
             }
 
             if response.tool_calls.is_empty() {
-                // Retry if the model returned a completely empty response
-                if response.content.trim().is_empty() && empty_retries < MAX_EMPTY_RETRIES {
-                    empty_retries += 1;
+                // Model returned an empty response: push a corrective user
+                // message so the model sees an explicit nudge on the next turn
+                // instead of silently retrying into the same degenerate state.
+                if response.content.trim().is_empty() {
+                    if correction_count < MAX_CORRECTIONS {
+                        correction_count += 1;
+                        let nudge = Message::user(
+                            "[auto] Your previous response was empty. You must either \
+                             call a tool to make progress or give a final answer — do \
+                             not return nothing.",
+                        );
+                        self.messages.push(nudge.clone());
+                        send_event(events, AgentEvent::MessageLogged(nudge))?;
+                        send_event(
+                            events,
+                            AgentEvent::Debug(format!(
+                                "Empty response — injected corrective follow-up ({}/{})",
+                                correction_count, MAX_CORRECTIONS
+                            )),
+                        )?;
+                        continue;
+                    }
                     send_event(
                         events,
-                        AgentEvent::Debug(format!(
-                            "Empty response from model, retrying ({}/{})",
-                            empty_retries, MAX_EMPTY_RETRIES
+                        AgentEvent::Error(format!(
+                            "Model returned empty responses {} times in a row — giving up.",
+                            correction_count + 1
                         )),
                     )?;
-                    tokio::time::sleep(retry_backoff_delay(empty_retries)).await;
-                    continue;
+                    send_event(
+                        events,
+                        AgentEvent::Done {
+                            prompt_tokens: response.prompt_eval_count,
+                            eval_count: response.eval_count,
+                        },
+                    )?;
+                    return Ok(());
                 }
 
                 // --- agent_done hooks ---
@@ -1698,6 +2003,10 @@ impl Agent {
                     AgentEvent::ContentReplaced(response.content.clone()),
                 )?;
             }
+
+            // Model produced tool calls — that counts as real progress, so
+            // clear the empty-response correction streak.
+            correction_count = 0;
 
             // Ensure all tool calls have IDs (needed for OpenAI-compatible backends).
             let tool_calls_with_ids: Vec<_> = response

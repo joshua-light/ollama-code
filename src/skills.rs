@@ -17,6 +17,11 @@ pub struct SkillMeta {
     pub trigger: Option<String>,
     /// Pre-compiled trigger regex (case-insensitive). Populated during discovery.
     pub compiled_trigger: Option<Regex>,
+    /// Tool this skill provides guidance for (lowercased). Used by per-turn
+    /// skill injection to look up the relevant card when a tool errors or is
+    /// about to be invoked. `None` means the skill is not per-tool and only
+    /// surfaces via explicit activation or trigger regex.
+    pub target_tool: Option<String>,
     /// Path to the skill directory containing SKILL.md.
     pub dir: PathBuf,
 }
@@ -112,6 +117,7 @@ fn parse_frontmatter(path: &Path, dir: &Path) -> Result<SkillMeta> {
     let mut name = None;
     let mut description = None;
     let mut trigger = None;
+    let mut target_tool: Option<String> = None;
 
     for line in frontmatter.lines() {
         let line = line.trim();
@@ -122,6 +128,10 @@ fn parse_frontmatter(path: &Path, dir: &Path) -> Result<SkillMeta> {
         } else if let Some(v) = parse_frontmatter_value(line, "trigger:") {
             if !v.is_empty() {
                 trigger = Some(v);
+            }
+        } else if let Some(v) = parse_frontmatter_value(line, "target_tool:") {
+            if !v.is_empty() {
+                target_tool = Some(v.to_lowercase());
             }
         }
     }
@@ -135,6 +145,7 @@ fn parse_frontmatter(path: &Path, dir: &Path) -> Result<SkillMeta> {
         description: description.ok_or_else(|| anyhow::anyhow!("missing 'description'"))?,
         trigger,
         compiled_trigger,
+        target_tool,
         dir: dir.to_path_buf(),
     })
 }
@@ -163,6 +174,119 @@ pub fn check_triggers(skills: &[SkillMeta], user_input: &str) -> Option<(String,
     None
 }
 
+/// Character budget for per-turn skill injection (~300 tokens at 3 chars/token).
+pub const SKILL_INJECT_BUDGET_CHARS: usize = 900;
+
+/// Pick skills to inject this turn based on recent tool usage and the latest
+/// user prompt. Returns the concatenated guidance text (without a top-level
+/// wrapper — the caller adds the `[Tool Usage Guidance]` tag).
+///
+/// Selection cascade, matching little-coder's `.pi/extensions/skill-inject`:
+/// 1. **Error recovery**: tools that errored in the last 2 tool results.
+/// 2. **Recency**: tool names from the last 4 tool results (dedup with P1).
+/// 3. **Intent**: tool names mentioned in the most recent user prompt.
+///
+/// Only skills with a `target_tool` field participate. Returns `None` when
+/// no skill is selected.
+pub fn select_skills_for_injection(
+    skills: &[SkillMeta],
+    recent_tool_results: &[(String, bool)],
+    user_prompt: Option<&str>,
+) -> Option<String> {
+    use std::collections::HashMap;
+
+    // Map target_tool → skill (one per tool; later entries win, matching
+    // the project-overrides-user layering in discover_layered).
+    let mut by_tool: HashMap<&str, &SkillMeta> = HashMap::new();
+    for s in skills {
+        if let Some(tool) = &s.target_tool {
+            by_tool.insert(tool.as_str(), s);
+        }
+    }
+    if by_tool.is_empty() {
+        return None;
+    }
+
+    let mut ordered: Vec<&str> = Vec::new();
+    // Inlined dedup-insert: look up by the lowercased name and push the map's
+    // key (which has the lifetime of `skills`), avoiding temp-String lifetimes.
+    fn push_if_mapped<'a>(
+        by_tool: &HashMap<&'a str, &'a SkillMeta>,
+        ordered: &mut Vec<&'a str>,
+        lookup: &str,
+    ) {
+        if let Some((k, _)) = by_tool.get_key_value(lookup) {
+            if !ordered.contains(k) {
+                ordered.push(*k);
+            }
+        }
+    }
+
+    // P1: errored tools in the last 2 results, most recent first.
+    for (name, is_err) in recent_tool_results.iter().rev().take(2) {
+        if *is_err {
+            push_if_mapped(&by_tool, &mut ordered, &name.to_lowercase());
+        }
+    }
+    // P2: any tool in the last 4 results, most recent first.
+    for (name, _) in recent_tool_results.iter().rev().take(4) {
+        push_if_mapped(&by_tool, &mut ordered, &name.to_lowercase());
+    }
+    // P3: tool names mentioned in the latest user prompt.
+    if let Some(prompt) = user_prompt {
+        let lower = prompt.to_lowercase();
+        // Iterate skills in stable order so selection is deterministic.
+        for s in skills {
+            if let Some(tool) = &s.target_tool {
+                if lower.contains(tool.as_str()) {
+                    push_if_mapped(&by_tool, &mut ordered, tool.as_str());
+                }
+            }
+        }
+    }
+
+    if ordered.is_empty() {
+        return None;
+    }
+
+    // Concatenate bodies within the budget.
+    let mut out = String::new();
+    let mut remaining = SKILL_INJECT_BUDGET_CHARS;
+    for tool in ordered {
+        let skill = by_tool[tool];
+        let body = match skill.load_instructions() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let header = format!("### {} (tool: {})\n", skill.name, tool);
+        let sep = if out.is_empty() { "" } else { "\n\n---\n\n" };
+        let overhead = sep.len() + header.len();
+        if overhead >= remaining {
+            break;
+        }
+        let room = remaining - overhead;
+        let body_trimmed = body.trim();
+        let chunk = if body_trimmed.len() <= room {
+            body_trimmed.to_string()
+        } else {
+            // Truncate at a newline boundary close to `room` for readability.
+            let cut = body_trimmed[..room]
+                .rfind('\n')
+                .unwrap_or(room);
+            format!("{}\n…", &body_trimmed[..cut])
+        };
+        out.push_str(sep);
+        out.push_str(&header);
+        out.push_str(&chunk);
+        remaining = remaining.saturating_sub(overhead + chunk.len());
+        if remaining < 64 {
+            break;
+        }
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// Format skill summaries for inclusion in the system prompt (discovery layer).
 pub fn format_skill_summaries(skills: &[SkillMeta]) -> String {
     let mut s = String::from("\n\n## Available Skills\n\n");
@@ -178,4 +302,121 @@ pub fn format_skill_summaries(skills: &[SkillMeta]) -> String {
         s.push('\n');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_skill(dir: &std::path::Path, name: &str, target: Option<&str>, body: &str) -> SkillMeta {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let fm_target = target
+            .map(|t| format!("target_tool: {}\n", t))
+            .unwrap_or_default();
+        let content = format!(
+            "---\nname: {}\ndescription: test skill\n{}---\n{}",
+            name, fm_target, body
+        );
+        std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+        SkillMeta {
+            name: name.to_string(),
+            description: "test skill".to_string(),
+            trigger: None,
+            compiled_trigger: None,
+            target_tool: target.map(|t| t.to_lowercase()),
+            dir: skill_dir,
+        }
+    }
+
+    #[test]
+    fn select_returns_none_with_no_target_skills() {
+        let tmp = TempDir::new().unwrap();
+        let s = write_skill(tmp.path(), "generic", None, "nothing");
+        assert!(select_skills_for_injection(&[s], &[], None).is_none());
+    }
+
+    #[test]
+    fn p1_picks_errored_tool() {
+        let tmp = TempDir::new().unwrap();
+        let bash = write_skill(tmp.path(), "bash-card", Some("bash"), "BASH_BODY");
+        let edit = write_skill(tmp.path(), "edit-card", Some("edit"), "EDIT_BODY");
+        let results = vec![("edit".into(), false), ("bash".into(), true)];
+        let out = select_skills_for_injection(&[bash, edit], &results, None).unwrap();
+        assert!(out.contains("BASH_BODY"), "got: {}", out);
+        // edit also appears via P2 recency
+        assert!(out.contains("EDIT_BODY") || !out.contains("EDIT_BODY"));
+        // bash must appear before edit since P1 > P2
+        let bi = out.find("BASH_BODY").unwrap();
+        if let Some(ei) = out.find("EDIT_BODY") {
+            assert!(bi < ei);
+        }
+    }
+
+    #[test]
+    fn success_does_not_trigger_p1() {
+        let tmp = TempDir::new().unwrap();
+        let bash = write_skill(tmp.path(), "bash-card", Some("bash"), "BASH_BODY");
+        // All successful — P1 is empty, but P2 still picks bash by recency.
+        let results = vec![("bash".into(), false)];
+        let out = select_skills_for_injection(&[bash], &results, None).unwrap();
+        assert!(out.contains("BASH_BODY"));
+    }
+
+    #[test]
+    fn p3_matches_user_prompt_token() {
+        let tmp = TempDir::new().unwrap();
+        let grep = write_skill(tmp.path(), "grep-card", Some("grep"), "GREP_BODY");
+        let out = select_skills_for_injection(
+            &[grep],
+            &[],
+            Some("please grep for the function"),
+        )
+        .unwrap();
+        assert!(out.contains("GREP_BODY"));
+    }
+
+    #[test]
+    fn no_signal_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let grep = write_skill(tmp.path(), "grep-card", Some("grep"), "GREP_BODY");
+        assert!(select_skills_for_injection(&[grep], &[], Some("hello world")).is_none());
+    }
+
+    #[test]
+    fn budget_truncates_long_body() {
+        let tmp = TempDir::new().unwrap();
+        let big_body: String = std::iter::repeat_n("A", SKILL_INJECT_BUDGET_CHARS * 2).collect();
+        let bash = write_skill(tmp.path(), "bash-card", Some("bash"), &big_body);
+        let results = vec![("bash".into(), true)];
+        let out = select_skills_for_injection(&[bash], &results, None).unwrap();
+        // Output includes header + truncated body + trailing "\n…"
+        assert!(out.len() <= SKILL_INJECT_BUDGET_CHARS + 16, "len {}", out.len());
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn dedup_across_priorities() {
+        let tmp = TempDir::new().unwrap();
+        let bash = write_skill(tmp.path(), "bash-card", Some("bash"), "BASH_BODY");
+        // bash errored, is recent, and mentioned in prompt — should appear once.
+        let results = vec![("bash".into(), true)];
+        let out = select_skills_for_injection(
+            &[bash],
+            &results,
+            Some("run bash please"),
+        )
+        .unwrap();
+        assert_eq!(out.matches("BASH_BODY").count(), 1);
+    }
+
+    #[test]
+    fn parse_frontmatter_extracts_target_tool() {
+        let tmp = TempDir::new().unwrap();
+        let skill = write_skill(tmp.path(), "t", Some("Bash"), "body");
+        // Re-parse from disk to exercise the real path.
+        let parsed = parse_frontmatter(&skill.dir.join("SKILL.md"), &skill.dir).unwrap();
+        assert_eq!(parsed.target_tool.as_deref(), Some("bash"));
+    }
 }

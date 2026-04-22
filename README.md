@@ -104,16 +104,19 @@ Options:
 
 ### Tools
 
-| Tool       | Description                                              |
-|------------|----------------------------------------------------------|
-| `bash`     | Execute shell commands                                   |
-| `read`     | Read file contents (with optional offset/limit)          |
-| `edit`     | Replace an exact string match in a file (returns a diff) |
-| `write`    | Create a new file                                        |
-| `glob`     | Find files by pattern                                    |
-| `grep`     | Search file contents with regex                          |
-| `subagent` | Spawn a sub-agent for a scoped task                      |
-| `skill`    | Activate a skill by name (loads its instructions)        |
+| Tool            | Description                                                     |
+|-----------------|-----------------------------------------------------------------|
+| `bash`          | Execute shell commands                                          |
+| `read`          | Read file contents (with optional offset/limit)                 |
+| `edit`          | Replace an exact string match in a file (returns a diff)        |
+| `write`         | Create a new file                                               |
+| `glob`          | Find files by pattern                                           |
+| `grep`          | Search file contents with regex                                 |
+| `subagent`      | Spawn a sub-agent for a scoped task                             |
+| `skill`         | Activate a skill by name (loads its instructions)               |
+| `evidence_add`  | Stash a short keyed snippet (survives context compaction)       |
+| `evidence_get`  | Retrieve a previously-stored snippet by key                     |
+| `evidence_list` | List keys (optional prefix filter) with short previews          |
 
 Bash, edit, and write require user confirmation by default (use `--no-confirm` or `/bypass` to skip).
 

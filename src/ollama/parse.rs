@@ -104,6 +104,130 @@ pub(super) fn detect_repetition(text: &str) -> bool {
     false
 }
 
+/// Best-effort repair of near-JSON fragments small models sometimes emit as
+/// tool-call arguments.
+///
+/// Handles: single-quoted strings, trailing commas before `}`/`]`, unescaped
+/// control chars inside strings (`\n`/`\r`/`\t`), and unclosed string/array/
+/// object tokens (closed with `"`, `]`, `}` at the end). Does not attempt to
+/// fix unquoted keys or Python-ish literals — those are beyond the budget of
+/// a single-pass repair.
+pub(crate) fn repair_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut chars = s.chars().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut open_braces: i32 = 0;
+    let mut open_brackets: i32 = 0;
+
+    while let Some(c) = chars.next() {
+        if escape {
+            out.push(c);
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match c {
+                '\\' => {
+                    escape = true;
+                    out.push(c);
+                }
+                '"' => {
+                    in_string = false;
+                    out.push(c);
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(c),
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '\'' => {
+                // Rewrite a single-quoted string as a double-quoted one.
+                out.push('"');
+                while let Some(d) = chars.next() {
+                    if d == '\\' {
+                        out.push('\\');
+                        if let Some(e) = chars.next() {
+                            out.push(e);
+                        }
+                        continue;
+                    }
+                    if d == '\'' {
+                        out.push('"');
+                        break;
+                    }
+                    match d {
+                        '"' => {
+                            out.push('\\');
+                            out.push('"');
+                        }
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\t' => out.push_str("\\t"),
+                        _ => out.push(d),
+                    }
+                }
+            }
+            '{' => {
+                open_braces += 1;
+                out.push(c);
+            }
+            '}' => {
+                strip_trailing_comma(&mut out);
+                open_braces -= 1;
+                out.push(c);
+            }
+            '[' => {
+                open_brackets += 1;
+                out.push(c);
+            }
+            ']' => {
+                strip_trailing_comma(&mut out);
+                open_brackets -= 1;
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    if in_string {
+        out.push('"');
+    }
+    for _ in 0..open_brackets.max(0) {
+        out.push(']');
+    }
+    for _ in 0..open_braces.max(0) {
+        out.push('}');
+    }
+    out
+}
+
+fn strip_trailing_comma(out: &mut String) {
+    let trimmed_len = out.trim_end().len();
+    if out[..trimmed_len].ends_with(',') {
+        out.truncate(trimmed_len - 1);
+    }
+}
+
+/// Parse `s` as JSON, falling back to a repaired version if strict parsing
+/// fails. Returns `None` if both attempts fail.
+pub(crate) fn parse_json_lenient(s: &str) -> Option<Value> {
+    if let Ok(v) = serde_json::from_str(s) {
+        return Some(v);
+    }
+    let repaired = repair_json(s);
+    if repaired == s {
+        return None;
+    }
+    serde_json::from_str(&repaired).ok()
+}
+
 /// Find balanced `{…}` JSON objects in a string by brace-matching.
 /// Returns `(json_text, start_byte_offset, end_byte_offset)` for each match.
 fn find_json_objects(text: &str) -> Vec<(String, usize, usize)> {
@@ -228,7 +352,7 @@ pub(super) fn extract_tool_calls_from_content(
     let mut removals: Vec<(usize, usize)> = Vec::new();
 
     for (json_str, start, end) in &objects {
-        if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+        if let Some(val) = parse_json_lenient(json_str) {
             if let (Some(name), Some(arguments)) = (
                 val.get("name").and_then(|v| v.as_str()),
                 val.get("arguments").filter(|a| a.is_object()),
@@ -500,6 +624,85 @@ mod tests {
         let prefix = "x".repeat(100);
         let text = prefix + &"hello".repeat(7);
         assert!(!detect_repetition(&text));
+    }
+
+    // ---------------------------------------------------------------
+    // repair_json / parse_json_lenient
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn repair_json_trailing_comma_object() {
+        let input = r#"{"a": 1, "b": 2,}"#;
+        let v: Value = serde_json::from_str(&repair_json(input)).unwrap();
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], 2);
+    }
+
+    #[test]
+    fn repair_json_trailing_comma_array() {
+        let input = r#"[1, 2, 3,]"#;
+        let v: Value = serde_json::from_str(&repair_json(input)).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn repair_json_single_quotes() {
+        let input = r#"{'command': 'ls -la'}"#;
+        let v: Value = serde_json::from_str(&repair_json(input)).unwrap();
+        assert_eq!(v["command"], "ls -la");
+    }
+
+    #[test]
+    fn repair_json_single_quotes_with_embedded_double() {
+        let input = r#"{'msg': 'say "hi"'}"#;
+        let v: Value = serde_json::from_str(&repair_json(input)).unwrap();
+        assert_eq!(v["msg"], r#"say "hi""#);
+    }
+
+    #[test]
+    fn repair_json_unclosed_object() {
+        let input = r#"{"command": "ls""#;
+        let v: Value = serde_json::from_str(&repair_json(input)).unwrap();
+        assert_eq!(v["command"], "ls");
+    }
+
+    #[test]
+    fn repair_json_unclosed_string_and_object() {
+        let input = r#"{"command": "ls"#;
+        let v: Value = serde_json::from_str(&repair_json(input)).unwrap();
+        assert_eq!(v["command"], "ls");
+    }
+
+    #[test]
+    fn repair_json_raw_newlines_in_string() {
+        let input = "{\"content\": \"line1\nline2\"}";
+        let v: Value = serde_json::from_str(&repair_json(input)).unwrap();
+        assert_eq!(v["content"], "line1\nline2");
+    }
+
+    #[test]
+    fn repair_json_wellformed_unchanged() {
+        let input = r#"{"a": 1}"#;
+        assert_eq!(repair_json(input), input);
+    }
+
+    #[test]
+    fn parse_lenient_falls_back_to_repair() {
+        let v = parse_json_lenient(r#"{"a": 1,}"#).unwrap();
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn parse_lenient_returns_none_for_garbage() {
+        assert!(parse_json_lenient("not json at all !!!").is_none());
+    }
+
+    #[test]
+    fn parse_lenient_strict_first() {
+        // Well-formed JSON should not be run through repair (round-trips fine
+        // either way, but verifies the first branch is taken).
+        let v = parse_json_lenient(r#"{"b": [1, 2, 3]}"#).unwrap();
+        assert_eq!(v["b"][1], 2);
     }
 
     // ---------------------------------------------------------------

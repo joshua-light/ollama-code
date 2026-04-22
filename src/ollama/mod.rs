@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::backend::{ChatResponse, ModelBackend, ModelInfo};
-use crate::message::{Message, ToolCall};
+use crate::message::{self, Message, ToolCall};
 
 /// If no bytes arrive within this window the stream is considered stalled.
 const STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -37,6 +37,11 @@ struct ChatRequest {
     /// Ollama ignores this field; llama-server requires it to report token counts.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    /// Ask Ollama to emit a separate reasoning channel (`message.thinking`).
+    /// Ignored by llama-server (it emits reasoning inline or under
+    /// `reasoning_content` depending on the model's template).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -133,6 +138,7 @@ impl ModelBackend for OllamaBackend {
         messages: &'a [Message],
         tools: Option<Vec<Value>>,
         num_ctx: Option<u64>,
+        thinking_budget_tokens: Option<u64>,
         on_token: Box<dyn Fn(&str) + Send + 'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
         Box::pin(async move {
@@ -163,6 +169,13 @@ impl ModelBackend for OllamaBackend {
                 })
                 .unwrap_or_default();
 
+            let think = thinking_budget_tokens.map(|_| true);
+            // Budget in chars, using the same rough chars/token heuristic the
+            // rest of the codebase uses for context estimates. When None, the
+            // counter is never checked.
+            let budget_chars: Option<usize> = thinking_budget_tokens
+                .map(|n| (n as usize) * (message::CHARS_PER_TOKEN as usize));
+
             let request = ChatRequest {
                 model: model.to_string(),
                 messages: messages.to_vec(),
@@ -170,6 +183,7 @@ impl ModelBackend for OllamaBackend {
                 stream: true,
                 options,
                 stream_options: Some(StreamOptions { include_usage: true }),
+                think,
             };
 
             let resp = self
@@ -190,10 +204,12 @@ impl ModelBackend for OllamaBackend {
             }
 
             let mut content = String::new();
+            let mut thinking = String::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             let mut metrics = TimingMetrics::new();
             let mut saw_done = false;
             let mut repetition_detected = false;
+            let mut thinking_budget_exceeded = false;
             let mut token_count: u32 = 0;
 
             let mut stream = resp.bytes_stream();
@@ -253,6 +269,7 @@ impl ModelBackend for OllamaBackend {
                         let finish = process_openai_chunk(
                             &parsed,
                             &mut content,
+                            &mut thinking,
                             &mut openai_tool_accum,
                             &mut metrics,
                             &*on_token,
@@ -269,6 +286,7 @@ impl ModelBackend for OllamaBackend {
                         process_chunk(
                             &parsed,
                             &mut content,
+                            &mut thinking,
                             &mut tool_calls,
                             &mut metrics,
                             &*on_token,
@@ -276,6 +294,17 @@ impl ModelBackend for OllamaBackend {
                         if parsed.done {
                             saw_done = true;
                             break;
+                        }
+                    }
+
+                    // Thinking-budget cap: abort mid-stream once accumulated
+                    // reasoning tokens blow past the configured budget. The
+                    // reqwest body stream is dropped on scope exit, so we stop
+                    // paying wall-clock immediately.
+                    if let Some(limit) = budget_chars {
+                        if thinking.len() > limit {
+                            thinking_budget_exceeded = true;
+                            break 'stream;
                         }
                     }
 
@@ -291,11 +320,12 @@ impl ModelBackend for OllamaBackend {
             }
 
             let remaining = String::from_utf8_lossy(&buffer);
-            if !saw_done {
+            if !saw_done && !thinking_budget_exceeded {
                 saw_done = process_remaining_buffer(
                     &remaining,
                     is_openai,
                     &mut content,
+                    &mut thinking,
                     &mut tool_calls,
                     &mut openai_tool_accum,
                     &mut metrics,
@@ -305,6 +335,7 @@ impl ModelBackend for OllamaBackend {
 
             Ok(postprocess_response(StreamResult {
                 content,
+                thinking,
                 tool_calls,
                 openai_tool_accum,
                 is_openai: is_openai == Some(true),
@@ -312,6 +343,7 @@ impl ModelBackend for OllamaBackend {
                 metrics,
                 saw_done,
                 repetition_detected,
+                thinking_budget_exceeded,
             }))
         })
     }

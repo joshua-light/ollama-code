@@ -133,6 +133,12 @@ pub async fn run_pipe(
             AgentEvent::Debug(ref msg) if verbose => {
                 eprintln!("[debug] {}", msg);
             }
+            AgentEvent::ThinkingBudgetExceeded { thinking_tokens } => {
+                eprintln!(
+                    "[thinking budget exceeded ({} tokens) — thinking disabled, forcing commit]",
+                    thinking_tokens
+                );
+            }
             AgentEvent::ReloadComplete { .. }
             | AgentEvent::ContextUpdate { .. }
             | AgentEvent::MessageLogged(_)

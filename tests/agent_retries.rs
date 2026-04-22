@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use harness::{run_agent, run_agent_with_config, ConfirmStrategy, MockBackend, MockResponse};
 use ollama_code::config::Config;
+use ollama_code::message::Role;
 
 // ── Empty response retries ──────────────────────────────────────────
 
@@ -115,6 +116,79 @@ async fn incomplete_with_content_emits_error_and_done() {
 }
 
 // ── Context exhaustion ──────────────────────────────────────────────
+
+// ── Thinking budget ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn thinking_budget_flips_sticky_off_and_injects_follow_up() {
+    // Turn 1: model trips the budget (thinking_budget_exceeded=true, no final answer).
+    // Turn 2: backend should receive a synthetic "commit" user message,
+    //         thinking_budget_tokens is None (sticky off), and the model
+    //         answers normally.
+    let mut first = MockResponse::text("Partial reasoning leaked into content")
+        .with_thinking_budget_exceeded("long-winded reasoning that blew the budget");
+    // Force the harness to stream this content so we can verify the tagged
+    // assistant message gets persisted.
+    first.content = "Partial reasoning leaked into content".to_string();
+
+    let backend = Arc::new(MockBackend::new(vec![
+        first,
+        MockResponse::text("Here is the committed answer."),
+    ]));
+
+    let config = Config {
+        thinking_budget_tokens: Some(128),
+        ..Default::default()
+    };
+    let result =
+        run_agent_with_config(backend.clone(), "solve this", ConfirmStrategy::ApproveAll, &config).await;
+
+    assert!(result.is_done());
+
+    // The final assistant message logged to the session is the committed
+    // answer from turn 2. (`final_content` concatenates all streamed tokens
+    // including the partial from the aborted turn, which isn't what we care
+    // about here.)
+    let logged = result.logged_messages();
+    let final_assistant = logged
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant))
+        .expect("expected a final assistant message");
+    assert_eq!(final_assistant.content, "Here is the committed answer.");
+
+    // Two backend calls — one that tripped the budget, one after the nudge.
+    let calls = backend.calls();
+    assert_eq!(calls.len(), 2);
+
+    // First call: budget set to Some(128).
+    assert_eq!(calls[0].thinking_budget_tokens, Some(128));
+    // Second call: sticky-off kicks in.
+    assert_eq!(calls[1].thinking_budget_tokens, None);
+
+    // Second call's message history includes the partial assistant (tagged)
+    // and the synthetic user nudge right before the fresh turn.
+    let msgs = &calls[1].messages;
+    assert!(
+        msgs.iter().any(|m| matches!(m.role, Role::Assistant)
+            && m.content.contains("[auto: thinking budget exceeded")),
+        "expected tagged partial assistant message in history",
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(m.role, Role::User)
+            && m.content.starts_with("[auto]")
+            && m.content.contains("Commit to an implementation")),
+        "expected synthetic 'commit' user message in history",
+    );
+}
+
+#[tokio::test]
+async fn thinking_budget_none_by_default_means_no_think_flag() {
+    let backend = Arc::new(MockBackend::new(vec![MockResponse::text("Answer.")]));
+    let result = run_agent(backend.clone(), "hello", ConfirmStrategy::ApproveAll).await;
+    assert!(result.is_done());
+    assert_eq!(backend.calls()[0].thinking_budget_tokens, None);
+}
 
 #[tokio::test]
 async fn context_full_emits_error() {
