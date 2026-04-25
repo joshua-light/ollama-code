@@ -105,6 +105,11 @@ pub struct Agent {
     /// Hard cap on the total number of agent-loop turns for the main agent.
     /// `None` = unlimited. Sub-agents use `max_turns` instead.
     main_turn_cap: Option<u32>,
+    /// (tool_name, canonical_args) of the last dispatched tool call. Reset at
+    /// the start of every `run()`. Used by `dispatch_tool_call` to detect
+    /// immediate repeats and short-circuit them with a corrective synthetic
+    /// result, so a small model that loops on the same call doesn't burn turns.
+    pub(super) last_tool_signature: Option<(String, String)>,
 }
 
 impl Agent {
@@ -190,6 +195,7 @@ impl Agent {
             // Main-agent turn cap only applies when this isn't a sub-agent —
             // sub-agents use `max_turns` which is already set.
             main_turn_cap: if is_subagent { None } else { cfg.max_turns },
+            last_tool_signature: None,
         }
     }
 
@@ -679,7 +685,13 @@ impl Agent {
             return;
         };
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let has_errors = stderr.contains("error[");
+        // `error[E…]` covers compiler diagnostics with codes; `error:` covers
+        // parse errors (e.g. "unclosed delimiter") and the "could not compile"
+        // tail. Without the second pattern, syntax errors silently slip past
+        // the auto-check and the model keeps editing a broken file.
+        let has_errors = !output.status.success()
+            || stderr.contains("error[")
+            || stderr.contains("error:");
         let has_warnings = stderr.contains("warning:");
         if !(has_errors || has_warnings) {
             return;
@@ -690,7 +702,9 @@ impl Agent {
             label,
             stderr
                 .lines()
-                .filter(|l| l.contains("error") || l.contains("warning"))
+                .filter(|l| {
+                    l.contains("error[") || l.starts_with("error:") || l.contains("warning:")
+                })
                 .take(20)
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -779,6 +793,7 @@ impl Agent {
         self.current_task = user_input.to_string();
         self.has_explored = false;
         self.had_edits_this_run = false;
+        self.last_tool_signature = None;
 
         let user_msg = Message::user(user_input);
         self.messages.push(user_msg.clone());

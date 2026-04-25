@@ -197,7 +197,7 @@ impl Agent {
                 events,
                 AgentEvent::ToolConfirmRequest {
                     name: name.clone(),
-                    args: args_display,
+                    args: args_display.clone(),
                 },
             )?;
 
@@ -218,6 +218,27 @@ impl Agent {
             self.emit_tool_error(events, &name, tool_call.id.clone(), msg)?;
             return Ok(true);
         }
+
+        // Short-circuit immediate repeats. A small model that gets stuck in a
+        // loop will keep emitting the same tool call. Re-running it just burns
+        // turns; injecting a corrective synthetic result breaks the cycle.
+        // `serde_json::Map` is `BTreeMap`-backed (no `preserve_order` feature),
+        // so `to_string` produces a key-sorted, stable canonical form.
+        let canonical_args = serde_json::to_string(args).unwrap_or_default();
+        if let Some((last_name, last_args)) = self.last_tool_signature.as_ref() {
+            if last_name == &name && last_args == &canonical_args {
+                let msg = format!(
+                    "[auto] You just called {}({}) with identical arguments. \
+                     The result was the same. Repeating won't help — try a different \
+                     approach (different args, a different tool, or commit to a final answer).",
+                    name, args_display
+                );
+                self.emit_tool_error(events, &name, tool_call.id.clone(), msg)?;
+                // Keep last_tool_signature unchanged so a third repeat is also caught.
+                return Ok(true);
+            }
+        }
+        self.last_tool_signature = Some((name.clone(), canonical_args));
 
         // Check cancellation before each tool call.
         // NOTE: callers rely on no tool result message being pushed when we

@@ -15,7 +15,7 @@ A terminal-based AI coding agent that runs locally via [Ollama](https://ollama.c
 - **Session management** — conversations saved as JSONL, with resume (`--resume`) and rewind (`/rewind`)
 - **Project config** — per-project `.ollama-code.toml` layered over user config
 - **Context window tracking** — segmented context bar with auto-trimming
-- **Small-model tuning** — sampling params, dynamic tool scoping, tool validation, and task re-injection
+- **Small-model tuning** — sampling params, dynamic tool scoping, tool validation, task re-injection, and duplicate tool-call short-circuiting
 - **Cancellation** — press Esc to cancel in-flight generation
 - **Repetition detection** — detects and recovers from degenerate output loops
 
