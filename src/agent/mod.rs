@@ -110,6 +110,19 @@ pub struct Agent {
     /// immediate repeats and short-circuit them with a corrective synthetic
     /// result, so a small model that loops on the same call doesn't burn turns.
     pub(super) last_tool_signature: Option<(String, String)>,
+    /// Number of consecutive immediate-repeat detections on the current
+    /// signature. Each repeat escalates the corrective message; after a few
+    /// the harness injects a system message and starts hard-refusing the
+    /// call until the model picks a different tool or arguments. Reset when
+    /// the model finally varies its call.
+    pub(super) consecutive_repeat_count: u32,
+    /// One entry per cargo-check observation in the current `run()`, holding
+    /// the set of error signatures (code + primary span) seen at that point.
+    /// Compared against new sets to detect oscillation/regression — the
+    /// rendered diagnostics already tell the model *what* is broken; this
+    /// tells it *whether its own edits are making things better or worse*.
+    /// Reset at the start of each run.
+    pub(super) compile_attempts: util::AttemptHistory,
 }
 
 impl Agent {
@@ -196,6 +209,8 @@ impl Agent {
             // sub-agents use `max_turns` which is already set.
             main_turn_cap: if is_subagent { None } else { cfg.max_turns },
             last_tool_signature: None,
+            consecutive_repeat_count: 0,
+            compile_attempts: Vec::new(),
         }
     }
 
@@ -672,44 +687,34 @@ impl Agent {
     /// inject the diagnostics as a system message if there are errors or
     /// warnings. No-op if no edits happened or there's no Cargo.toml.
     async fn run_post_edit_cargo_check(&mut self) {
-        if !self.had_edits_this_run || !std::path::Path::new("Cargo.toml").exists() {
+        if !self.had_edits_this_run {
             return;
         }
         self.had_edits_this_run = false;
-
-        let Ok(output) = tokio::process::Command::new("cargo")
-            .args(["check", "--message-format=short"])
-            .output()
-            .await
-        else {
-            return;
-        };
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // `error[E…]` covers compiler diagnostics with codes; `error:` covers
-        // parse errors (e.g. "unclosed delimiter") and the "could not compile"
-        // tail. Without the second pattern, syntax errors silently slip past
-        // the auto-check and the model keeps editing a broken file.
-        let has_errors = !output.status.success()
-            || stderr.contains("error[")
-            || stderr.contains("error:");
-        let has_warnings = stderr.contains("warning:");
-        if !(has_errors || has_warnings) {
-            return;
+        if let Some(body) = self.check_and_record_cargo_diagnostics().await {
+            self.messages.push(Message::system(&body));
         }
-        let label = if has_errors { "errors" } else { "warnings" };
-        let check_msg = format!(
-            "[Auto cargo check detected {}]\n{}",
-            label,
-            stderr
-                .lines()
-                .filter(|l| {
-                    l.contains("error[") || l.starts_with("error:") || l.contains("warning:")
-                })
-                .take(20)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        self.messages.push(Message::system(&check_msg));
+    }
+
+    /// Run `cargo check` and record the resulting error signature set in
+    /// `compile_attempts`. Returns the rendered diagnostics block (with any
+    /// oscillation advisory appended) for the caller to inject. Skips the
+    /// `compile_attempts` push when the new set is identical to the previous
+    /// one — pushing duplicates inflates `analyze_compile_oscillation`'s
+    /// `rposition` walk without changing what it can detect.
+    pub(super) async fn check_and_record_cargo_diagnostics(&mut self) -> Option<String> {
+        let diag = util::collect_cargo_diagnostics().await?;
+        let mut body = diag.rendered_block;
+        if let Some(advisory) =
+            util::analyze_compile_oscillation(&self.compile_attempts, &diag.error_sigs)
+        {
+            body.push_str("\n\n");
+            body.push_str(&advisory);
+        }
+        if self.compile_attempts.last() != Some(&diag.error_sigs) {
+            self.compile_attempts.push(diag.error_sigs);
+        }
+        Some(body)
     }
 
     /// Build the message list for the next `backend.chat()` call. When
@@ -794,6 +799,8 @@ impl Agent {
         self.has_explored = false;
         self.had_edits_this_run = false;
         self.last_tool_signature = None;
+        self.consecutive_repeat_count = 0;
+        self.compile_attempts.clear();
 
         let user_msg = Message::user(user_input);
         self.messages.push(user_msg.clone());
@@ -903,7 +910,7 @@ impl Agent {
             )?;
 
             let thinking_budget = if self.thinking_disabled {
-                None
+                Some(0)
             } else {
                 self.config
                     .as_ref()
@@ -938,36 +945,40 @@ impl Agent {
                 return Ok(());
             }
 
-            // Thinking budget tripped mid-stream: flip the session-sticky
-            // thinking-off flag, persist any real partial content (tagged), and
-            // inject a synthetic user turn forcing a commit.
+            // Thinking budget tripped mid-stream. Bounded-thinking-with-retry:
+            // preserve the partial reasoning trace, reinject it as assistant
+            // context so the model sees its own conclusions in history, then
+            // retry with thinking disabled. This stops the model from
+            // re-deliberating the same problem from scratch on every turn —
+            // its prior reasoning is now observable state it can act on.
             if response.thinking_budget_exceeded {
                 self.thinking_disabled = true;
                 let thinking_tokens = message::estimate_tokens(response.thinking.len());
-                let partial = response.content.trim();
-                if !partial.is_empty() {
-                    let tagged = format!(
-                        "{}\n\n[auto: thinking budget exceeded — forcing commit]",
-                        partial
-                    );
-                    send_event(events, AgentEvent::ContentReplaced(tagged.clone()))?;
-                    let assistant_msg = Message::assistant(&tagged);
-                    self.messages.push(assistant_msg.clone());
-                    send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
-                } else {
-                    send_event(events, AgentEvent::ContentReplaced(String::new()))?;
+                let trace = response.thinking.trim();
+                let partial_content = response.content.trim();
+                let mut combined = String::new();
+                if !trace.is_empty() {
+                    combined.push_str("[partial reasoning, truncated at budget]\n");
+                    combined.push_str(trace);
                 }
+                if !partial_content.is_empty() {
+                    if !combined.is_empty() {
+                        combined.push_str("\n\n");
+                    }
+                    combined.push_str(partial_content);
+                }
+                if combined.is_empty() {
+                    combined
+                        .push_str("[auto: thinking budget exceeded — no partial output captured]");
+                }
+                send_event(events, AgentEvent::ContentReplaced(combined.clone()))?;
+                let assistant_msg = Message::assistant(&combined);
+                self.messages.push(assistant_msg.clone());
+                send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
                 send_event(
                     events,
                     AgentEvent::ThinkingBudgetExceeded { thinking_tokens },
                 )?;
-                let nudge = Message::user(
-                    "[auto] You've spent enough time deliberating. Commit to an \
-                     implementation now — call a tool or give a final answer. \
-                     Do not reason further.",
-                );
-                self.messages.push(nudge.clone());
-                send_event(events, AgentEvent::MessageLogged(nudge))?;
                 empty_retries = 0;
                 continue;
             }

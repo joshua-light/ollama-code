@@ -156,6 +156,25 @@ pub(super) fn build_system_prompt(
         .replace("{subagent_tool}", subagent_desc)
         .replace("{skill_tool}", skill_desc);
 
+    // Plan-tracking guidance: surfaces the model's intended steps in a form
+    // the harness's compaction extractor can find. Without this, plans live
+    // only inside thinking/prose and get summarized away on compaction.
+    prompt.push_str(
+        "\n\n## Plan tracking\n\
+         \n\
+         For non-trivial tasks (anything beyond a single edit or single read), \
+         maintain a short numbered checklist in your responses using these \
+         markers:\n\
+         - `- [ ] step description` — pending\n\
+         - `- [x] step description` — done\n\
+         - `- [-] step description` — skipped\n\
+         \n\
+         Update the checklist as you complete steps. The harness scans your \
+         most recent message for the latest checklist block and pins it across \
+         context compactions, so your plan persists even when older messages \
+         are summarized away. Keep plans short (5–10 items) and focused on the \
+         current task.\n",
+    );
     let base_len = prompt.len();
 
     let skills_summary_len = if !discovered_skills.is_empty() {

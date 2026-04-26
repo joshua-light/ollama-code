@@ -1,64 +1,17 @@
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fs;
-use std::sync::Mutex;
 
 use super::{expand_tilde, required_str, Tool, ToolDefinition};
 
-/// Tracks which (path, start, end) ranges have been read.
-struct ReadCache {
-    /// path -> list of (start_line_0based, end_line_0based) ranges read.
-    ranges: HashMap<String, Vec<(usize, usize)>>,
-}
-
-impl ReadCache {
-    fn new() -> Self {
-        Self {
-            ranges: HashMap::new(),
-        }
-    }
-
-    /// Check if the requested range is fully covered by a previous read.
-    fn is_covered(&self, path: &str, start: usize, end: usize) -> bool {
-        if let Some(ranges) = self.ranges.get(path) {
-            ranges.iter().any(|&(s, e)| s <= start && e >= end)
-        } else {
-            false
-        }
-    }
-
-    /// Record a read range.
-    fn record(&mut self, path: &str, start: usize, end: usize) {
-        self.ranges
-            .entry(path.to_string())
-            .or_default()
-            .push((start, end));
-    }
-
-    /// Clear the cache (e.g. on conversation clear).
-    #[allow(dead_code)]
-    fn clear(&mut self) {
-        self.ranges.clear();
-    }
-}
-
-pub struct ReadTool {
-    cache: Mutex<ReadCache>,
-}
+pub struct ReadTool;
 
 impl Default for ReadTool {
-    fn default() -> Self {
-        Self {
-            cache: Mutex::new(ReadCache::new()),
-        }
-    }
+    fn default() -> Self { Self }
 }
 
 impl ReadTool {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self }
 }
 
 impl Tool for ReadTool {
@@ -124,39 +77,15 @@ impl Tool for ReadTool {
         let end = (start + limit).min(total_lines);
         let truncated = end < total_lines && raw_limit.is_none();
 
-        // Check read cache for duplicate reads
-        let dedup_note = {
-            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            let covered = cache.is_covered(file_path.as_ref(), start, end);
-            cache.record(file_path.as_ref(), start, end);
-            if covered {
-                Some(format!(
-                    "(Note: you have already read this section of '{}'. \
-                     Consider using the information from the earlier read instead \
-                     of re-reading the same content.)\n\n",
-                    file_path
-                ))
-            } else {
-                None
-            }
-        };
-
         let mut result = String::new();
-
-        let has_dedup_note = dedup_note.is_some();
-        if let Some(note) = dedup_note {
-            result.push_str(&note);
-        }
 
         for (i, line) in lines[start..end].iter().enumerate() {
             let line_num = start + i + 1;
             result.push_str(&format!("{:>4}\t{}\n", line_num, line));
         }
 
-        if result.is_empty() || (has_dedup_note && lines[start..end].is_empty()) {
-            if !has_dedup_note {
-                result = "(empty file)".to_string();
-            }
+        if result.is_empty() {
+            result = "(empty file)".to_string();
         } else if limit_capped && end < total_lines {
             result.push_str(&format!(
                 "\n... (limit capped to {} lines, {} more lines not shown. \

@@ -16,7 +16,7 @@ use crate::backend::{ChatResponse, ModelBackend, ModelInfo};
 use crate::message::{self, Message, ToolCall};
 
 /// If no bytes arrive within this window the stream is considered stalled.
-const STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(180);
 
 use parse::detect_repetition;
 use streaming::{
@@ -169,12 +169,32 @@ impl ModelBackend for OllamaBackend {
                 })
                 .unwrap_or_default();
 
-            let think = thinking_budget_tokens.map(|_| true);
-            // Budget in chars, using the same rough chars/token heuristic the
-            // rest of the codebase uses for context estimates. When None, the
-            // counter is never checked.
-            let budget_chars: Option<usize> = thinking_budget_tokens
-                .map(|n| (n as usize) * (message::CHARS_PER_TOKEN as usize));
+            // Thinking-budget semantics:
+            //   Some(0) → explicitly disable thinking (`think: false`, no
+            //             stream-side budget enforcement). The harness flips
+            //             to this after the budget tripped once, so models
+            //             that think unconditionally stop emitting reasoning
+            //             on retry.
+            //   Some(N) → enable thinking with budget N tokens.
+            //   None    → no explicit opt-in/out; still cap accumulated
+            //             thinking at the default to avoid a single turn
+            //             burning the whole stream on reasoning the harness
+            //             can't see.
+            const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 2048;
+            let (think, budget_chars): (Option<bool>, Option<usize>) = match thinking_budget_tokens {
+                Some(0) => (Some(false), None),
+                Some(n) => (
+                    Some(true),
+                    Some((n as usize) * (message::CHARS_PER_TOKEN as usize)),
+                ),
+                None => (
+                    None,
+                    Some(
+                        (DEFAULT_THINKING_BUDGET_TOKENS as usize)
+                            * (message::CHARS_PER_TOKEN as usize),
+                    ),
+                ),
+            };
 
             let request = ChatRequest {
                 model: model.to_string(),

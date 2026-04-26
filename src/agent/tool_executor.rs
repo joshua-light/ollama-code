@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::message::Message;
+use crate::message::{Message, Role};
 use crate::tools::BashTool;
 
 use super::events::{send_event, AgentEvent};
-use super::util::{poll_cancel, truncate_tool_output};
+use super::util::{poll_cancel, truncate_tool_output, AUTO_CARGO_CHECK_PREFIX};
 use super::Agent;
 
 impl Agent {
@@ -222,23 +222,64 @@ impl Agent {
         // Short-circuit immediate repeats. A small model that gets stuck in a
         // loop will keep emitting the same tool call. Re-running it just burns
         // turns; injecting a corrective synthetic result breaks the cycle.
+        // The corrective message escalates: a soft warning the first time, a
+        // stronger system-level intervention the second, a hard refusal the
+        // third+. Smaller models have been observed to re-issue the same
+        // read/grep call several times despite a single warning.
         // `serde_json::Map` is `BTreeMap`-backed (no `preserve_order` feature),
         // so `to_string` produces a key-sorted, stable canonical form.
         let canonical_args = serde_json::to_string(args).unwrap_or_default();
         if let Some((last_name, last_args)) = self.last_tool_signature.as_ref() {
             if last_name == &name && last_args == &canonical_args {
-                let msg = format!(
-                    "[auto] You just called {}({}) with identical arguments. \
-                     The result was the same. Repeating won't help — try a different \
-                     approach (different args, a different tool, or commit to a final answer).",
-                    name, args_display
-                );
-                self.emit_tool_error(events, &name, tool_call.id.clone(), msg)?;
-                // Keep last_tool_signature unchanged so a third repeat is also caught.
+                self.consecutive_repeat_count =
+                    self.consecutive_repeat_count.saturating_add(1);
+                let count = self.consecutive_repeat_count;
+                let tool_msg = match count {
+                    1 => format!(
+                        "[auto] You just called {}({}) with identical arguments. \
+                         The result was the same. Repeating won't help — try a \
+                         different approach (different args, a different tool, or \
+                         commit to a final answer).",
+                        name, args_display
+                    ),
+                    2 => format!(
+                        "[auto] {}({}) — that's the third identical call in a row. \
+                         Stop. You either have enough context to act (call edit / \
+                         write / bash, or finish), or you need different arguments. \
+                         Repeating the same call will not change the result.",
+                        name, args_display
+                    ),
+                    _ => format!(
+                        "[auto] HARD REFUSAL: {}({}) — call #{} in a row with \
+                         identical arguments. The harness will not execute this \
+                         again until you change tool or arguments. Pick edit / \
+                         write / bash, or emit a final answer.",
+                        name,
+                        args_display,
+                        count + 1,
+                    ),
+                };
+                self.emit_tool_error(events, &name, tool_call.id.clone(), tool_msg)?;
+                // On the second escalation, also inject a system message —
+                // tool errors live at Role::Tool and the model has demonstrably
+                // ignored them. A Role::System message carries more weight.
+                if count == 2 {
+                    let nudge = Message::system(
+                        "[harness] You have been calling the same tool with the \
+                         same arguments repeatedly despite warnings. You have \
+                         enough context. Take a concrete action: call `edit`, \
+                         `write`, or `bash` — or emit a final answer. Do not \
+                         re-read or re-grep the same target.",
+                    );
+                    self.messages.push(nudge.clone());
+                    send_event(events, AgentEvent::MessageLogged(nudge))?;
+                }
+                // Keep last_tool_signature unchanged so the next repeat is also caught.
                 return Ok(true);
             }
         }
         self.last_tool_signature = Some((name.clone(), canonical_args));
+        self.consecutive_repeat_count = 0;
 
         // Check cancellation before each tool call.
         // NOTE: callers rely on no tool result message being pushed when we
@@ -305,19 +346,40 @@ impl Agent {
             self.has_explored = true;
         }
 
-        // Track file reads for subagent context injection
+        // Track file reads for subagent context injection.
+        // Also rewrite prior overlapping read tool-results in history to a
+        // short stub. The current full content stays at the most recent
+        // position, so the model always sees fresh data "now" and prior
+        // copies of the same range stop competing for attention.
         if success && name == "read" {
             if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
                 let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
                 let start = offset.max(1) - 1;
                 self.read_file_ranges.push((path.to_string(), start, start + limit));
+                let expanded = crate::tools::expand_tilde(path).into_owned();
+                self.rewrite_superseded_reads(&expanded, start, start + limit);
             }
         }
 
         // Track edits for post-edit compilation and subagent enforcement
         if success && matches!(name.as_str(), "edit" | "write") {
             self.had_edits_this_run = true;
+        }
+
+        // If the model ran a cargo command itself (typically piped through
+        // `head`/`grep` that strips rustc's `help:`/`note:` lines) and the
+        // surviving output mentions errors, append the full structured
+        // diagnostics. Skip when no error markers are present or when the
+        // output already looks like the rich format we'd produce.
+        if name == "bash"
+            && bash_command_runs_cargo(args)
+            && bash_output_has_rustc_errors(&result)
+            && !result.contains(AUTO_CARGO_CHECK_PREFIX)
+        {
+            if let Some(block) = self.check_and_record_cargo_diagnostics().await {
+                result = format!("{}\n\n{}", result, block);
+            }
         }
 
         // --- post_tool_execute hooks ---
@@ -347,4 +409,102 @@ impl Agent {
 
         Ok(true)
     }
+}
+
+/// Sentinel prefix on a stubbed-out `read` tool-result. Both written by
+/// `rewrite_superseded_reads` and matched there to skip already-stubbed
+/// messages on subsequent rewrites.
+const SUPERSEDED_PREFIX: &str = "[superseded]";
+
+impl Agent {
+    /// Replace the bodies of prior `read` tool-result messages whose request
+    /// range is fully covered by the just-completed read. The full content
+    /// of the new read stays at its current position; older copies become a
+    /// one-line stub. Token cost stays bounded — only one full copy of any
+    /// given range lives in context at a time. We compare on the request
+    /// args (path/offset/limit), not on returned content, because a prior
+    /// read of `[1, 200)` is logically superseded by a later read of
+    /// `[1, 500)` even if the file was only 50 lines.
+    fn rewrite_superseded_reads(&mut self, new_path: &str, new_start: usize, new_end: usize) {
+        // tool_call_id -> (expanded_path, start, end) for every `read` call
+        // we can still see in history. Walk assistant messages once.
+        let mut index: std::collections::HashMap<String, (String, usize, usize)> =
+            std::collections::HashMap::new();
+        for msg in &self.messages {
+            if !matches!(msg.role, Role::Assistant) {
+                continue;
+            }
+            let Some(ref calls) = msg.tool_calls else {
+                continue;
+            };
+            for tc in calls {
+                if tc.function.name != "read" {
+                    continue;
+                }
+                let Some(id) = tc.id.clone() else { continue; };
+                let args = &tc.function.arguments;
+                let Some(raw_path) = args.get("file_path").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let path = crate::tools::expand_tilde(raw_path).into_owned();
+                let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                let start = offset.saturating_sub(1);
+                let end = start.saturating_add(limit);
+                index.insert(id, (path, start, end));
+            }
+        }
+
+        for msg in self.messages.iter_mut() {
+            if !matches!(msg.role, Role::Tool) {
+                continue;
+            }
+            if msg.content.starts_with(SUPERSEDED_PREFIX) {
+                continue;
+            }
+            let Some(id) = msg.tool_call_id.as_ref() else {
+                continue;
+            };
+            let Some((path, start, end)) = index.get(id) else {
+                continue;
+            };
+            if path != new_path {
+                continue;
+            }
+            // Rewrite when the new read fully covers the prior request.
+            if *start >= new_start && *end <= new_end {
+                msg.content = format!(
+                    "{} Lines {}-{} of '{}' — replaced by a later read of an overlapping range; refer to that result.",
+                    SUPERSEDED_PREFIX,
+                    start + 1,
+                    end,
+                    path,
+                );
+            }
+        }
+    }
+}
+
+/// True if the bash command string starts with (or pipes through) a `cargo`
+/// invocation that exercises rustc — so a follow-up `cargo check` would
+/// surface diagnostics. Cheap string scan; false positives are harmless
+/// (the diagnostic re-run is a no-op on a clean tree).
+fn bash_command_runs_cargo(args: &serde_json::Value) -> bool {
+    let cmd = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // Strip leading `cd …; ` / `cd …&&` so common shell wrappers don't hide
+    // the cargo call. We only need a coarse signal.
+    let scan = cmd.replace("&&", " ").replace(';', " ");
+    for token in ["cargo build", "cargo check", "cargo test", "cargo clippy", "cargo run"] {
+        if scan.contains(token) {
+            return true;
+        }
+    }
+    false
+}
+
+fn bash_output_has_rustc_errors(output: &str) -> bool {
+    output.contains("error[E") || output.contains("error: ") || output.contains("could not compile")
 }
