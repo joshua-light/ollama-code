@@ -60,6 +60,14 @@ pub enum AgentEvent {
         /// Labels are "Built-in", "MCP: <server>", or "Plugins".
         tool_defs_breakdown: Vec<(String, u64)>,
     },
+    /// Enforced planning phase: planner sub-agent is starting.
+    PlanningStarted,
+    /// Planner sub-agent finished and produced a plan. Carries the ordered
+    /// list of step descriptions (including any auto-appended steps).
+    PlanReady { steps: Vec<String> },
+    /// Termination gate fired: the model tried to end its turn while plan
+    /// steps were unfinished. Carries the descriptions still pending.
+    PlanGated { remaining: Vec<String> },
 }
 
 /// Send an event through the channel, returning an error if the receiver is gone.

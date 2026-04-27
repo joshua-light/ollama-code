@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use ollama_code::agent::{Agent, AgentEvent};
 use ollama_code::backend::{ChatResponse, ModelBackend};
-use ollama_code::config::Config;
+use ollama_code::config::{Config, PlanConfig};
 use ollama_code::message::{FunctionCall, Message, ToolCall};
 
 // ---------------------------------------------------------------------------
@@ -365,13 +365,24 @@ pub async fn run_agent(
 }
 
 /// Run with a custom `Config` (for testing feature flags, plugin config, etc.).
+///
+/// If the caller's config doesn't set `plan`, planning is force-disabled here
+/// so tests that don't script planner responses keep working. Opt in with an
+/// explicit `plan: Some(PlanConfig { enabled: true, .. })`.
 pub async fn run_agent_with_config(
     backend: Arc<MockBackend>,
     input: &str,
     confirm: ConfirmStrategy,
     config: &Config,
 ) -> TestResult {
-    run_agent_full(backend, input, confirm, None, Some(config)).await
+    let mut cfg = config.clone();
+    if cfg.plan.is_none() {
+        cfg.plan = Some(PlanConfig {
+            enabled: false,
+            ..Default::default()
+        });
+    }
+    run_agent_full(backend, input, confirm, None, Some(&cfg)).await
 }
 
 /// Run with additional configuration (cancel flag, etc.).
@@ -392,23 +403,25 @@ async fn run_agent_full(
     cancel: Option<Arc<AtomicBool>>,
     config: Option<&Config>,
 ) -> TestResult {
-    let mut agent = match config {
-        Some(cfg) => Agent::with_config(
-            backend.clone(),
-            "test-model".to_string(),
-            8192,
-            std::time::Duration::from_secs(30),
-            4,
-            cfg,
-        ),
-        None => Agent::new(
-            backend.clone(),
-            "test-model".to_string(),
-            8192,
-            std::time::Duration::from_secs(30),
-            4,
-        ),
+    // Default to plan-disabled so existing scripted tests don't need to
+    // budget for planner backend calls. Tests that exercise planning pass
+    // an explicit config via run_agent_with_config.
+    let default_cfg = Config {
+        plan: Some(PlanConfig {
+            enabled: false,
+            ..Default::default()
+        }),
+        ..Default::default()
     };
+    let cfg_to_use = config.unwrap_or(&default_cfg);
+    let mut agent = Agent::with_config(
+        backend.clone(),
+        "test-model".to_string(),
+        8192,
+        std::time::Duration::from_secs(30),
+        4,
+        cfg_to_use,
+    );
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (confirm_tx, mut confirm_rx) = mpsc::unbounded_channel::<bool>();

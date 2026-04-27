@@ -1,11 +1,73 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use super::events::{send_event, AgentEvent};
 use super::Agent;
+
+/// Drive an already-constructed sub-agent on `task`, pumping its events to
+/// the parent's channels. Translates the sub-agent's `ToolCall`/`ToolResult`
+/// into `SubagentToolCall`/`SubagentToolResult` and forwards
+/// `ToolConfirmRequest` to the parent's `confirm_rx`. Returns the run result
+/// plus the sub-agent's last assistant message (empty if none).
+///
+/// Caller is responsible for emitting `SubagentStart`/`SubagentEnd` framing.
+pub(super) async fn drive_subagent(
+    sub_agent: Agent,
+    task: String,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
+    cancel: Arc<AtomicBool>,
+) -> (Result<()>, String) {
+    let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (sub_confirm_tx, mut sub_confirm_rx) = mpsc::unbounded_channel::<bool>();
+
+    let sub_tx_for_agent = sub_tx.clone();
+    let mut sub_future = Box::pin(async move {
+        let mut sa = sub_agent;
+        let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel::<String>();
+        let result = sa
+            .run(&task, &sub_tx_for_agent, &mut sub_confirm_rx, &mut steer_rx, cancel)
+            .await;
+        let last_msg = sa.last_assistant_message();
+        (result, last_msg)
+    });
+
+    let mut sub_finished: Option<(Result<()>, String)> = None;
+    let mut sub_tx_option = Some(sub_tx);
+
+    loop {
+        tokio::select! {
+            biased;
+            event = sub_rx.recv() => {
+                match event {
+                    Some(AgentEvent::ToolConfirmRequest { name, args }) => {
+                        let _ = send_event(events, AgentEvent::ToolConfirmRequest { name, args });
+                        let approved = confirm_rx.recv().await.unwrap_or(false);
+                        let _ = sub_confirm_tx.send(approved);
+                    }
+                    Some(AgentEvent::ToolCall { name, args }) => {
+                        let _ = events.send(AgentEvent::SubagentToolCall { name, args });
+                    }
+                    Some(AgentEvent::ToolResult { name, success, .. }) => {
+                        let _ = events.send(AgentEvent::SubagentToolResult { name, success });
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            result = &mut sub_future, if sub_finished.is_none() => {
+                sub_finished = Some(result);
+                sub_tx_option.take();
+            }
+        }
+    }
+
+    sub_finished
+        .unwrap_or_else(|| (Err(anyhow!("Sub-agent channel closed unexpectedly")), String::new()))
+}
 
 impl Agent {
     /// Return the last assistant message content, or a fallback string.
@@ -134,77 +196,16 @@ impl Agent {
             self.config.as_ref(),
         );
 
-        // Channels for the sub-agent
-        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<AgentEvent>();
-        let (sub_confirm_tx, mut sub_confirm_rx) = mpsc::unbounded_channel::<bool>();
+        let (result, last_msg) =
+            drive_subagent(sub_agent, task.to_string(), events, confirm_rx, cancel.clone()).await;
 
-        // Move the sub-agent and channel clones into an owned future.
-        // This avoids borrow issues: the future owns everything it needs.
-        let sub_tx_for_agent = sub_tx.clone();
-        let cancel_for_sub = cancel.clone();
-        let task_owned = task.to_string();
-        let mut sub_future = Box::pin(async move {
-            let mut sa = sub_agent;
-            // Sub-agents don't receive steering messages
-            let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel::<String>();
-            let result = sa
-                .run(&task_owned, &sub_tx_for_agent, &mut sub_confirm_rx, &mut steer_rx, cancel_for_sub)
-                .await;
-            let last_msg = sa.last_assistant_message();
-            (result, last_msg)
-        });
-
-        // Drive the sub-agent and its event loop concurrently.
-        // We poll both the sub-agent future and its event channel so we
-        // can forward tool confirmations through the parent's confirm_rx
-        // instead of auto-approving.
-        let mut sub_finished: Option<(Result<()>, String)> = None;
-        let mut sub_tx_option = Some(sub_tx);
-
-        loop {
-            tokio::select! {
-                biased;
-                // Process sub-agent events first (higher priority)
-                event = sub_rx.recv() => {
-                    match event {
-                        Some(AgentEvent::ToolConfirmRequest { name, args }) => {
-                            // Forward to parent TUI for user confirmation
-                            let _ = send_event(events, AgentEvent::ToolConfirmRequest { name, args });
-                            let approved = confirm_rx.recv().await.unwrap_or(false);
-                            let _ = sub_confirm_tx.send(approved);
-                        }
-                        Some(AgentEvent::ToolCall { name, args }) => {
-                            let _ = events.send(AgentEvent::SubagentToolCall { name, args });
-                        }
-                        Some(AgentEvent::ToolResult { name, success, .. }) => {
-                            let _ = events.send(AgentEvent::SubagentToolResult { name, success });
-                        }
-                        Some(_) => {} // ignore other events
-                        None => break, // sub-agent channel closed
-                    }
-                }
-                // Poll the sub-agent future
-                result = &mut sub_future, if sub_finished.is_none() => {
-                    sub_finished = Some(result);
-                    // Drop our sender clone to close channel (the future's
-                    // clone was already dropped when the async block ended).
-                    sub_tx_option.take();
-                }
+        match result {
+            Ok(()) => {
+                let _ = send_event(events, AgentEvent::SubagentEnd { result: last_msg.clone() });
+                (last_msg, true)
             }
-        }
-
-        match sub_finished {
-            Some((Ok(()), response)) => {
-                let _ = send_event(events, AgentEvent::SubagentEnd { result: response.clone() });
-                (response, true)
-            }
-            Some((Err(e), _)) => {
+            Err(e) => {
                 let err_msg = format!("Sub-agent error: {}", e);
-                let _ = send_event(events, AgentEvent::SubagentEnd { result: err_msg.clone() });
-                (err_msg, false)
-            }
-            None => {
-                let err_msg = "Sub-agent channel closed unexpectedly".to_string();
                 let _ = send_event(events, AgentEvent::SubagentEnd { result: err_msg.clone() });
                 (err_msg, false)
             }

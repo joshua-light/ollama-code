@@ -3,6 +3,7 @@ mod edit;
 mod evidence;
 mod glob;
 mod grep;
+mod plan;
 mod read;
 mod skill;
 mod subagent;
@@ -15,6 +16,9 @@ pub use evidence::{
 };
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use plan::{
+    PlanAddStepTool, PlanListStepsTool, PlanMarkDoneTool, PlanMarkInProgressTool, PlanSkipStepTool,
+};
 pub use read::ReadTool;
 pub use skill::SkillTool;
 pub use subagent::SubagentToolDef;

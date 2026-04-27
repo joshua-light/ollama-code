@@ -42,6 +42,8 @@ The agent loop lives in `src/agent.rs`. `Agent::run()` sends messages to the mod
 
 **Context compaction** (`src/agent.rs`): When the context window fills up, the agent can compact old messages by asking the LLM to summarize them, replacing the originals with a condensed summary message. This is more intelligent than simple trimming and preserves important context.
 
+**Enforced planning** (`src/agent/plan.rs`, `src/agent/planner.rs`, `src/tools/plan.rs`): For non-trivial requests, a read-only planner sub-agent runs first and populates a shared `TodoList` via `plan_add_step`. The main agent then works through the list using `plan_mark_in_progress` / `plan_mark_done` / `plan_skip_step`, and the agent loop refuses to terminate while pending steps remain. After the plan is complete, a behavioural-verification gate runs the project's test command (`cargo xtask test` → `cargo test` → `npm test`) before letting the agent declare done. Configured via `[plan]` in `config.toml` (`enabled`, `append_steps`, `max_gate_retries`).
+
 **Prompt templates** (`src/prompts.rs`, `prompts/`): User-defined prompt templates stored as markdown files with YAML frontmatter. Templates support `{{placeholder}}` and `{{name:default}}` syntax. Loaded from `prompts/` in the config directory and invokable as slash commands.
 
 **Message types** (`src/message.rs`): Serializable message structs matching Ollama's chat API format (system/user/assistant/tool roles).

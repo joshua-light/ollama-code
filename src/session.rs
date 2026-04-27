@@ -432,6 +432,11 @@ impl Session {
             AgentEvent::ThinkingBudgetExceeded { thinking_tokens } => {
                 format!("THINKING_BUDGET_EXCEEDED tokens={}", thinking_tokens)
             }
+            AgentEvent::PlanningStarted => "PLANNING_STARTED".to_string(),
+            AgentEvent::PlanReady { steps } => format!("PLAN_READY steps={}", steps.len()),
+            AgentEvent::PlanGated { remaining } => {
+                format!("PLAN_GATED remaining={}", remaining.len())
+            }
             AgentEvent::ToolOutput { .. } => return, // high-frequency, not logged
         };
         self.log_debug(&line);

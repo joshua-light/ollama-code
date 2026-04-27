@@ -139,6 +139,22 @@ pub async fn run_pipe(
                     thinking_tokens
                 );
             }
+            AgentEvent::PlanningStarted => {
+                eprintln!("\n ◧ Planning phase...");
+            }
+            AgentEvent::PlanReady { steps } => {
+                eprintln!(" ◧ Plan ({} steps):", steps.len());
+                for (i, step) in steps.iter().enumerate() {
+                    eprintln!("   {}. {}", i, step);
+                }
+            }
+            AgentEvent::PlanGated { remaining } => {
+                eprintln!(
+                    "(plan gate: {} step{} still pending — looping)",
+                    remaining.len(),
+                    if remaining.len() == 1 { "" } else { "s" }
+                );
+            }
             AgentEvent::ReloadComplete { .. }
             | AgentEvent::ContextUpdate { .. }
             | AgentEvent::MessageLogged(_)

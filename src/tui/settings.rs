@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::config::{
-    Config, DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_CONTEXT_SIZE, DEFAULT_OLLAMA_URL,
+    Config, PlanConfig, DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_CONTEXT_SIZE, DEFAULT_OLLAMA_URL,
     DEFAULT_REINJECTION_INTERVAL, DEFAULT_SUBAGENT_MAX_TURNS, DEFAULT_TRIM_TARGET_PCT,
     DEFAULT_TRIM_THRESHOLD_PCT,
 };
@@ -58,6 +58,7 @@ const CATEGORIES: &[&str] = &[
     "Server",
     "Behavior",
     "Context Management",
+    "Plan",
     "Cost",
 ];
 
@@ -98,6 +99,12 @@ const CONTEXT_FIELDS: &[FieldDef] = &[
     FieldDef { name: "reinjection_interval", kind: FieldKind::U16 },
 ];
 
+const PLAN_FIELDS: &[FieldDef] = &[
+    FieldDef { name: "plan_enabled", kind: FieldKind::Bool },
+    FieldDef { name: "plan_append_steps", kind: FieldKind::Str },
+    FieldDef { name: "plan_max_gate_retries", kind: FieldKind::U32 },
+];
+
 const COST_FIELDS: &[FieldDef] = &[
     FieldDef { name: "show_cost_estimate", kind: FieldKind::Bool },
 ];
@@ -109,7 +116,8 @@ fn fields_for_category(cat: usize) -> &'static [FieldDef] {
         2 => SERVER_FIELDS,
         3 => BEHAVIOR_FIELDS,
         4 => CONTEXT_FIELDS,
-        5 => COST_FIELDS,
+        5 => PLAN_FIELDS,
+        6 => COST_FIELDS,
         _ => &[],
     }
 }
@@ -167,8 +175,30 @@ impl SettingsPanel {
             "task_reinjection" => bool_display(self.config.task_reinjection.unwrap_or(false)),
             "reinjection_interval" => opt_num(self.config.reinjection_interval, DEFAULT_REINJECTION_INTERVAL),
             "show_cost_estimate" => bool_display(self.config.show_cost_estimate.unwrap_or(false)),
+            "plan_enabled" => bool_display(self.plan_config().enabled),
+            "plan_append_steps" => {
+                let steps = self.plan_config().append_steps;
+                if steps.is_empty() {
+                    "(none)".into()
+                } else {
+                    steps.join(", ")
+                }
+            }
+            "plan_max_gate_retries" => self.plan_config().max_gate_retries.to_string(),
             _ => "(unknown)".into(),
         }
+    }
+
+    /// Resolved (`plan` defaulted) PlanConfig used for display/edit.
+    fn plan_config(&self) -> PlanConfig {
+        self.config.plan.clone().unwrap_or_default()
+    }
+
+    /// Mutate `self.config.plan` in place, initializing to default if unset.
+    fn with_plan_mut<F: FnOnce(&mut PlanConfig)>(&mut self, f: F) {
+        let mut pc = self.config.plan.clone().unwrap_or_default();
+        f(&mut pc);
+        self.config.plan = Some(pc);
     }
 
     /// Raw value for the edit buffer (empty string = not set).
@@ -189,6 +219,11 @@ impl SettingsPanel {
             "trim_target" => self.config.trim_target.map_or_else(String::new, |v| v.to_string()),
             "reinjection_interval" => self.config.reinjection_interval.map_or_else(String::new, |v| v.to_string()),
             "thinking_budget_tokens" => self.config.thinking_budget_tokens.map_or_else(String::new, |v| v.to_string()),
+            "plan_append_steps" => {
+                let steps = self.plan_config().append_steps;
+                steps.join(", ")
+            }
+            "plan_max_gate_retries" => self.plan_config().max_gate_retries.to_string(),
             _ => String::new(),
         }
     }
@@ -205,6 +240,10 @@ impl SettingsPanel {
             "task_reinjection" => self.config.task_reinjection = Some(!self.config.task_reinjection.unwrap_or(false)),
             "context_compaction" => self.config.context_compaction = Some(!self.config.context_compaction.unwrap_or(true)),
             "show_cost_estimate" => self.config.show_cost_estimate = Some(!self.config.show_cost_estimate.unwrap_or(false)),
+            "plan_enabled" => {
+                let prev = self.plan_config().enabled;
+                self.with_plan_mut(|pc| pc.enabled = !prev);
+            }
             _ => {}
         }
     }
@@ -229,6 +268,21 @@ impl SettingsPanel {
             "trim_target" => return parse_opt(&mut self.config.trim_target, value),
             "reinjection_interval" => return parse_opt(&mut self.config.reinjection_interval, value),
             "thinking_budget_tokens" => return parse_opt(&mut self.config.thinking_budget_tokens, value),
+            "plan_append_steps" => {
+                let steps: Vec<String> = if value.is_empty() {
+                    Vec::new()
+                } else {
+                    value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                };
+                self.with_plan_mut(|pc| pc.append_steps = steps);
+            }
+            "plan_max_gate_retries" => {
+                let parsed: u32 = match value.parse() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                self.with_plan_mut(|pc| pc.max_gate_retries = parsed);
+            }
             _ => return false,
         }
         true

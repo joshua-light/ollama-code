@@ -13,6 +13,7 @@ pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_TRIM_THRESHOLD_PCT: u8 = 80;
 pub const DEFAULT_TRIM_TARGET_PCT: u8 = 60;
 pub const DEFAULT_REINJECTION_INTERVAL: u16 = 3;
+pub const DEFAULT_PLAN_GATE_RETRIES: u32 = 5;
 
 /// Root config directory for ollama-code (`$XDG_CONFIG_HOME/ollama-code` or `./ollama-code`).
 /// On macOS, `dirs::config_dir()` returns `~/Library/Application Support` which doesn't
@@ -213,9 +214,52 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_hf_models: Option<Vec<String>>,
 
+    /// Enforced planning phase: a planner sub-agent (read-only tools)
+    /// produces a structured TodoList before the main agent acts, and the
+    /// loop refuses to emit a final response while pending steps remain.
+    #[serde(default)]
+    pub plan: Option<PlanConfig>,
+
     /// Path to the project config file that was loaded (if any). Not serialized.
     #[serde(skip)]
     pub project_config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanConfig {
+    /// When true, every main-agent `run()` first invokes the planner sub-agent
+    /// and the loop gates `Done` on plan completion. Default: true.
+    #[serde(default = "default_plan_enabled")]
+    pub enabled: bool,
+
+    /// Steps automatically appended after the planner finishes (e.g.
+    /// `["Run tests"]`). Useful for forcing a verification phase.
+    #[serde(default)]
+    pub append_steps: Vec<String>,
+
+    /// Maximum number of times the loop will refuse `Done` and re-prompt
+    /// the model to finish remaining steps. Prevents infinite loops if the
+    /// model refuses to mark steps. Default: 5.
+    #[serde(default = "default_plan_gate_retries")]
+    pub max_gate_retries: u32,
+}
+
+fn default_plan_enabled() -> bool {
+    true
+}
+
+fn default_plan_gate_retries() -> u32 {
+    DEFAULT_PLAN_GATE_RETRIES
+}
+
+impl Default for PlanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_plan_enabled(),
+            append_steps: Vec::new(),
+            max_gate_retries: default_plan_gate_retries(),
+        }
+    }
 }
 
 /// Walk up from `start_dir` looking for `.ollama-code.toml`.
@@ -347,6 +391,7 @@ impl Config {
                 .or_else(|| other.bash_safe_prefixes.clone()),
             // User-scope only: always take from the lower-priority layer (user config).
             recent_hf_models: other.recent_hf_models.clone(),
+            plan: self.plan.clone().or_else(|| other.plan.clone()),
             project_config_path: None,
         }
     }
@@ -509,6 +554,15 @@ impl Config {
 #   my-hook = false   # disables the hook
 # [hooks.my-hook]
 # key = "value"
+
+# Enforced planning phase (default: enabled).
+# Before the main agent acts, a planner sub-agent (read-only tools) explores
+# the codebase and populates a structured TodoList. The agent loop refuses to
+# emit a final response while pending steps remain.
+# [plan]
+# enabled = true
+# append_steps = ["Run tests"]
+# max_gate_retries = 5
 "#
     }
 
@@ -546,6 +600,10 @@ impl Config {
 
     pub fn effective_reinjection_interval(&self) -> u16 {
         self.reinjection_interval.unwrap_or(DEFAULT_REINJECTION_INTERVAL)
+    }
+
+    pub fn effective_plan_config(&self) -> PlanConfig {
+        self.plan.clone().unwrap_or_default()
     }
 
     /// Add a HuggingFace repo to the recent list (most recent first, max 10).
@@ -854,6 +912,69 @@ args = ["hello"]
         // Search from child should find it in parent
         let found = find_project_config(&child);
         assert_eq!(found, Some(config_path));
+    }
+
+    // ── PlanConfig ──────────────────────────────────────────────────
+
+    #[test]
+    fn plan_config_defaults() {
+        let pc = PlanConfig::default();
+        assert!(pc.enabled);
+        assert!(pc.append_steps.is_empty());
+        assert_eq!(pc.max_gate_retries, DEFAULT_PLAN_GATE_RETRIES);
+    }
+
+    #[test]
+    fn plan_config_parses_from_toml() {
+        let toml_str = r#"
+[plan]
+enabled = false
+append_steps = ["Run tests", "Lint"]
+max_gate_retries = 2
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let pc = cfg.effective_plan_config();
+        assert!(!pc.enabled);
+        assert_eq!(pc.append_steps, vec!["Run tests".to_string(), "Lint".to_string()]);
+        assert_eq!(pc.max_gate_retries, 2);
+    }
+
+    #[test]
+    fn plan_config_partial_uses_defaults() {
+        let toml_str = r#"
+[plan]
+append_steps = ["Run tests"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let pc = cfg.effective_plan_config();
+        assert!(pc.enabled); // default
+        assert_eq!(pc.append_steps, vec!["Run tests".to_string()]);
+        assert_eq!(pc.max_gate_retries, DEFAULT_PLAN_GATE_RETRIES);
+    }
+
+    #[test]
+    fn merge_plan_hi_wins() {
+        let hi = Config {
+            plan: Some(PlanConfig {
+                enabled: false,
+                append_steps: vec!["a".into()],
+                max_gate_retries: 1,
+            }),
+            ..Default::default()
+        };
+        let lo = Config {
+            plan: Some(PlanConfig {
+                enabled: true,
+                append_steps: vec!["b".into()],
+                max_gate_retries: 9,
+            }),
+            ..Default::default()
+        };
+        let merged = hi.merge(&lo);
+        let pc = merged.plan.unwrap();
+        assert!(!pc.enabled);
+        assert_eq!(pc.append_steps, vec!["a".to_string()]);
+        assert_eq!(pc.max_gate_retries, 1);
     }
 
     #[test]

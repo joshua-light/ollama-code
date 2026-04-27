@@ -1,6 +1,8 @@
 mod builder;
 mod context;
 mod events;
+pub mod plan;
+mod planner;
 mod subagent;
 mod tool_executor;
 mod util;
@@ -14,17 +16,18 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::backend::ModelBackend;
-use crate::config::Config;
+use crate::config::{Config, PlanConfig};
 use crate::hooks::HookRunner;
 use crate::mcp;
 use crate::message::{self, Message};
 use crate::skills::{self, SkillMeta};
 use crate::tools::{SkillTool, ToolRegistry};
 
-use builder::{build_system_prompt, build_tools_and_servers};
+use builder::{build_system_prompt, build_tools_and_servers, AgentMode};
 use context::ContextManager;
 pub use events::AgentEvent;
 use events::send_event;
+use plan::{new_shared_todo_list, SharedTodoList};
 use util::{poll_cancel, retry_backoff_delay};
 
 /// How `rewind_turns` / `rewind_leaf` treats the anchor user message.
@@ -123,11 +126,33 @@ pub struct Agent {
     /// tells it *whether its own edits are making things better or worse*.
     /// Reset at the start of each run.
     pub(super) compile_attempts: util::AttemptHistory,
+    /// Shared TodoList written by the planner sub-agent (via plan_add_step)
+    /// and updated by the main agent (via plan_mark_*). The agent loop reads
+    /// it at termination time to decide whether to refuse `Done`.
+    pub(super) plan: SharedTodoList,
+    /// Resolved plan config (`enabled`, `append_steps`, `max_gate_retries`).
+    pub(super) plan_config: PlanConfig,
+    /// How many times the termination gate has fired in the current `run()`.
+    /// Reset on each `run()`. Capped by `plan_config.max_gate_retries`.
+    pub(super) plan_gate_retries: u32,
+    /// Set true once behavioural verification (project test command) has
+    /// passed in the current run. Stays false until tests pass — a failed
+    /// run keeps it false so the next gate retry triggers another check.
+    /// Reset on each `run()`.
+    pub(super) behavioral_verify_passed: bool,
+    /// How many times the behavioural-verify gate has run in the current
+    /// `run()`. Reset on each `run()`. Cap prevents the model from spinning
+    /// forever on a flaky or unfixable test suite.
+    pub(super) behavioral_verify_retries: u32,
+    /// Identifies a planner sub-agent so it doesn't recursively trigger its
+    /// own planner. Set only via `Agent::new_planner_subagent`.
+    pub(super) is_planner: bool,
 }
 
 impl Agent {
     /// Shared constructor. When `is_subagent` is true, the subagent tool is
     /// omitted (prevents recursion) and a turn limit is enforced.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         backend: Arc<dyn ModelBackend>,
         model: String,
@@ -136,18 +161,20 @@ impl Agent {
         subagent_max_turns: u16,
         max_turns: Option<u16>,
         config: Option<&Config>,
+        mode: AgentMode,
+        plan: SharedTodoList,
     ) -> Self {
         let default_config = Config::default();
         let cfg = config.unwrap_or(&default_config);
         let is_subagent = max_turns.is_some();
-        let include_extensions = !is_subagent;
+        let include_extensions = matches!(mode, AgentMode::Main);
 
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
         let (mut tools, plugin_confirm_tools, mcp_servers) =
-            build_tools_and_servers(cfg, context_size, &cwd, include_extensions);
+            build_tools_and_servers(cfg, context_size, &cwd, mode, &plan);
 
         let discovered_skills = if include_extensions {
             skills::discover_skills(&cwd)
@@ -159,7 +186,7 @@ impl Agent {
         }
 
         let (system_prompt, system_prompt_base_len, skills_summary_len, project_docs_info) =
-            build_system_prompt(&cwd, include_extensions, &discovered_skills);
+            build_system_prompt(&cwd, mode, &discovered_skills);
 
         let hooks = if include_extensions {
             HookRunner::discover(&cwd, config)
@@ -211,6 +238,12 @@ impl Agent {
             last_tool_signature: None,
             consecutive_repeat_count: 0,
             compile_attempts: Vec::new(),
+            plan,
+            plan_config: cfg.effective_plan_config(),
+            plan_gate_retries: 0,
+            behavioral_verify_passed: false,
+            behavioral_verify_retries: 0,
+            is_planner: matches!(mode, AgentMode::Planner),
         }
     }
 
@@ -227,7 +260,17 @@ impl Agent {
         bash_timeout: std::time::Duration,
         subagent_max_turns: u16,
     ) -> Self {
-        Self::build(backend, model, context_size, bash_timeout, subagent_max_turns, None, None)
+        Self::build(
+            backend,
+            model,
+            context_size,
+            bash_timeout,
+            subagent_max_turns,
+            None,
+            None,
+            AgentMode::Main,
+            new_shared_todo_list(),
+        )
     }
 
     /// Create an agent with custom config (controls which tools are enabled, etc.).
@@ -239,7 +282,17 @@ impl Agent {
         subagent_max_turns: u16,
         config: &Config,
     ) -> Self {
-        Self::build(backend, model, context_size, bash_timeout, subagent_max_turns, None, Some(config))
+        Self::build(
+            backend,
+            model,
+            context_size,
+            bash_timeout,
+            subagent_max_turns,
+            None,
+            Some(config),
+            AgentMode::Main,
+            new_shared_todo_list(),
+        )
     }
 
     /// Create a sub-agent with fresh context and no subagent tool (prevents recursion).
@@ -252,7 +305,45 @@ impl Agent {
         max_turns: u16,
         config: Option<&Config>,
     ) -> Self {
-        Self::build(backend, model, context_size, bash_timeout, 0, Some(max_turns), config)
+        // Sub-agents get their own (unused) plan list and the loop's planning
+        // phase is gated off via `is_planner`/`is_subagent` checks.
+        Self::build(
+            backend,
+            model,
+            context_size,
+            bash_timeout,
+            0,
+            Some(max_turns),
+            config,
+            AgentMode::Subagent,
+            new_shared_todo_list(),
+        )
+    }
+
+    /// Create a planner sub-agent that shares the parent's plan list. Has
+    /// only read-only built-in tools (read/glob/grep) plus `plan_add_step`
+    /// and `plan_list_steps`. No bash, edit, write, plugins, MCP, evidence,
+    /// or subagent — strictly observe-and-plan.
+    pub(super) fn new_planner_subagent(
+        backend: Arc<dyn ModelBackend>,
+        model: String,
+        context_size: u64,
+        bash_timeout: std::time::Duration,
+        max_turns: u16,
+        config: Option<&Config>,
+        plan: SharedTodoList,
+    ) -> Self {
+        Self::build(
+            backend,
+            model,
+            context_size,
+            bash_timeout,
+            0,
+            Some(max_turns),
+            config,
+            AgentMode::Planner,
+            plan,
+        )
     }
 
     pub fn model(&self) -> &str {
@@ -297,7 +388,7 @@ impl Agent {
         // Drop old MCP servers before rebuilding (triggers cleanup).
         self._mcp_servers.clear();
         let (mut tools, plugin_confirm_tools, mcp_servers) =
-            build_tools_and_servers(&config, self.context_size, &cwd, true);
+            build_tools_and_servers(&config, self.context_size, &cwd, AgentMode::Main, &self.plan);
 
         let discovered_skills = skills::discover_skills(&cwd);
         if !discovered_skills.is_empty() {
@@ -305,7 +396,7 @@ impl Agent {
         }
 
         let (system_prompt, system_prompt_base_len, skills_summary_len, project_docs_info) =
-            build_system_prompt(&cwd, true, &discovered_skills);
+            build_system_prompt(&cwd, AgentMode::Main, &discovered_skills);
 
         if !self.messages.is_empty() {
             self.messages[0] = Message::system(&system_prompt);
@@ -322,6 +413,7 @@ impl Agent {
         self.context.compaction_enabled = config.effective_context_compaction();
         self.skill_inject = config.skill_inject.unwrap_or(false);
         self.bash_safe_prefixes = config.bash_safe_prefixes.clone().unwrap_or_default();
+        self.plan_config = config.effective_plan_config();
         // Sub-agents keep main_turn_cap at None (their cap is `max_turns`).
         if self.max_turns.is_none() {
             self.main_turn_cap = config.max_turns;
@@ -748,6 +840,30 @@ impl Agent {
         (Cow::Owned(msgs), Some(body))
     }
 
+    /// Whether the plan-completion gate should run for the current agent.
+    /// True only on the top-level main agent with planning enabled and a
+    /// non-empty plan. Sub-agents and planners are gated off.
+    fn should_gate_on_plan(&self) -> bool {
+        if !self.plan_config.enabled || self.is_planner || self.max_turns.is_some() {
+            return false;
+        }
+        // Lock is held briefly; poisoning means a prior panic in plan code,
+        // and silently failing-open here would defeat the whole gate.
+        !self.plan.lock().expect("plan lock poisoned").is_empty()
+    }
+
+    /// Descriptions of plan steps that are still pending or in progress.
+    /// Empty if the plan is fully complete.
+    fn unfinished_plan_steps(&self) -> Vec<String> {
+        self.plan
+            .lock()
+            .expect("plan lock poisoned")
+            .unfinished()
+            .into_iter()
+            .map(|(_, s)| s.description.clone())
+            .collect()
+    }
+
     /// Record a tool call outcome for per-turn skill injection. Bounded at 4.
     pub(super) fn record_tool_result(&mut self, name: &str, success: bool) {
         if !self.skill_inject {
@@ -801,15 +917,59 @@ impl Agent {
         self.last_tool_signature = None;
         self.consecutive_repeat_count = 0;
         self.compile_attempts.clear();
+        self.plan_gate_retries = 0;
+        self.behavioral_verify_passed = false;
+        self.behavioral_verify_retries = 0;
 
         let user_msg = Message::user(user_input);
         self.messages.push(user_msg.clone());
         send_event(events, AgentEvent::MessageLogged(user_msg))?;
 
+        // Enforced planning phase: only fires for the top-level main agent on
+        // a fresh plan list. Sub-agents (planner included) skip this so they
+        // don't recurse into another planner. We also skip planning for
+        // trivial requests (short, no edit-action verbs) — running a full
+        // sub-agent for "what is 2+2" would double latency for nothing.
+        let plan_list_empty = self.plan.lock().expect("plan lock poisoned").is_empty();
+        if self.plan_config.enabled
+            && !self.is_planner
+            && self.max_turns.is_none()
+            && plan_list_empty
+            && !is_trivial_request(user_input)
+        {
+            match self.produce_plan(user_input, events, confirm_rx, &cancel).await {
+                Ok(true) => {
+                    let summary = self
+                        .plan
+                        .lock()
+                        .expect("plan lock poisoned")
+                        .summary_for_prompt();
+                    let reminder = Message::system(format!(
+                        "[Enforced plan]\nA planner sub-agent produced this plan for the \
+                         current task:\n\n{}\nWork through the steps in order using \
+                         plan_mark_in_progress, plan_mark_done, and plan_skip_step. You \
+                         cannot end your turn until every step is marked done or skipped.",
+                        summary
+                    ));
+                    self.messages.push(reminder.clone());
+                    send_event(events, AgentEvent::MessageLogged(reminder))?;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    send_event(
+                        events,
+                        AgentEvent::Error(format!("Planner error: {}", e)),
+                    )?;
+                }
+            }
+        }
+
         let mut empty_retries: u32 = 0;
         const MAX_EMPTY_RETRIES: u32 = 10;
         let mut correction_count: u32 = 0;
         const MAX_CORRECTIONS: u32 = 2;
+        let mut per_turn_timeout_count: u32 = 0;
+        const MAX_PER_TURN_TIMEOUTS: u32 = 3;
         let mut turn: u32 = 0;
         let mut tool_call_summary: Vec<String> = Vec::new();
         let num_ctx = if self.context_size > 0 { Some(self.context_size) } else { None };
@@ -918,16 +1078,64 @@ impl Agent {
                     .filter(|&n| n > 0)
             };
 
-            let mut response = tokio::select! {
-                r = self.backend.chat(&self.model, &turn_messages, Some(tool_defs), num_ctx, thinking_budget, Box::new(move |token| {
+            // Per-turn wall-clock cap. The streaming layer already has a
+            // chunk-level inactivity timeout, but that catches "no bytes for
+            // 180s," not "trickle of bytes for 30+ minutes with no semantic
+            // progress" — observed with qwen3.6:35b on a heavily-populated
+            // context, where the model output rate slows to a crawl. After
+            // this cap fires, we abort the whole chat() call and inject a
+            // user nudge to retry, so a stalled turn doesn't wedge the
+            // entire run indefinitely.
+            const PER_TURN_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(600);
+            let chat_future = self.backend.chat(
+                &self.model,
+                &turn_messages,
+                Some(tool_defs),
+                num_ctx,
+                thinking_budget,
+                Box::new(move |token| {
                     let _ = events_clone.send(AgentEvent::Token(token.to_string()));
-                })) => {
+                }),
+            );
+            let mut response = tokio::select! {
+                r = tokio::time::timeout(PER_TURN_TIMEOUT, chat_future) => {
                     match r {
-                        Ok(r) => r,
-                        Err(e) => {
+                        Ok(Ok(resp)) => resp,
+                        Ok(Err(e)) => {
                             send_event(events, AgentEvent::Error(e.to_string()))?;
                             send_event(events, AgentEvent::Done { prompt_tokens: 0, eval_count: 0 })?;
                             return Ok(());
+                        }
+                        Err(_) => {
+                            per_turn_timeout_count += 1;
+                            if per_turn_timeout_count >= MAX_PER_TURN_TIMEOUTS {
+                                send_event(
+                                    events,
+                                    AgentEvent::Error(format!(
+                                        "[harness] Per-turn timeout hit {} times in a row — giving up on this run.",
+                                        per_turn_timeout_count
+                                    )),
+                                )?;
+                                send_event(events, AgentEvent::Done { prompt_tokens: 0, eval_count: 0 })?;
+                                return Ok(());
+                            }
+                            send_event(
+                                events,
+                                AgentEvent::Debug(format!(
+                                    "[harness] Per-turn timeout fired after {}s — aborting this turn and retrying ({}/{})",
+                                    PER_TURN_TIMEOUT.as_secs(),
+                                    per_turn_timeout_count,
+                                    MAX_PER_TURN_TIMEOUTS
+                                )),
+                            )?;
+                            let nudge = Message::user(format!(
+                                "[harness] Your previous turn timed out after {}s without producing a usable response. The chat request was aborted. Retry with a smaller, more focused next action — call one tool at a time and keep responses concise.",
+                                PER_TURN_TIMEOUT.as_secs()
+                            ));
+                            self.messages.push(nudge.clone());
+                            send_event(events, AgentEvent::MessageLogged(nudge))?;
+                            continue;
                         }
                     }
                 }
@@ -1065,6 +1273,109 @@ impl Agent {
             }
 
             if response.tool_calls.is_empty() {
+                if self.should_gate_on_plan() {
+                    let unfinished = self.unfinished_plan_steps();
+                    if !unfinished.is_empty()
+                        && self.plan_gate_retries < self.plan_config.max_gate_retries
+                    {
+                        self.plan_gate_retries += 1;
+                        send_event(
+                            events,
+                            AgentEvent::PlanGated {
+                                remaining: unfinished.clone(),
+                            },
+                        )?;
+                        if !response.content.trim().is_empty() {
+                            let assistant_msg = Message::assistant(&response.content);
+                            self.messages.push(assistant_msg.clone());
+                            send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
+                        }
+                        let nudge = Message::user(format!(
+                            "[Plan gate] You have {} unfinished plan step{}: {}. \
+                             Continue working — call plan_mark_in_progress on the next \
+                             step, do the work, then plan_mark_done. Use plan_skip_step \
+                             with a reason if a step truly does not apply. Do not end \
+                             your turn until every step is marked done or skipped.",
+                            unfinished.len(),
+                            if unfinished.len() == 1 { "" } else { "s" },
+                            unfinished.join("; ")
+                        ));
+                        self.messages.push(nudge.clone());
+                        send_event(events, AgentEvent::MessageLogged(nudge))?;
+                        continue;
+                    }
+                    let verify_cmd = if !self.behavioral_verify_passed
+                        && self.behavioral_verify_retries < BEHAVIORAL_VERIFY_MAX_RETRIES
+                    {
+                        discover_test_command()
+                    } else {
+                        None
+                    };
+                    if let Some(cmd) = verify_cmd {
+                        self.behavioral_verify_retries += 1;
+                        send_event(
+                            events,
+                            AgentEvent::Debug(format!(
+                                "[harness] Running behavioural verification: {} (attempt {}/{})",
+                                cmd.join(" "),
+                                self.behavioral_verify_retries,
+                                BEHAVIORAL_VERIFY_MAX_RETRIES
+                            )),
+                        )?;
+                        let (success, summary) = run_behavioral_verification(&cmd).await;
+                        if success {
+                            self.behavioral_verify_passed = true;
+                            send_event(
+                                events,
+                                AgentEvent::Debug(format!(
+                                    "[harness] Behavioural verification passed: {}",
+                                    cmd.join(" ")
+                                )),
+                            )?;
+                        } else {
+                            let synthetic = format!(
+                                "[harness-injected] Fix failing tests from `{}`. Tail of test \
+                                 output:\n```\n{}\n```",
+                                cmd.join(" "),
+                                summary
+                            );
+                            // Best-effort: if the description exceeds the
+                            // step-length cap (large test failure tails), we
+                            // truncate so the gate still fires.
+                            let synthetic = if synthetic.len() > crate::agent::plan::MAX_STEP_DESC_LEN {
+                                let mut truncated = synthetic[..crate::agent::plan::MAX_STEP_DESC_LEN.saturating_sub(3)].to_string();
+                                truncated.push_str("...");
+                                truncated
+                            } else {
+                                synthetic
+                            };
+                            let _ = self.plan
+                                .lock()
+                                .expect("plan lock poisoned")
+                                .add(&synthetic);
+                            if !response.content.trim().is_empty() {
+                                let assistant_msg = Message::assistant(&response.content);
+                                self.messages.push(assistant_msg.clone());
+                                send_event(
+                                    events,
+                                    AgentEvent::MessageLogged(assistant_msg),
+                                )?;
+                            }
+                            let nudge = Message::user(format!(
+                                "[Behavioural verification gate] Tests failed: `{}` exited \
+                                 non-zero. Plan was reopened with a synthetic step containing \
+                                 the failure tail. Address the failures before declaring done. \
+                                 cargo check passing is not enough — the integration tests \
+                                 exercise behaviour that structural checks cannot.",
+                                cmd.join(" ")
+                            ));
+                            self.messages.push(nudge.clone());
+                            send_event(events, AgentEvent::MessageLogged(nudge))?;
+                            continue;
+                        }
+                    }
+                }
+
                 // Empty response: push a corrective user message so the model
                 // sees an explicit nudge next turn instead of silently retrying
                 // into the same degenerate state.
@@ -1185,4 +1496,95 @@ impl Agent {
             self.run_post_edit_cargo_check().await;
         }
     }
+}
+
+/// Cap on how many times the behavioural-verification gate runs in a single
+/// agent run. After hitting the cap the gate stops re-running and lets the
+/// model exit (with the last failure visible in plan history). Prevents an
+/// infinite loop on a flaky or unfixable test suite.
+const BEHAVIORAL_VERIFY_MAX_RETRIES: u32 = 3;
+
+/// Wall-clock cap on a single behavioural-verification command. A hung test
+/// process must not be allowed to wedge the agent forever.
+const BEHAVIORAL_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Heuristic: skip the planning phase for short, action-verb-free requests
+/// (chit-chat, simple questions). Without this, every prompt — including
+/// "what is 2+2" — triggers a full planner sub-agent run, doubling latency.
+fn is_trivial_request(input: &str) -> bool {
+    const ACTION_VERBS: &[&str] = &[
+        "implement", "edit", "modify", "update", "change", "fix", "add", "remove",
+        "replace", "refactor", "rewrite", "write", "create", "delete", "build",
+        "run ", "test", "debug", "review", "audit", "investigate", "diagnose",
+    ];
+    if input.len() > 120 {
+        return false;
+    }
+    let lower = input.to_lowercase();
+    if ACTION_VERBS.iter().any(|v| lower.contains(v)) {
+        return false;
+    }
+    // File-path-ish tokens (contain a slash + dot or a leading ./) imply
+    // "operate on this file", which warrants planning.
+    if input.split_whitespace().any(|tok| {
+        tok.starts_with("./") || tok.starts_with("/") || (tok.contains('/') && tok.contains('.'))
+    }) {
+        return false;
+    }
+    true
+}
+
+/// Discover the project's behavioural-test command from the working
+/// directory's layout. Preference order matches "most-specific to least":
+/// xtask binary (`cargo xtask test`) → `cargo test` → `npm test`. None when
+/// no recognised test infrastructure is present (the gate then becomes a
+/// no-op for that project).
+fn discover_test_command() -> Option<Vec<String>> {
+    if std::path::Path::new("xtask/Cargo.toml").exists() {
+        return Some(vec![
+            "cargo".to_string(),
+            "xtask".to_string(),
+            "test".to_string(),
+        ]);
+    }
+    if std::path::Path::new("Cargo.toml").exists() {
+        return Some(vec!["cargo".to_string(), "test".to_string()]);
+    }
+    if std::path::Path::new("package.json").exists() {
+        return Some(vec!["npm".to_string(), "test".to_string()]);
+    }
+    None
+}
+
+/// Run the discovered test command and return `(success, tail_summary)`.
+/// The tail is the last 50 lines of merged stdout+stderr — enough to surface
+/// failure messages without flooding context. Bounded by
+/// `BEHAVIORAL_VERIFY_TIMEOUT` with `kill_on_drop` so a hung test process
+/// can't wedge the agent.
+async fn run_behavioral_verification(cmd: &[String]) -> (bool, String) {
+    let mut command = tokio::process::Command::new(&cmd[0]);
+    command.args(&cmd[1..]).kill_on_drop(true);
+    let output = match tokio::time::timeout(BEHAVIORAL_VERIFY_TIMEOUT, command.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return (false, format!("[command failed to launch: {}]", e));
+        }
+        Err(_) => {
+            return (
+                false,
+                format!(
+                    "[command timed out after {}s; killed]",
+                    BEHAVIORAL_VERIFY_TIMEOUT.as_secs()
+                ),
+            );
+        }
+    };
+    let success = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+    let lines: Vec<&str> = combined.lines().collect();
+    let tail_start = lines.len().saturating_sub(50);
+    let summary = lines[tail_start..].join("\n");
+    (success, summary)
 }

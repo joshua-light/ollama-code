@@ -179,6 +179,25 @@ pub(in crate::tui) fn handle_agent_event(event: AgentEvent, app: &mut App) {
                 }
             }
         }
+        AgentEvent::PlanningStarted => {
+            app.messages.push(ChatMessage::Info(
+                "Planning phase started (planner sub-agent exploring)...".to_string(),
+            ));
+        }
+        AgentEvent::PlanReady { steps } => {
+            let mut body = format!("Plan ready ({} steps):", steps.len());
+            for (i, step) in steps.iter().enumerate() {
+                body.push_str(&format!("\n  {}. {}", i, step));
+            }
+            app.messages.push(ChatMessage::Info(body));
+        }
+        AgentEvent::PlanGated { remaining } => {
+            app.messages.push(ChatMessage::Info(format!(
+                "Plan gate: {} step{} still pending — looping the model.",
+                remaining.len(),
+                if remaining.len() == 1 { "" } else { "s" }
+            )));
+        }
         // MessageLogged and Debug are handled by the session logger in the event loop,
         // not by the app state.
         AgentEvent::MessageLogged(_) | AgentEvent::Debug(_) => {}
