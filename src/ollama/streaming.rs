@@ -376,6 +376,29 @@ pub(super) fn postprocess_response(result: StreamResult) -> ChatResponse {
         }
     }
 
+    // Reasoning-enabled models served via llama-server with
+    // `--reasoning-format deepseek` (the default for Qwen3/Qwen3.5) route
+    // ALL output — including <tool_call> blocks — through `reasoning_content`,
+    // leaving `content` empty. When that happens, scan the thinking buffer
+    // for tool calls before declaring the response empty. As a last resort,
+    // promote the thinking buffer to content so the agent has *something* to
+    // act on instead of looping into a corrective injection.
+    if tool_calls.is_empty()
+        && content.trim().is_empty()
+        && !thinking.trim().is_empty()
+        && !known_tool_names.is_empty()
+    {
+        let (extracted, remaining) =
+            extract_tool_calls_from_content(&thinking, &known_tool_names);
+        if !extracted.is_empty() {
+            tool_calls = extracted;
+            content = remaining.trim().to_string();
+            tool_calls_from_content = true;
+        } else {
+            content = thinking.trim().to_string();
+        }
+    }
+
     ChatResponse {
         content,
         tool_calls,

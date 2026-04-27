@@ -264,7 +264,11 @@ impl Agent {
                 // tool errors live at Role::Tool and the model has demonstrably
                 // ignored them. A Role::System message carries more weight.
                 if count == 2 {
-                    let nudge = Message::system(
+                    // User role: chat templates that gate system messages to
+                    // index 0 (Qwen3, Qwen3.5, …) reject mid-conversation
+                    // system inserts. The harness escalation still lands as a
+                    // strong signal as a user-authored line.
+                    let nudge = Message::user(
                         "[harness] You have been calling the same tool with the \
                          same arguments repeatedly despite warnings. You have \
                          enough context. Take a concrete action: call `edit`, \

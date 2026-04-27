@@ -784,7 +784,9 @@ impl Agent {
         }
         self.had_edits_this_run = false;
         if let Some(body) = self.check_and_record_cargo_diagnostics().await {
-            self.messages.push(Message::system(&body));
+            // User role: chat templates for several recent models reject
+            // system messages that don't sit at the start of the conversation.
+            self.messages.push(Message::user(&body));
         }
     }
 
@@ -836,7 +838,9 @@ impl Agent {
             None => return (Cow::Borrowed(self.messages.as_slice()), None),
         };
         let mut msgs = self.messages.clone();
-        msgs.push(Message::system(format!("[Tool Usage Guidance]\n{}", body)));
+        // User role: see post_edit_cargo_check note — mid-conversation system
+        // messages are rejected by Qwen3/Qwen3.5-style chat templates.
+        msgs.push(Message::user(format!("[Tool Usage Guidance]\n{}", body)));
         (Cow::Owned(msgs), Some(body))
     }
 
@@ -888,7 +892,12 @@ impl Agent {
 
         // --- agent_start hooks ---
         if let Some(extra_context) = self.hooks.agent_start(user_input, &self.model).await {
-            let ctx_msg = Message::system(format!(
+            // User role (rather than a second system message): Qwen3/Qwen3.5
+            // chat templates only allow one system message and require it at
+            // index 0. Subsequent context injections must use a non-system
+            // role to avoid `raise_exception('System message must be at the
+            // beginning.')`.
+            let ctx_msg = Message::user(format!(
                 "[Hook-injected context]\n{}",
                 extra_context
             ));
@@ -899,7 +908,8 @@ impl Agent {
         if let Some((skill_name, instructions)) =
             skills::check_triggers(&self.skills, user_input)
         {
-            let ctx_msg = Message::system(format!(
+            // User role: see agent_start hook note above.
+            let ctx_msg = Message::user(format!(
                 "[Auto-triggered skill: /{}]\n{}",
                 skill_name, instructions
             ));
@@ -944,7 +954,13 @@ impl Agent {
                         .lock()
                         .expect("plan lock poisoned")
                         .summary_for_prompt();
-                    let reminder = Message::system(format!(
+                    // User role: chat templates for Qwen3/Qwen3.5 (and other
+                    // recent models) raise an exception when a system message
+                    // appears after the start of the conversation. The plan
+                    // reminder is informational, so a user-role message
+                    // delivers the same instruction without breaking the
+                    // template.
+                    let reminder = Message::user(format!(
                         "[Enforced plan]\nA planner sub-agent produced this plan for the \
                          current task:\n\n{}\nWork through the steps in order using \
                          plan_mark_in_progress, plan_mark_done, and plan_skip_step. You \
@@ -970,6 +986,8 @@ impl Agent {
         const MAX_CORRECTIONS: u32 = 2;
         let mut per_turn_timeout_count: u32 = 0;
         const MAX_PER_TURN_TIMEOUTS: u32 = 3;
+        let mut backend_retry_count: u32 = 0;
+        const MAX_BACKEND_RETRIES: u32 = 3;
         let mut turn: u32 = 0;
         let mut tool_call_summary: Vec<String> = Vec::new();
         let num_ctx = if self.context_size > 0 { Some(self.context_size) } else { None };
@@ -1031,11 +1049,16 @@ impl Agent {
                 } else {
                     format!(" Completed so far: {}", tool_call_summary.join(", "))
                 };
+                // Inject as a user message rather than system: chat templates
+                // for several recent models (Qwen3, Qwen3.5, GLM4) raise an
+                // exception when a system message appears anywhere other than
+                // the start of the conversation. A user-role reminder is
+                // template-portable and the agent treats it the same way.
                 let reminder = format!(
                     "[Task reminder] Your current task: {}.{}",
                     self.current_task, summary
                 );
-                let reminder_msg = Message::system(&reminder);
+                let reminder_msg = Message::user(&reminder);
                 self.messages.push(reminder_msg);
                 send_event(
                     events,
@@ -1101,9 +1124,42 @@ impl Agent {
             let mut response = tokio::select! {
                 r = tokio::time::timeout(PER_TURN_TIMEOUT, chat_future) => {
                     match r {
-                        Ok(Ok(resp)) => resp,
+                        Ok(Ok(resp)) => {
+                            backend_retry_count = 0;
+                            resp
+                        }
                         Ok(Err(e)) => {
-                            send_event(events, AgentEvent::Error(e.to_string()))?;
+                            // Transient HTTP/transport errors (connection
+                            // reset, keep-alive expiry, momentary unreachable
+                            // socket) shouldn't kill the run. llama-server in
+                            // particular sometimes drops idle keep-alive
+                            // connections between turns — retry with a fresh
+                            // connection before giving up.
+                            let msg = e.to_string();
+                            let transient = msg.contains("Failed to connect to backend")
+                                || msg.contains("connection closed")
+                                || msg.contains("connection reset")
+                                || msg.contains("broken pipe")
+                                || msg.contains("os error 104")
+                                || msg.contains("error sending request");
+                            if transient && backend_retry_count < MAX_BACKEND_RETRIES {
+                                backend_retry_count += 1;
+                                send_event(
+                                    events,
+                                    AgentEvent::Debug(format!(
+                                        "[harness] Transient backend error ({}), retrying ({}/{}): {}",
+                                        if msg.len() > 80 { &msg[..80] } else { &msg },
+                                        backend_retry_count,
+                                        MAX_BACKEND_RETRIES,
+                                        msg
+                                    )),
+                                )?;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    500 * backend_retry_count as u64,
+                                )).await;
+                                continue;
+                            }
+                            send_event(events, AgentEvent::Error(msg))?;
                             send_event(events, AgentEvent::Done { prompt_tokens: 0, eval_count: 0 })?;
                             return Ok(());
                         }
@@ -1154,11 +1210,18 @@ impl Agent {
             }
 
             // Thinking budget tripped mid-stream. Bounded-thinking-with-retry:
-            // preserve the partial reasoning trace, reinject it as assistant
-            // context so the model sees its own conclusions in history, then
+            // preserve the partial reasoning trace, reinject it as a user
+            // message so the model sees its own conclusions in history, then
             // retry with thinking disabled. This stops the model from
             // re-deliberating the same problem from scratch on every turn —
             // its prior reasoning is now observable state it can act on.
+            //
+            // We use a *user* role rather than *assistant* because Gemma 4 (and
+            // similar templates that gate enable_thinking) treat a trailing
+            // assistant message as a "prefill" and raise
+            // `Assistant response prefill is incompatible with enable_thinking`
+            // on the next chat call. Routing the trace through a user message
+            // keeps the same recall benefit without confusing the template.
             if response.thinking_budget_exceeded {
                 self.thinking_disabled = true;
                 let thinking_tokens = message::estimate_tokens(response.thinking.len());
@@ -1180,9 +1243,15 @@ impl Agent {
                         .push_str("[auto: thinking budget exceeded — no partial output captured]");
                 }
                 send_event(events, AgentEvent::ContentReplaced(combined.clone()))?;
-                let assistant_msg = Message::assistant(&combined);
-                self.messages.push(assistant_msg.clone());
-                send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
+                let nudge = Message::user(format!(
+                    "[harness] Your previous turn was cut off after the thinking \
+                     budget was reached. Here is your captured reasoning so far:\n\n{}\n\n\
+                     Continue from where you left off — call a tool or give a final \
+                     answer. Thinking is now disabled for the rest of this run.",
+                    combined
+                ));
+                self.messages.push(nudge.clone());
+                send_event(events, AgentEvent::MessageLogged(nudge))?;
                 send_event(
                     events,
                     AgentEvent::ThinkingBudgetExceeded { thinking_tokens },
