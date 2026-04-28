@@ -19,11 +19,29 @@ fn required_index(args: &Value) -> Result<usize> {
 
 pub struct PlanAddStepTool {
     list: SharedTodoList,
+    /// When `true`, refuse to add a step if the plan is non-empty and every
+    /// step is still `Pending` (i.e. the main agent hasn't engaged with the
+    /// plan yet). Set to `false` for the planner sub-agent, which is the one
+    /// populating the plan in the first place.
+    gate_when_populated: bool,
 }
 
 impl PlanAddStepTool {
+    /// Default constructor: gate is enabled. Use this for the main agent.
     pub fn new(list: SharedTodoList) -> Self {
-        Self { list }
+        Self {
+            list,
+            gate_when_populated: true,
+        }
+    }
+
+    /// Construct without the populated-plan gate. Use this for the planner
+    /// sub-agent, which must be free to populate an empty plan.
+    pub fn new_ungated(list: SharedTodoList) -> Self {
+        Self {
+            list,
+            gate_when_populated: false,
+        }
     }
 }
 
@@ -58,6 +76,20 @@ impl Tool for PlanAddStepTool {
             return Err(anyhow!("Step description cannot be empty"));
         }
         let mut list = lock_list(&self.list)?;
+        if self.gate_when_populated
+            && list.len() > 0
+            && list.steps.iter().all(|s| matches!(s.status, StepStatus::Pending))
+        {
+            let n = list.len();
+            return Err(anyhow!(
+                "[harness] plan_add_step refused: a populated plan is already in place ({} steps, all still pending). \
+                 Work the existing plan first — call plan_mark_in_progress(0) to start step 0. \
+                 You may add new steps later, but only after at least one step has been marked done, in_progress, or skipped. \
+                 If a step in the existing plan is wrong or missing context, mention that in your next turn's content; \
+                 the harness will allow add after you've engaged with the plan.",
+                n
+            ));
+        }
         let idx = list.add(&description)?;
         Ok(format!("Added step {} to plan: {}", idx, description))
     }
@@ -247,11 +279,13 @@ mod tests {
 
     #[test]
     fn add_then_list() {
+        // Use ungated tool so successive `add` calls aren't blocked by the
+        // populated-plan gate (which only fires for the main agent's adder).
         let list = new_shared_todo_list();
-        PlanAddStepTool::new(list.clone())
+        PlanAddStepTool::new_ungated(list.clone())
             .execute(&json!({"description": "first"}))
             .unwrap();
-        PlanAddStepTool::new(list.clone())
+        PlanAddStepTool::new_ungated(list.clone())
             .execute(&json!({"description": "second"}))
             .unwrap();
         let out = PlanListStepsTool::new(list).execute(&json!({})).unwrap();
@@ -262,7 +296,7 @@ mod tests {
     #[test]
     fn mark_done_decrements_remaining() {
         let list = new_shared_todo_list();
-        let adder = PlanAddStepTool::new(list.clone());
+        let adder = PlanAddStepTool::new_ungated(list.clone());
         adder.execute(&json!({"description": "a"})).unwrap();
         adder.execute(&json!({"description": "b"})).unwrap();
         let done = PlanMarkDoneTool::new(list.clone())
@@ -299,5 +333,81 @@ mod tests {
             .execute(&json!({"description": "   "}))
             .unwrap_err();
         assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn gate_blocks_add_when_plan_full_and_untouched() {
+        let list = new_shared_todo_list();
+        // Pre-populate as the planner would (ungated path).
+        let planner_adder = PlanAddStepTool::new_ungated(list.clone());
+        planner_adder
+            .execute(&json!({"description": "step 0"}))
+            .unwrap();
+        planner_adder
+            .execute(&json!({"description": "step 1"}))
+            .unwrap();
+        planner_adder
+            .execute(&json!({"description": "step 2"}))
+            .unwrap();
+
+        // The main agent's gated tool should now refuse.
+        let main_adder = PlanAddStepTool::new(list.clone());
+        let err = main_adder
+            .execute(&json!({"description": "duplicate of step 0"}))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("plan_add_step refused"));
+        assert!(msg.contains("3 steps"));
+        assert!(msg.contains("plan_mark_in_progress"));
+        // Plan length unchanged.
+        assert_eq!(list.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn gate_allows_add_after_step_marked_in_progress() {
+        let list = new_shared_todo_list();
+        let planner_adder = PlanAddStepTool::new_ungated(list.clone());
+        planner_adder.execute(&json!({"description": "a"})).unwrap();
+        planner_adder.execute(&json!({"description": "b"})).unwrap();
+
+        PlanMarkInProgressTool::new(list.clone())
+            .execute(&json!({"index": 0}))
+            .unwrap();
+
+        let main_adder = PlanAddStepTool::new(list.clone());
+        let res = main_adder.execute(&json!({"description": "newly discovered step"}));
+        assert!(res.is_ok(), "add should be allowed once a step is in_progress: {:?}", res);
+        assert_eq!(list.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn gate_allows_add_after_step_marked_done() {
+        let list = new_shared_todo_list();
+        let planner_adder = PlanAddStepTool::new_ungated(list.clone());
+        planner_adder.execute(&json!({"description": "a"})).unwrap();
+        planner_adder.execute(&json!({"description": "b"})).unwrap();
+
+        PlanMarkDoneTool::new(list.clone())
+            .execute(&json!({"index": 0}))
+            .unwrap();
+
+        let main_adder = PlanAddStepTool::new(list.clone());
+        let res = main_adder.execute(&json!({"description": "follow-up step"}));
+        assert!(res.is_ok(), "add should be allowed once a step is done: {:?}", res);
+        assert_eq!(list.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn ungated_tool_always_adds() {
+        let list = new_shared_todo_list();
+        let planner_adder = PlanAddStepTool::new_ungated(list.clone());
+        planner_adder.execute(&json!({"description": "a"})).unwrap();
+        planner_adder.execute(&json!({"description": "b"})).unwrap();
+        planner_adder.execute(&json!({"description": "c"})).unwrap();
+
+        // Even though plan is fully Pending, ungated tool keeps adding.
+        let res = planner_adder.execute(&json!({"description": "d"}));
+        assert!(res.is_ok(), "ungated add should always succeed: {:?}", res);
+        assert_eq!(list.lock().unwrap().len(), 4);
     }
 }

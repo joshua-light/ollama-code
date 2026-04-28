@@ -494,7 +494,7 @@ fn generate_entry_id() -> String {
 }
 
 /// Format a SystemTime as an ISO 8601-ish UTC string.
-fn format_utc(time: SystemTime) -> String {
+pub(crate) fn format_utc(time: SystemTime) -> String {
     let dur = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = dur.as_secs();
     let millis = dur.subsec_millis();

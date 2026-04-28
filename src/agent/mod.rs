@@ -1,5 +1,6 @@
 mod builder;
 mod context;
+mod edit_audit;
 mod events;
 pub mod plan;
 mod planner;
@@ -91,7 +92,17 @@ pub struct Agent {
     /// Used to inject file context into subagent prompts.
     read_file_ranges: Vec<(String, usize, usize)>,
     /// Whether any edit/write tool succeeded during the current `run()`.
-    had_edits_this_run: bool,
+    /// Reset to false at the end of every turn by `run_post_edit_cargo_check`
+    /// after that turn's cargo check fires — so this is "edits to verify this
+    /// turn", not "edits ever made." Use `any_edits_in_session` for "did this
+    /// agent ever modify a file" semantics (e.g. for the destructive-bash
+    /// gate).
+    pub(super) had_edits_this_run: bool,
+    /// Sticky flag: set true on the FIRST successful edit/write of the agent's
+    /// life and never cleared until a new `run()` starts. The destructive-bash
+    /// gate consults this so a model can't trip the gate, edit, wait one turn
+    /// for the gate to relax, then `git checkout` its own work.
+    pub(super) any_edits_in_session: bool,
     /// Sticky flag: set true once the thinking budget has been exceeded in
     /// this session. When set, subsequent turns are sent with thinking off
     /// regardless of config. Cleared only by /settings changes or a new session.
@@ -119,6 +130,12 @@ pub struct Agent {
     /// call until the model picks a different tool or arguments. Reset when
     /// the model finally varies its call.
     pub(super) consecutive_repeat_count: u32,
+    /// Number of times the text-only-action-task gate has fired in the
+    /// current sub-agent `run()`. Reset on each `run()`. Capped by
+    /// `TEXT_ONLY_FORCE_MAX` — after that, the sub-agent terminates cleanly
+    /// and the parent's existing `task_expects_edits` retry path can decide
+    /// whether to re-spawn it.
+    pub(super) text_only_force_count: u32,
     /// One entry per cargo-check observation in the current `run()`, holding
     /// the set of error signatures (code + primary span) seen at that point.
     /// Compared against new sets to detect oscillation/regression — the
@@ -228,6 +245,7 @@ impl Agent {
             current_task: String::new(),
             read_file_ranges: Vec::new(),
             had_edits_this_run: false,
+            any_edits_in_session: false,
             thinking_disabled: false,
             checkpoint_dir: None,
             checkpointed_files: HashSet::new(),
@@ -237,6 +255,7 @@ impl Agent {
             main_turn_cap: if is_subagent { None } else { cfg.max_turns },
             last_tool_signature: None,
             consecutive_repeat_count: 0,
+            text_only_force_count: 0,
             compile_attempts: Vec::new(),
             plan,
             plan_config: cfg.effective_plan_config(),
@@ -924,8 +943,10 @@ impl Agent {
         self.current_task = user_input.to_string();
         self.has_explored = false;
         self.had_edits_this_run = false;
+        self.any_edits_in_session = false;
         self.last_tool_signature = None;
         self.consecutive_repeat_count = 0;
+        self.text_only_force_count = 0;
         self.compile_attempts.clear();
         self.plan_gate_retries = 0;
         self.behavioral_verify_passed = false;
@@ -1484,6 +1505,56 @@ impl Agent {
                     return Ok(());
                 }
 
+                // Text-only-action-task gate (sub-agents only).
+                //
+                // A small model handed an action task ("Refactor X to...",
+                // "Implement Y") will sometimes emit a narrative plan and
+                // stop, mistaking the description for completion. Text alone
+                // never satisfies an action task — refuse termination and
+                // force a tool call. After TEXT_ONLY_FORCE_MAX forced
+                // retries we fall through to the normal Done path and let
+                // the parent's `task_expects_edits` retry mechanism in
+                // `subagent.rs::execute_subagent` decide what to do next.
+                if !self.is_planner
+                    && Self::should_force_text_only_retry(
+                        self.max_turns.is_some(),
+                        &self.current_task,
+                        self.had_edits_this_run,
+                        response.content.trim().is_empty(),
+                        self.text_only_force_count,
+                    )
+                {
+                    self.text_only_force_count += 1;
+                    // Preserve the assistant's narrative in history so the
+                    // next turn sees its own prior reasoning.
+                    let assistant_msg = Message::assistant(&response.content);
+                    self.messages.push(assistant_msg.clone());
+                    send_event(events, AgentEvent::MessageLogged(assistant_msg))?;
+                    let nudge = Message::user(format!(
+                        "[harness] Your response was a text plan, not a tool call. \
+                         Your task contains action verbs (e.g. 'refactor', 'add', \
+                         'modify') and you have not yet edited any file in this run. \
+                         The harness will not accept text as completion of an action \
+                         task — text alone never modifies code. Your NEXT response \
+                         MUST contain a `tool_calls` array with at least one of: \
+                         `edit`, `write`, `bash`. Pick the smallest concrete action \
+                         you can take based on the task and the file context already \
+                         loaded above. (Forced retry {} of {}.)",
+                        self.text_only_force_count, TEXT_ONLY_FORCE_MAX
+                    ));
+                    self.messages.push(nudge.clone());
+                    send_event(events, AgentEvent::MessageLogged(nudge))?;
+                    send_event(
+                        events,
+                        AgentEvent::Debug(format!(
+                            "[harness] Text-only response on action task — forcing \
+                             retry ({}/{})",
+                            self.text_only_force_count, TEXT_ONLY_FORCE_MAX
+                        )),
+                    )?;
+                    continue;
+                }
+
                 // --- agent_done hooks ---
                 let final_content = match self
                     .hooks
@@ -1565,7 +1636,39 @@ impl Agent {
             self.run_post_edit_cargo_check().await;
         }
     }
+
+    /// Predicate for the text-only-action-task gate. Pulled out as a free-
+    /// standing associated function so it can be unit-tested without standing
+    /// up a full `Agent` and backend. The call site in `Agent::run` mirrors
+    /// these arguments exactly.
+    ///
+    /// Returns true when ALL of:
+    ///   - the agent is a sub-agent (`is_subagent`),
+    ///   - the task description contains an action verb,
+    ///   - no edit has succeeded yet in this run (`!had_edits`),
+    ///   - the response had non-empty content (`!content_empty`) — the empty
+    ///     branch has its own corrective and we must not double-fire,
+    ///   - the per-run forced-retry counter is still under the cap.
+    pub(super) fn should_force_text_only_retry(
+        is_subagent: bool,
+        task: &str,
+        had_edits: bool,
+        content_empty: bool,
+        retries_used: u32,
+    ) -> bool {
+        is_subagent
+            && Self::task_expects_edits(task)
+            && !had_edits
+            && !content_empty
+            && retries_used < TEXT_ONLY_FORCE_MAX
+    }
 }
+
+/// Cap on how many forced retries the text-only-action-task gate fires per
+/// sub-agent `run()`. After this many forced retries the gate stops firing
+/// and the loop falls through to the normal Done path; the parent's
+/// `task_expects_edits` retry mechanism then decides what to do next.
+pub(super) const TEXT_ONLY_FORCE_MAX: u32 = 5;
 
 /// Cap on how many times the behavioural-verification gate runs in a single
 /// agent run. After hitting the cap the gate stops re-running and lets the
@@ -1656,4 +1759,87 @@ async fn run_behavioral_verification(cmd: &[String]) -> (bool, String) {
     let tail_start = lines.len().saturating_sub(50);
     let summary = lines[tail_start..].join("\n");
     (success, summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_fires_for_action_task_subagent_with_no_edits() {
+        // is_subagent=true, action verb in task, no edits yet, non-empty
+        // content, retries under cap → fire.
+        assert!(Agent::should_force_text_only_retry(
+            true,
+            "Refactor src/agent/mod.rs to extract the gate predicate",
+            false,
+            false,
+            0,
+        ));
+    }
+
+    #[test]
+    fn gate_skips_when_main_agent() {
+        // Main agent (max_turns is None → is_subagent=false): the gate must
+        // not interfere with the user's interactive control flow.
+        assert!(!Agent::should_force_text_only_retry(
+            false,
+            "Refactor src/agent/mod.rs to extract the gate predicate",
+            false,
+            false,
+            0,
+        ));
+    }
+
+    #[test]
+    fn gate_skips_when_task_is_questiony() {
+        // No action verb in the task → it's a Q&A or exploration task; a
+        // text answer is a legitimate completion.
+        assert!(!Agent::should_force_text_only_retry(
+            true,
+            "What does the agent loop do?",
+            false,
+            false,
+            0,
+        ));
+    }
+
+    #[test]
+    fn gate_skips_when_edits_already_made() {
+        // Sub-agent has already produced edits this run → its closing
+        // narrative is a summary of the work, not an evasion. Let it end.
+        assert!(!Agent::should_force_text_only_retry(
+            true,
+            "Refactor src/agent/mod.rs to extract the gate predicate",
+            true,
+            false,
+            0,
+        ));
+    }
+
+    #[test]
+    fn gate_skips_when_content_empty() {
+        // Empty content has its own corrective branch in Agent::run; this
+        // gate must not double-fire on the same condition.
+        assert!(!Agent::should_force_text_only_retry(
+            true,
+            "Refactor src/agent/mod.rs to extract the gate predicate",
+            false,
+            true,
+            0,
+        ));
+    }
+
+    #[test]
+    fn gate_caps_at_max_retries() {
+        // After TEXT_ONLY_FORCE_MAX forced retries, the gate stops firing
+        // and the loop falls through to the normal Done path.
+        assert!(!Agent::should_force_text_only_retry(
+            true,
+            "Refactor src/agent/mod.rs to extract the gate predicate",
+            false,
+            false,
+            TEXT_ONLY_FORCE_MAX,
+        ));
+    }
 }

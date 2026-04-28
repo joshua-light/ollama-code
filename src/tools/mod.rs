@@ -91,6 +91,81 @@ pub fn format_bash_output(output: &std::process::Output) -> (String, bool) {
     (result, success)
 }
 
+/// Coerce loosely-typed tool arguments against a JSON schema before validation.
+/// Local models routinely emit `"index": "1"` instead of `1` and `"~/foo"`
+/// instead of `/home/u/foo` — both fail validation for nothing. We rewrite
+/// these in place so the call goes through.
+///
+/// Coercions performed (idempotent on already-correct args):
+/// - `"integer"` / `"number"` typed fields: `"1"` → `1`, `"-2"` → `-2`,
+///   `"3.14"` → `3.14`. Booleans/objects are left alone.
+/// - `"boolean"` typed fields: `"true"` / `"false"` (case-insensitive) → bool.
+/// - `"string"` typed fields named `path`, `file_path`, `cwd`, or any field
+///   ending in `_path`: leading `~` / `~/` expanded to `$HOME`.
+///
+/// No effect when schema is missing/invalid or args isn't an object.
+pub fn coerce_arg_types(schema: &Value, args: &mut Value) {
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return;
+    };
+    let Some(args_obj) = args.as_object_mut() else {
+        return;
+    };
+    for (key, value) in args_obj.iter_mut() {
+        let Some(prop) = props.get(key) else { continue };
+        let Some(expected) = prop.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        match expected {
+            "integer" => {
+                if let Value::String(s) = value {
+                    let trimmed = s.trim();
+                    if let Ok(n) = trimmed.parse::<i64>() {
+                        *value = serde_json::Value::from(n);
+                    } else if let Ok(n) = trimmed.parse::<f64>() {
+                        if n.fract() == 0.0 && n.is_finite() {
+                            *value = serde_json::Value::from(n as i64);
+                        }
+                    }
+                }
+            }
+            "number" => {
+                if let Value::String(s) = value {
+                    if let Ok(n) = s.trim().parse::<f64>() {
+                        if let Some(num) = serde_json::Number::from_f64(n) {
+                            *value = Value::Number(num);
+                        }
+                    }
+                }
+            }
+            "boolean" => {
+                if let Value::String(s) = value {
+                    match s.trim().to_ascii_lowercase().as_str() {
+                        "true" | "yes" | "1" => *value = Value::Bool(true),
+                        "false" | "no" | "0" => *value = Value::Bool(false),
+                        _ => {}
+                    }
+                }
+            }
+            "string" => {
+                let path_like = key == "path"
+                    || key == "file_path"
+                    || key == "cwd"
+                    || key.ends_with("_path");
+                if !path_like {
+                    continue;
+                }
+                if let Value::String(s) = value {
+                    if let Cow::Owned(expanded) = expand_tilde(s) {
+                        *s = expanded;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Validate tool call arguments against a tool's JSON schema.
 /// Returns `Ok(())` if valid, or an error message describing what's wrong.
 pub fn validate_tool_args(schema: &Value, args: &Value) -> std::result::Result<(), String> {
@@ -237,6 +312,23 @@ impl ToolRegistry {
         Some(validate_tool_args(params, args))
     }
 
+    /// Coerce stringly-typed integer/number/boolean/path arguments against the
+    /// tool's JSON schema. Mutates `args` in place. No-op if the tool isn't
+    /// in this registry (external tools skip coercion).
+    pub fn coerce(&self, name: &str, args: &mut Value) {
+        let Some(idx) = self.tools.iter().position(|t| t.name() == name) else {
+            return;
+        };
+        let schema = &self.cached_definitions[idx];
+        let Some(params) = schema
+            .get("function")
+            .and_then(|f| f.get("parameters"))
+        else {
+            return;
+        };
+        coerce_arg_types(params, args);
+    }
+
     pub fn execute(&self, name: &str, arguments: &Value) -> Result<String> {
         let tool = self
             .tools
@@ -244,5 +336,75 @@ impl ToolRegistry {
             .find(|t| t.name() == name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?;
         tool.execute(arguments)
+    }
+}
+
+#[cfg(test)]
+mod coerce_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "index": { "type": "integer" },
+                "ratio": { "type": "number" },
+                "verbose": { "type": "boolean" },
+                "file_path": { "type": "string" },
+                "name": { "type": "string" }
+            }
+        })
+    }
+
+    #[test]
+    fn integer_strings_are_coerced() {
+        let mut args = json!({ "index": "1" });
+        coerce_arg_types(&schema(), &mut args);
+        assert_eq!(args["index"], json!(1));
+        let mut args = json!({ "index": "-2" });
+        coerce_arg_types(&schema(), &mut args);
+        assert_eq!(args["index"], json!(-2));
+    }
+
+    #[test]
+    fn integer_already_correct_is_idempotent() {
+        let mut args = json!({ "index": 5 });
+        coerce_arg_types(&schema(), &mut args);
+        assert_eq!(args["index"], json!(5));
+    }
+
+    #[test]
+    fn boolean_strings_are_coerced() {
+        let mut args = json!({ "verbose": "true" });
+        coerce_arg_types(&schema(), &mut args);
+        assert_eq!(args["verbose"], json!(true));
+        let mut args = json!({ "verbose": "FALSE" });
+        coerce_arg_types(&schema(), &mut args);
+        assert_eq!(args["verbose"], json!(false));
+    }
+
+    #[test]
+    fn tilde_expansion_for_path_field() {
+        let mut args = json!({ "file_path": "~/foo/bar.rs" });
+        coerce_arg_types(&schema(), &mut args);
+        let p = args["file_path"].as_str().unwrap();
+        assert!(!p.starts_with("~"));
+        assert!(p.ends_with("/foo/bar.rs"));
+    }
+
+    #[test]
+    fn non_path_string_field_untouched() {
+        let mut args = json!({ "name": "~/foo" });
+        coerce_arg_types(&schema(), &mut args);
+        assert_eq!(args["name"], json!("~/foo"));
+    }
+
+    #[test]
+    fn unknown_field_left_alone() {
+        let mut args = json!({ "extra": "1", "index": "2" });
+        coerce_arg_types(&schema(), &mut args);
+        assert_eq!(args["extra"], json!("1"));
+        assert_eq!(args["index"], json!(2));
     }
 }

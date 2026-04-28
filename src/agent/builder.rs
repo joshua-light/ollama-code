@@ -116,7 +116,10 @@ pub(super) fn build_tools_and_servers(
             register_if_enabled!("plan_list_steps", PlanListStepsTool::new(plan_list.clone()));
         }
         AgentMode::Planner => {
-            register_if_enabled!("plan_add_step", PlanAddStepTool::new(plan_list.clone()));
+            register_if_enabled!(
+                "plan_add_step",
+                PlanAddStepTool::new_ungated(plan_list.clone())
+            );
             register_if_enabled!("plan_list_steps", PlanListStepsTool::new(plan_list.clone()));
         }
         AgentMode::Subagent => {}
@@ -181,10 +184,15 @@ pub(super) fn build_system_prompt(
 ) -> (String, usize, usize, Vec<(String, usize)>) {
     let include_extensions = matches!(mode, AgentMode::Main);
     let subagent_desc = if include_extensions {
-        "- subagent(task): Spawn a sub-agent with a fresh context to handle a focused task. \
-         The sub-agent cannot see this conversation, so include all necessary context in the \
-         task description. Use for: research across many files, complex multi-step operations, \
-         or any task that would benefit from a clean context window"
+        "- subagent(task, files?): Spawn a sub-agent with a fresh context to handle a focused \
+         task. The sub-agent cannot see this conversation, so include all necessary context in \
+         the task description. STRONGLY PREFER passing `files` (an array of paths) for any \
+         single-file edit — the harness pre-reads each file and prepends it to the task, so the \
+         sub-agent starts with code in hand and skips warm-up turns. **For multi-file refactors, \
+         delegate one sub-agent per file** rather than editing them all from this top-level \
+         conversation. The smaller the sub-agent's context, the sharper the local model is on \
+         the actual edit. Your top-level role is to plan, dispatch one sub-agent per file, and \
+         verify with a final cargo check"
     } else {
         ""
     };
@@ -288,6 +296,13 @@ pub(super) fn build_system_prompt(
                 steps. Adding a Resource must come before any step that reads it.\n\
              - When the same file is touched in multiple steps, group them \
                 contiguously (one open of the file → multiple edits → one close).\n\
+             - **Prefer per-file delegation steps** over bulk edits done from \
+                the orchestrator. Phrase implementation steps as: \
+                `Delegate <change> in <file> to a sub-agent (subagent tool, \
+                files=[<path>]) — invariant: ... — risk: ...`. The execution \
+                agent will then call `subagent(task=..., files=[<path>])` for \
+                that step, keeping the orchestrator's context small. Reserve \
+                non-delegated edits for trivial changes (one line or two).\n\
              - End your turn with no tool calls when the plan is complete.\n\
              \n\
              Do not write code. Do not produce a final summary — your output is \
